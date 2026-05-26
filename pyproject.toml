@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smzdm-notice"
+version = "0.1.0"
+description = "SMZDM good-deal notification bot with Feishu and LLM filtering."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "httpx",
+    "lark-oapi",
+    "loguru",
+    "openai",
+    "pydantic",
+    "python-dotenv",
+    "urllib3<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyright",
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+smzdm-notice = "smzdm_notice.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyright]
+include = ["src"]
+exclude = [
+    "**/__pycache__",
+    ".venv",
+    "workspace",
+]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.9"
+typeCheckingMode = "basic"
