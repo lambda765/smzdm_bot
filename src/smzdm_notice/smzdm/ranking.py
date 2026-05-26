@@ -12,6 +12,7 @@ from typing import Callable
 
 from loguru import logger
 
+from smzdm_notice.core import config as app_config
 from smzdm_notice.smzdm.client import (
     AD_CELL_TYPES,
     extract_article_tags,
@@ -150,7 +151,7 @@ def get_ranking(config: RankingConfig, top_n: int = 20) -> list[RankingItem]:
 def _ranking_params(config: RankingConfig) -> dict:
     params: dict = {
         "basic_v": 0,
-        "f": "iphone",
+        "f": app_config.get_smzdm_client_platform(),
         "mall_ids": "",
         "offset": 0,
         "page": 1,
@@ -159,7 +160,7 @@ def _ranking_params(config: RankingConfig) -> dict:
         "tab_id": config.tab_id,
         "category_ids": config.category_ids,
         "tag_ids": config.tag_ids,
-        "v": "11.1.70",
+        "v": app_config.SMZDM_APP_VERSION,
         "weixin": "1",
         "zhuanzai_ab": "b",
     }

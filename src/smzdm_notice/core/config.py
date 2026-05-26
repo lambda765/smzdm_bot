@@ -93,8 +93,17 @@ FEISHU_APP_SECRET: str = _get("FEISHU_APP_SECRET")
 FEISHU_BINDING_FILE: str = _get("FEISHU_BINDING_FILE", str(WORKSPACE_STATE_DIR / "feishu_binding.json"))
 
 # ========== SMZDM 配置 ==========
+SMZDM_CLIENT_PLATFORM: str = _get_fallback("SMZDM_CLIENT_PLATFORM", "iphone").lower()
+SMZDM_APP_VERSION: str = _get_fallback("SMZDM_APP_VERSION", "11.1.70")
 SMZDM_SIGN_KEY: str = _get("SMZDM_SIGN_KEY")
 SMZDM_USER_AGENT: str = _get("SMZDM_USER_AGENT")
+
+
+def get_smzdm_client_platform() -> str:
+    """Return the SMZDM app platform value used in signed request params."""
+    if SMZDM_CLIENT_PLATFORM in {"iphone", "android"}:
+        return SMZDM_CLIENT_PLATFORM
+    raise RuntimeError("SMZDM_CLIENT_PLATFORM 仅支持 iphone 或 android")
 
 # ========== LLM 配置 ==========
 LLM_API_KEY: str = _get("LLM_API_KEY")

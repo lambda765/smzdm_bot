@@ -7,6 +7,7 @@ from typing import Callable
 
 from loguru import logger
 
+from smzdm_notice.core import config
 from smzdm_notice.smzdm.client import (
     AD_CELL_TYPES,
     compact_sign_value,
@@ -26,7 +27,7 @@ def _search_params(keyword: str, limit: int) -> dict:
         "basic_v": 0,
         "category_id": "",
         "category_name": "",
-        "f": "iphone",
+        "f": config.get_smzdm_client_platform(),
         "filter_json_data": "{}",
         "is_biserial": 2,
         "keyword": keyword,
@@ -44,7 +45,7 @@ def _search_params(keyword: str, limit: int) -> dict:
         "subtype": "",
         "tab_source": "",
         "type": "good_price",
-        "v": "11.1.70",
+        "v": config.SMZDM_APP_VERSION,
         "weixin": "1",
         "zhifa_tag_id": "",
         "zhilv_rate": "",
