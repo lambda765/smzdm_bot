@@ -69,6 +69,8 @@ smzdm-notice setup
 |-----|------|---------|
 | `FEISHU_APP_ID` | 飞书应用 App ID | `cli_xxx` |
 | `FEISHU_APP_SECRET` | 飞书应用 Secret | |
+| `SMZDM_CLIENT_PLATFORM` | SMZDM App 平台，支持 `iphone` / `android` | `iphone` |
+| `SMZDM_APP_VERSION` | SMZDM App 版本号 | `11.1.70` |
 | `SMZDM_SIGN_KEY` | SMZDM App 接口签名 key | |
 | `SMZDM_USER_AGENT` | SMZDM App 请求 User-Agent | |
 | `LLM_API_KEY` | LLM API 密钥 | |
@@ -78,13 +80,13 @@ smzdm-notice setup
 
 可选榜单：综合榜-全部、综合榜-电脑数码、综合榜-白菜、综合榜-食品生鲜、综合榜-运动户外、综合榜-家用电器、综合榜-服饰鞋包、综合榜-日用百货、综合榜-母婴用品、综合榜-家居家装、综合榜-办公设备、综合榜-个护化妆、综合榜-本地生活、综合榜-医疗健康、综合榜-图书文娱、综合榜-玩模乐器、热卖榜、热评榜、热搜榜。
 
-**SMZDM 配置：** `.env.example` 不提供 `SMZDM_SIGN_KEY` 和 `SMZDM_USER_AGENT` 默认值。请自行从 GitHub 公开仓库的 SMZDM 签到、脚本或 bot 实现中查找当前可用的签名 key 和 UA，例如：
+**SMZDM 配置：** 安卓和 iPhone 的签名 key 可能不同，`SMZDM_CLIENT_PLATFORM`、`SMZDM_APP_VERSION`、`SMZDM_SIGN_KEY` 和 `SMZDM_USER_AGENT` 应来自同一平台和相近 App 版本。请自行从 GitHub 公开仓库的 SMZDM 签到、脚本或 bot 实现中查找当前可用的签名 key 和 UA，例如：
 
 - https://github.com/Cat-zaizai/ZaiZaiCat-Checkin
 - https://github.com/enwaiax/smzdm_bot
 - https://github.com/hex-ci/smzdm_script
 
-这些值可能随 SMZDM App 版本变化而失效；如果抓取接口返回签名、权限或请求异常，优先检查这两个配置是否仍然有效。
+这些值可能随 SMZDM App 版本变化而失效；如果抓取接口返回签名、权限或请求异常，优先检查平台、版本、签名 key 和 UA 是否匹配且仍然有效。
 
 **可选配置：**
 

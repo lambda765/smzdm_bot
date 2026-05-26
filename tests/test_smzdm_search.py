@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from smzdm_notice.core import config
 from smzdm_notice.smzdm.client import build_signed_params, compact_sign_value, get_json
-from smzdm_notice.smzdm.ranking import RankingConfig, RankingItem
+from smzdm_notice.smzdm.ranking import RankingConfig, RankingItem, _ranking_params
 from smzdm_notice.smzdm.search import _parse_search_rows, _search_params
 from smzdm_notice.smzdm.sources import fetch_all_sources
 
@@ -68,6 +68,31 @@ def _expected_sign(params: dict, normalizer, sign_key: str) -> str:
 class SmzdmSearchParsingTests(unittest.TestCase):
     def test_search_params_sort_by_time(self) -> None:
         self.assertEqual(_search_params("AirPods Pro 2", 20)["order"], "time")
+
+    def test_search_params_use_configured_platform_and_version(self) -> None:
+        with (
+            patch.object(config, "SMZDM_CLIENT_PLATFORM", "android"),
+            patch.object(config, "SMZDM_APP_VERSION", "10.8.0"),
+        ):
+            params = _search_params("AirPods Pro 2", 20)
+
+        self.assertEqual(params["f"], "android")
+        self.assertEqual(params["v"], "10.8.0")
+
+    def test_ranking_params_use_configured_platform_and_version(self) -> None:
+        ranking = RankingConfig(name="综合榜-全部", tab_id="67")
+        with (
+            patch.object(config, "SMZDM_CLIENT_PLATFORM", "iphone"),
+            patch.object(config, "SMZDM_APP_VERSION", "11.2.0"),
+        ):
+            params = _ranking_params(ranking)
+
+        self.assertEqual(params["f"], "iphone")
+        self.assertEqual(params["v"], "11.2.0")
+
+    def test_invalid_smzdm_platform_fails_fast(self) -> None:
+        with patch.object(config, "SMZDM_CLIENT_PLATFORM", "ipad"), self.assertRaisesRegex(RuntimeError, "iphone"):
+            _search_params("AirPods Pro 2", 20)
 
     def test_parse_search_rows_maps_fields_and_skips_empty_price(self) -> None:
         rows = [

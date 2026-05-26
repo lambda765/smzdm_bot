@@ -236,7 +236,15 @@ def _check_env_file(root: Path) -> tuple[bool, str]:
     if found:
         return False, "placeholder values remain in .env"
     values = _parse_env_values(raw)
-    required = ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "SMZDM_SIGN_KEY", "SMZDM_USER_AGENT", "LLM_API_KEY"]
+    required = [
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+        "SMZDM_CLIENT_PLATFORM",
+        "SMZDM_APP_VERSION",
+        "SMZDM_SIGN_KEY",
+        "SMZDM_USER_AGENT",
+        "LLM_API_KEY",
+    ]
     missing = [key for key in required if not values.get(key)]
     if missing:
         return False, "missing required .env values: " + ", ".join(missing)

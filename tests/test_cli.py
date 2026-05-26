@@ -39,12 +39,19 @@ class CliTests(unittest.TestCase):
     def test_doctor_fails_when_smzdm_config_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
             root = Path(tmp)
-            _write_ready_project(root, extra_env="SMZDM_SIGN_KEY=\nSMZDM_USER_AGENT=")
+            _write_ready_project(
+                root,
+                extra_env="SMZDM_CLIENT_PLATFORM=\nSMZDM_APP_VERSION=\nSMZDM_SIGN_KEY=\nSMZDM_USER_AGENT=",
+            )
 
             code, output = _run_cli("--root", str(root), "doctor")
 
             self.assertEqual(code, 1)
-            self.assertIn("FAIL: missing required .env values: SMZDM_SIGN_KEY, SMZDM_USER_AGENT", output)
+            self.assertIn(
+                "FAIL: missing required .env values: "
+                "SMZDM_CLIENT_PLATFORM, SMZDM_APP_VERSION, SMZDM_SIGN_KEY, SMZDM_USER_AGENT",
+                output,
+            )
 
     def test_save_and_diff_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
@@ -77,6 +84,8 @@ def _write_ready_project(root: Path, extra_env: str = "") -> None:
             [
                 "FEISHU_APP_ID=cli_real_app_id",
                 "FEISHU_APP_SECRET=real-secret",
+                "SMZDM_CLIENT_PLATFORM=iphone",
+                "SMZDM_APP_VERSION=11.1.70",
                 "SMZDM_SIGN_KEY=real-smzdm-sign-key",
                 "SMZDM_USER_AGENT=real-smzdm-user-agent",
                 "LLM_API_KEY=real-key",
