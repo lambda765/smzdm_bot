@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Mapping
 from datetime import datetime
+from io import BytesIO
 from typing import Any
 
 from loguru import logger
@@ -13,6 +14,7 @@ from loguru import logger
 from smzdm_notice.feishu.binding import FeishuBinding, FeishuBindingStore
 from smzdm_notice.feishu.media import get_feishu_image_key
 from smzdm_notice.feishu.sdk import (
+    get_file_models,
     get_lark_client,
     get_message_models,
     get_message_update_models,
@@ -25,6 +27,9 @@ from smzdm_notice.smzdm.ranking import RankingItem
 _BINDING_STORE = FeishuBindingStore()
 ARBITRATION_CARD_KIND = "arbitration"
 ARBITRATION_CARD_METADATA_KEY = "arbitration_card"
+_DIGEST_PREVIEW_LIMIT = 20
+_DIGEST_ATTACHMENT_FORMAT = "markdown"
+_DIGEST_ATTACHMENT_EXTENSIONS = {"markdown": "md"}
 Card = dict[str, Any]
 MessageId = str
 
@@ -136,6 +141,53 @@ def send_text_to(receive_id_type: str, receive_id: str, text: str) -> bool:
         return False
     except Exception as e:
         logger.error(f"飞书文本消息发送异常: {e}")
+        return False
+
+
+def _upload_file(file_name: str, content: bytes, file_type: str = "stream") -> str:
+    """上传文件到飞书，成功返回 file_key。"""
+    if not content:
+        raise ValueError("文件内容为空")
+    CreateFileRequest, CreateFileRequestBody = get_file_models()
+    request = (
+        CreateFileRequest.builder()
+        .request_body(
+            CreateFileRequestBody.builder().file_type(file_type).file_name(file_name).file(BytesIO(content)).build()
+        )
+        .build()
+    )
+    response = get_lark_client().im.v1.file.create(request)
+    if response.success():
+        file_key = str(getattr(response.data, "file_key", "") or "")
+        if file_key:
+            return file_key
+        raise ValueError("飞书文件上传成功但未返回 file_key")
+    raise RuntimeError(f"飞书文件上传失败: code={response.code}, msg={response.msg}")
+
+
+def _send_file_to(receive_id_type: str, receive_id: str, file_key: str) -> bool:
+    try:
+        CreateMessageRequest, CreateMessageRequestBody = get_message_models()
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type(receive_id_type)
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .msg_type("file")
+                .content(json.dumps({"file_key": file_key}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        response = get_lark_client().im.v1.message.create(request)
+        if response.success():
+            logger.info(f"飞书文件消息发送成功: {getattr(response.data, 'message_id', '')}")
+            return True
+        logger.error(f"飞书文件消息发送失败: code={response.code}, msg={response.msg}")
+        return False
+    except Exception as e:
+        logger.error(f"飞书文件消息发送异常: {e}")
         return False
 
 
@@ -492,7 +544,7 @@ def send_digest(entries: list[dict], digest_date: str) -> bool:
     ]
 
     table_rows = ["| 商品 | 价格 | 热度 | 跳过原因 |", "| --- | ---: | --- | --- |"]
-    for entry in entries[:20]:
+    for entry in entries[:_DIGEST_PREVIEW_LIMIT]:
         title = _compact_table_text(entry.get("title", "未知商品"), 28)
         if entry.get("link"):
             title = f"[{title}]({entry['link']})"
@@ -505,21 +557,91 @@ def send_digest(entries: list[dict], digest_date: str) -> bool:
         table_rows.append(f"| {title} | {price} | {heat} | {reason} |")
 
     elements.append({"tag": "markdown", "content": "\n".join(table_rows)})
-    if count > 20:
-        elements.append({"tag": "markdown", "content": f"...以及其他 {count - 20} 件商品（已省略）"})
+    needs_attachment = count > _DIGEST_PREVIEW_LIMIT
+    if needs_attachment:
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": f"...以及其他 {count - _DIGEST_PREVIEW_LIMIT} 件商品（已省略，完整内容见附件）",
+            }
+        )
 
-    return _send_card_success(
-        {
-            "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": f"🌙 好价监控 · 夜间汇总 ({digest_date})",
-                },
-                "template": "orange",
+    card = {
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": f"🌙 好价监控 · 夜间汇总 ({digest_date})",
             },
-            "elements": elements,
-        }
-    )
+            "template": "orange",
+        },
+        "elements": elements,
+    }
+
+    if not needs_attachment:
+        return _send_card_success(card)
+
+    binding = _current_binding()
+    if not binding:
+        return False
+    try:
+        file_name, content = _build_digest_attachment(entries, digest_date, _DIGEST_ATTACHMENT_FORMAT)
+        file_key = _upload_file(file_name, content)
+    except Exception as e:
+        logger.error(f"夜间汇总附件上传失败: {e}")
+        return False
+
+    card_sent = _send_card_to_message_id(binding.receive_id_type, binding.receive_id, card) is not None
+    if not card_sent:
+        return False
+    return _send_file_to(binding.receive_id_type, binding.receive_id, file_key)
+
+
+def _build_digest_attachment(entries: list[dict], digest_date: str, format: str = "markdown") -> tuple[str, bytes]:
+    extension = _DIGEST_ATTACHMENT_EXTENSIONS.get(format)
+    if not extension:
+        raise ValueError(f"不支持的夜间汇总附件格式: {format}")
+    if format == "markdown":
+        content = _format_digest_markdown(entries, digest_date)
+    else:
+        raise ValueError(f"不支持的夜间汇总附件格式: {format}")
+    return f"smzdm_digest_{digest_date}.{extension}", content.encode("utf-8")
+
+
+def _format_digest_markdown(entries: list[dict], digest_date: str) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    parts = [
+        f"# 什么值得买夜间汇总 ({digest_date})",
+        "",
+        f"- 生成时间: {now}",
+        f"- near-miss 商品数: {len(entries)}",
+        "",
+    ]
+    for index, entry in enumerate(entries, start=1):
+        title = str(entry.get("title") or "未知商品").strip()
+        link = str(entry.get("link") or "").strip()
+        tags = entry.get("tags") or []
+        tag_text = " ".join(str(tag) for tag in tags if str(tag).strip()) if isinstance(tags, list) else str(tags)
+        reason = _strip_skip_reason_prefix(entry.get("skip_reason", ""))
+
+        parts.extend(
+            [
+                f"## {index}. {title}",
+                "",
+                f"- 链接: {link or '-'}",
+                f"- 价格: {entry.get('price') or '-'}",
+                f"- 商城: {entry.get('mall') or '-'}",
+                f"- 品牌: {entry.get('brand') or '-'}",
+                (
+                    f"- 热度: 值 {entry.get('worthy', 0)} / 不值 {entry.get('unworthy', 0)}"
+                    f" / 评论 {entry.get('comments', 0)} / 收藏 {entry.get('favorites', 0)}"
+                ),
+                f"- 榜单: {entry.get('tab_name') or '-'} #{entry.get('rank') or '-'}",
+                f"- 标签: {tag_text or '-'}",
+                f"- 跳过原因: {reason or '-'}",
+                "",
+            ]
+        )
+    return "\n".join(parts).rstrip() + "\n"
 
 
 def build_draft_preview_card(draft: Any) -> Card:

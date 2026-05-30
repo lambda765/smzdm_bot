@@ -66,6 +66,14 @@ def get_image_models() -> tuple[Any, Any]:
         return CreateImageRequest, CreateImageRequestBody
 
 
+def get_file_models() -> tuple[Any, Any]:
+    """获取上传文件需要的 SDK model。"""
+    with _IMPORT_LOCK:
+        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
+
+        return CreateFileRequest, CreateFileRequestBody
+
+
 def get_message_update_models() -> tuple[Any, Any]:
     """获取更新消息需要的 SDK model（使用 PATCH 方法）。"""
     with _IMPORT_LOCK:
