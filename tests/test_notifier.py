@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from smzdm_notice.feishu import notifier
-from smzdm_notice.feishu.binding import FeishuBindingStore
+from smzdm_notice.feishu.binding import FeishuBinding, FeishuBindingStore
 from smzdm_notice.llm.models import ArbiterInfo, FilterResult, Recommendation
 from smzdm_notice.preferences.models import ConfigDraft
 from smzdm_notice.smzdm.ranking import RankingItem
@@ -40,6 +40,25 @@ def _search_bypass_item() -> RankingItem:
     item.search_keyword = "AirPods Pro 2"
     item.search_max_price = 99.9
     return item
+
+
+def _digest_entry(index: int) -> dict:
+    return {
+        "article_id": f"10{index:02d}",
+        "title": f"完整测试商品 {index}",
+        "price": f"¥{index}.9",
+        "mall": f"测试商城 {index}",
+        "brand": f"测试品牌 {index}",
+        "worthy": index,
+        "unworthy": index // 2,
+        "comments": index * 3,
+        "favorites": index * 4,
+        "tags": ["好价", f"标签{index}"],
+        "link": f"https://example.com/deal/{index}",
+        "tab_name": "综合",
+        "rank": index,
+        "skip_reason": f"跳过原因：完整跳过原因 {index}",
+    }
 
 
 class NotifierBindingTests(unittest.TestCase):
@@ -166,6 +185,111 @@ class NotifierBindingTests(unittest.TestCase):
         self.assertIn("deal_follow", action_values)
         self.assertNotIn("search_remove_keyword", action_values)
         self.assertNotIn("search_clear_price", action_values)
+
+    def test_send_digest_without_overflow_sends_only_card(self) -> None:
+        sent_cards = []
+        entries = [_digest_entry(index) for index in range(1, 21)]
+        with (
+            patch(
+                "smzdm_notice.feishu.notifier._send_card_message_id",
+                side_effect=lambda card: sent_cards.append(card) or "om_digest",
+            ),
+            patch("smzdm_notice.feishu.notifier._upload_file") as upload_file,
+        ):
+            self.assertTrue(notifier.send_digest(entries, "2026-05-30"))
+
+        upload_file.assert_not_called()
+        markdown = "\n".join(element.get("content", "") for element in sent_cards[0]["elements"])
+        self.assertIn("完整测试商品 20", markdown)
+        self.assertNotIn("完整测试商品 21", markdown)
+        self.assertNotIn("完整内容见附件", markdown)
+
+    def test_send_digest_with_overflow_sends_full_markdown_attachment(self) -> None:
+        sent_cards = []
+        sent_files = []
+        calls = []
+        entries = [_digest_entry(index) for index in range(1, 26)]
+        binding = FeishuBinding("chat_id", "oc_digest", "2026-05-30T22:00:00", "ou_user", "test")
+        with (
+            patch("smzdm_notice.feishu.notifier._current_binding", return_value=binding),
+            patch(
+                "smzdm_notice.feishu.notifier._upload_file",
+                side_effect=lambda file_name, content: (
+                    calls.append("upload") or sent_files.append((file_name, content)) or "file_digest"
+                ),
+            ),
+            patch(
+                "smzdm_notice.feishu.notifier._send_card_to_message_id",
+                side_effect=lambda _receive_id_type, _receive_id, card: (
+                    calls.append("card") or sent_cards.append(card) or "om_digest"
+                ),
+            ),
+            patch(
+                "smzdm_notice.feishu.notifier._send_file_to",
+                side_effect=lambda _receive_id_type, _receive_id, _file_key: calls.append("file") or True,
+            ),
+        ):
+            self.assertTrue(notifier.send_digest(entries, "2026-05-30"))
+
+        self.assertEqual(calls, ["upload", "card", "file"])
+        card_markdown = "\n".join(element.get("content", "") for element in sent_cards[0]["elements"])
+        self.assertIn("完整测试商品 20", card_markdown)
+        self.assertNotIn("完整测试商品 21", card_markdown)
+        self.assertIn("完整内容见附件", card_markdown)
+
+        self.assertEqual(sent_files[0][0], "smzdm_digest_2026-05-30.md")
+        attachment = sent_files[0][1].decode("utf-8")
+        self.assertIn("# 什么值得买夜间汇总 (2026-05-30)", attachment)
+        self.assertIn("## 1. 完整测试商品 1", attachment)
+        self.assertIn("## 25. 完整测试商品 25", attachment)
+        self.assertIn("- 链接: https://example.com/deal/25", attachment)
+        self.assertIn("- 跳过原因: 完整跳过原因 25", attachment)
+
+    def test_send_digest_returns_false_when_attachment_fails(self) -> None:
+        entries = [_digest_entry(index) for index in range(1, 22)]
+        binding = FeishuBinding("chat_id", "oc_digest", "2026-05-30T22:00:00", "ou_user", "test")
+        with (
+            patch("smzdm_notice.feishu.notifier._current_binding", return_value=binding),
+            patch("smzdm_notice.feishu.notifier._upload_file", side_effect=RuntimeError("upload failed")),
+            patch("smzdm_notice.feishu.notifier._send_card_to_message_id") as send_card,
+        ):
+            self.assertFalse(notifier.send_digest(entries, "2026-05-30"))
+        send_card.assert_not_called()
+
+    def test_upload_file_returns_file_key(self) -> None:
+        CreateFileRequest = Mock()
+        request_builder = Mock()
+        request_builder.request_body.return_value = request_builder
+        request_builder.build.return_value = "request"
+        CreateFileRequest.builder.return_value = request_builder
+
+        CreateFileRequestBody = Mock()
+        body_builder = Mock()
+        body_builder.file_type.return_value = body_builder
+        body_builder.file_name.return_value = body_builder
+        body_builder.file.return_value = body_builder
+        body_builder.build.return_value = "body"
+        CreateFileRequestBody.builder.return_value = body_builder
+
+        response = Mock()
+        response.success.return_value = True
+        response.data.file_key = "file_key"
+        client = Mock()
+        client.im.v1.file.create.return_value = response
+
+        with (
+            patch(
+                "smzdm_notice.feishu.notifier.get_file_models",
+                return_value=(CreateFileRequest, CreateFileRequestBody),
+            ),
+            patch("smzdm_notice.feishu.notifier.get_lark_client", return_value=client),
+        ):
+            self.assertEqual(notifier._upload_file("digest.md", b"content"), "file_key")
+
+        body_builder.file_type.assert_called_once_with("stream")
+        body_builder.file_name.assert_called_once_with("digest.md")
+        body_builder.file.assert_called_once()
+        client.im.v1.file.create.assert_called_once_with("request")
 
     def test_send_poll_failure_warning_sanitizes_detail(self) -> None:
         sent_cards = []

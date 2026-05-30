@@ -55,6 +55,20 @@ class MainConfigValidationTests(unittest.TestCase):
             stack.enter_context(patch("smzdm_notice.runtime.logger.error"))
             self.assertFalse(main._validate_config())
 
+    def test_digest_failure_does_not_clear_near_miss_cache(self) -> None:
+        near_miss_mgr = MagicMock()
+        near_miss_mgr.get_last_digest_date.return_value = ""
+        near_miss_mgr.get_all_sorted.return_value = [{"title": f"item {index}"} for index in range(21)]
+
+        with (
+            patch("smzdm_notice.runtime.config.DIGEST_HOUR", 0),
+            patch("smzdm_notice.runtime.send_digest", return_value=False) as send_digest,
+        ):
+            main._check_digest(near_miss_mgr)
+
+        send_digest.assert_called_once()
+        near_miss_mgr.clear_and_set_digest_date.assert_not_called()
+
 
 class MainConfigParsingTests(unittest.TestCase):
     def test_get_bool_parses_common_values_and_falls_back(self) -> None:
@@ -189,9 +203,13 @@ class MainLifecycleTests(unittest.TestCase):
 
         with ExitStack() as stack:
             stack.enter_context(patch("smzdm_notice.runtime._ensure_startup_ready"))
-            stack.enter_context(patch("smzdm_notice.runtime._initialize_runtime", return_value=(dedup, near_miss_mgr, binding_store)))
+            stack.enter_context(
+                patch("smzdm_notice.runtime._initialize_runtime", return_value=(dedup, near_miss_mgr, binding_store))
+            )
             stack.enter_context(patch("smzdm_notice.runtime._notify_startup_if_bound"))
-            stack.enter_context(patch("smzdm_notice.runtime._run_poll_loop", side_effect=lambda *_args: calls.append("poll")))
+            stack.enter_context(
+                patch("smzdm_notice.runtime._run_poll_loop", side_effect=lambda *_args: calls.append("poll"))
+            )
             stack.enter_context(patch("smzdm_notice.runtime.close_client", side_effect=lambda: calls.append("close")))
             notify = stack.enter_context(
                 patch("smzdm_notice.runtime._notify_shutdown_or_restart", side_effect=lambda: calls.append("notify"))
@@ -210,7 +228,9 @@ class MainLifecycleTests(unittest.TestCase):
 
         with ExitStack() as stack:
             stack.enter_context(patch("smzdm_notice.runtime._ensure_startup_ready"))
-            stack.enter_context(patch("smzdm_notice.runtime._initialize_runtime", return_value=(dedup, near_miss_mgr, binding_store)))
+            stack.enter_context(
+                patch("smzdm_notice.runtime._initialize_runtime", return_value=(dedup, near_miss_mgr, binding_store))
+            )
             stack.enter_context(patch("smzdm_notice.runtime._notify_startup_if_bound"))
             stack.enter_context(patch("smzdm_notice.runtime._run_poll_loop", side_effect=error))
             close = stack.enter_context(patch("smzdm_notice.runtime.close_client"))
