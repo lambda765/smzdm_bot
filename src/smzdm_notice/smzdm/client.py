@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from typing import Callable
 
@@ -11,6 +12,8 @@ import httpx
 from smzdm_notice.core import config
 
 TIMEOUT = 30.0
+_CLIENT_LOCK = threading.Lock()
+_SHARED_CLIENT: httpx.Client | None = None
 
 # 需要过滤掉的 cell_type（广告/推广位等）
 AD_CELL_TYPES = {"21017"}
@@ -33,6 +36,24 @@ def _require_smzdm_user_agent() -> str:
     if not config.SMZDM_USER_AGENT:
         raise RuntimeError("SMZDM_USER_AGENT 未配置，请在 .env 中填写什么值得买 User-Agent")
     return config.SMZDM_USER_AGENT
+
+
+def get_client() -> httpx.Client:
+    """Return the shared SMZDM HTTP client."""
+    global _SHARED_CLIENT
+    with _CLIENT_LOCK:
+        if _SHARED_CLIENT is None:
+            _SHARED_CLIENT = httpx.Client(timeout=TIMEOUT)
+        return _SHARED_CLIENT
+
+
+def close_client() -> None:
+    """Close and clear the shared SMZDM HTTP client."""
+    global _SHARED_CLIENT
+    with _CLIENT_LOCK:
+        if _SHARED_CLIENT is not None:
+            _SHARED_CLIENT.close()
+            _SHARED_CLIENT = None
 
 
 def build_signed_params(
@@ -72,9 +93,8 @@ def get_json(
         "accept-encoding": "gzip",
         "User-Agent": _require_smzdm_user_agent(),
     }
-    with httpx.Client(timeout=TIMEOUT) as client:
-        resp = client.get(f"{base_url}{endpoint}", params=signed, headers=headers)
-        resp.raise_for_status()
+    resp = get_client().get(f"{base_url}{endpoint}", params=signed, headers=headers)
+    resp.raise_for_status()
 
     data = resp.json()
     code = data.get("error_code")

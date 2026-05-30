@@ -5,17 +5,21 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qsl, urlsplit
 
 from smzdm_notice.core import config
-from smzdm_notice.smzdm.client import build_signed_params, compact_sign_value, get_json
+from smzdm_notice.smzdm.client import build_signed_params, close_client, compact_sign_value, get_client, get_json
 from smzdm_notice.smzdm.ranking import RankingConfig, RankingItem, _ranking_params
 from smzdm_notice.smzdm.search import _parse_search_rows, _search_params
 from smzdm_notice.smzdm.sources import fetch_all_sources
 
 
 class SmzdmSignTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        close_client()
+
     def test_search_sign_uses_configured_key(self) -> None:
         url = (
             "https://s-api.smzdm.com/sou/list_v10?basic_v=0&category_id=&category_name=&f=iphone"
@@ -54,6 +58,55 @@ class SmzdmSignTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "SMZDM_USER_AGENT"),
         ):
             get_json("https://example.com", "/api", {"keyword": "AirPods", "time": 1000})
+
+    def test_get_client_reuses_shared_httpx_client_until_closed(self) -> None:
+        created = []
+
+        def client_factory(**kwargs):
+            client = Mock()
+            client.close = Mock()
+            created.append((kwargs, client))
+            return client
+
+        with patch("smzdm_notice.smzdm.client.httpx.Client", side_effect=client_factory):
+            first = get_client()
+            second = get_client()
+            close_client()
+            third = get_client()
+
+        self.assertIs(first, second)
+        self.assertIsNot(first, third)
+        self.assertEqual(len(created), 2)
+        self.assertEqual(created[0][0]["timeout"], 30.0)
+        created[0][1].close.assert_called_once_with()
+
+    def test_close_client_is_idempotent(self) -> None:
+        close_client()
+        client = Mock()
+
+        with patch("smzdm_notice.smzdm.client.httpx.Client", return_value=client):
+            get_client()
+            close_client()
+            close_client()
+
+        client.close.assert_called_once_with()
+
+    def test_get_json_reuses_shared_http_client(self) -> None:
+        response = Mock()
+        response.json.return_value = {"error_code": 0}
+        response.raise_for_status.return_value = None
+        client = SimpleNamespace(get=Mock(return_value=response), close=Mock())
+
+        with (
+            patch.object(config, "SMZDM_SIGN_KEY", "test-sign-key"),
+            patch.object(config, "SMZDM_USER_AGENT", "ua"),
+            patch("smzdm_notice.smzdm.client.httpx.Client", return_value=client) as client_factory,
+        ):
+            get_json("https://example.com", "/api", {"keyword": "AirPods", "time": 1000})
+            get_json("https://example.com", "/api", {"keyword": "AirPods", "time": 1001})
+
+        client_factory.assert_called_once_with(timeout=30.0)
+        self.assertEqual(client.get.call_count, 2)
 
 
 def _expected_sign(params: dict, normalizer, sign_key: str) -> str:

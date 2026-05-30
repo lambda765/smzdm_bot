@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -41,6 +43,27 @@ def _search_bypass_item() -> RankingItem:
 
 
 class NotifierBindingTests(unittest.TestCase):
+    def test_binding_file_is_written_with_owner_only_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "binding.json"
+            store = FeishuBindingStore(path)
+
+            binding = store.bind("open_id", "ou_1", "ou_operator", "private")
+
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["receive_id"], binding.receive_id)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_binding_file_permissions_are_fixed_when_replacing_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "binding.json"
+            path.write_text("{}", encoding="utf-8")
+            os.chmod(path, 0o644)
+            store = FeishuBindingStore(path)
+
+            store.bind("open_id", "ou_1", "ou_operator", "private")
+
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
     def test_send_card_success_returns_true_when_message_id_exists(self) -> None:
         with patch("smzdm_notice.feishu.notifier._send_card_message_id", return_value="om_1"):
             self.assertTrue(notifier._send_card_success({"elements": []}))

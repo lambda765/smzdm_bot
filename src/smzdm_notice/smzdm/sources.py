@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 
 from loguru import logger
 
+from smzdm_notice.core.sleep import interruptible_sleep
 from smzdm_notice.smzdm.keywords import SearchKeywordRule
 from smzdm_notice.smzdm.ranking import RankingConfig, RankingItem, get_ranking
 from smzdm_notice.smzdm.search import get_search
@@ -76,10 +76,4 @@ def _sleep_between_sources(
     interval_seconds: int,
     should_stop: Callable[[], bool] | None = None,
 ) -> None:
-    elapsed = 0
-    while elapsed < interval_seconds:
-        if should_stop and should_stop():
-            logger.info("收到停止信号，中断等待")
-            break
-        time.sleep(min(1, interval_seconds - elapsed))
-        elapsed += 1
+    interruptible_sleep(interval_seconds, should_stop)

@@ -49,10 +49,16 @@ class DedupManager:
             logger.debug(f"清理 {len(expired)} 条过期去重记录")
             self._save()
 
+    def cleanup(self) -> None:
+        """批量清理过期记录。"""
+        self._cleanup()
+
     def is_new(self, url: str) -> bool:
         """判断该 URL 是否为新商品（未在缓存中或已过期）。"""
-        self._cleanup()
-        return url not in self._cache
+        ts = self._cache.get(url)
+        if ts is None:
+            return True
+        return time.time() - ts > self._expire_seconds
 
     def mark_sent(self, url: str) -> None:
         """标记该 URL 已推送。"""

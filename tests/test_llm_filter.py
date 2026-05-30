@@ -10,7 +10,7 @@ from openai import APITimeoutError, BadRequestError, RateLimitError
 
 from smzdm_notice.llm.arbitration import ArbitrationRequest, arbitrate
 from smzdm_notice.llm.clients import _clear_client_cache, get_arbiter_client, get_draft_client, get_filter_client
-from smzdm_notice.llm.filter import _single_llm_call, filter_items
+from smzdm_notice.llm.filter import _build_prompt_context, _single_llm_call, filter_items
 from smzdm_notice.llm.models import FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
 from smzdm_notice.smzdm.ranking import RankingItem
 
@@ -203,6 +203,21 @@ class LlmClientReuseTests(unittest.TestCase):
 
         self.assertIsNot(first, second)
         self.assertEqual(created[1]["timeout"], 120.0)
+
+
+class LlmPromptContextTests(unittest.TestCase):
+    def test_build_prompt_context_reuses_item_summary_without_losing_arbiter_fields(self) -> None:
+        item = _item()
+        item.rank = 7
+        item.link = "https://example.com/deal/1001"
+
+        with patch.object(item, "to_llm_summary", wraps=item.to_llm_summary) as to_llm_summary:
+            context = _build_prompt_context([item], "用户偏好", "库存")
+
+        to_llm_summary.assert_called_once_with()
+        self.assertNotIn("rank", context.items_summary[0])
+        self.assertEqual(context.arbiter_items[item.article_id]["rank"], 7)
+        self.assertEqual(context.arbiter_items[item.article_id]["link"], "https://example.com/deal/1001")
 
 
 class LlmFilterDiagnosticsTests(unittest.TestCase):

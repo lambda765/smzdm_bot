@@ -6,13 +6,13 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable
 
 from loguru import logger
 
 from smzdm_notice.core import config as app_config
+from smzdm_notice.core.sleep import interruptible_sleep
 from smzdm_notice.smzdm.client import (
     AD_CELL_TYPES,
     extract_article_tags,
@@ -242,14 +242,7 @@ def fetch_all_rankings(
 
         # 在两个榜单之间等待，最后一个不等
         if i < len(configs) - 1:
-            # 分段 sleep，以便及时响应停止信号
-            elapsed = 0
-            while elapsed < interval_seconds:
-                if should_stop and should_stop():
-                    logger.info("收到停止信号，中断等待")
-                    break
-                time.sleep(min(1, interval_seconds - elapsed))
-                elapsed += 1
+            interruptible_sleep(interval_seconds, should_stop)
 
     logger.info(f"共获取 {len(all_items)} 条商品（来自 {len(configs)} 个榜单）")
     return all_items

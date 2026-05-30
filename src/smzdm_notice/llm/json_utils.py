@@ -28,12 +28,6 @@ def extract_json_object(content: str | None) -> dict | None:
     if data is not None:
         return data
 
-    json_match = re.search(r"\{.*\}", clean, re.DOTALL)
-    if json_match:
-        data = _loads_object(json_match.group())
-        if data is not None:
-            return data
-
     return _scan_first_json_object(clean)
 
 

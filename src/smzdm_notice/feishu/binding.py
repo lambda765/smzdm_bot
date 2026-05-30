@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -24,6 +26,21 @@ class FeishuBinding:
     bound_at: str
     bound_by_open_id: str
     source: str
+
+
+def _write_binding_file(filepath: Path, data: dict) -> None:
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = ""
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=str(filepath.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 class FeishuBindingStore:
@@ -57,8 +74,7 @@ class FeishuBindingStore:
             source=source,
         )
         with self._lock:
-            self.filepath.parent.mkdir(parents=True, exist_ok=True)
-            self.filepath.write_text(json.dumps(asdict(binding), ensure_ascii=False, indent=2), encoding="utf-8")
+            _write_binding_file(self.filepath, asdict(binding))
         return binding
 
     def clear(self) -> None:

@@ -58,9 +58,22 @@ class MainConfigValidationTests(unittest.TestCase):
 
 class MainConfigParsingTests(unittest.TestCase):
     def test_get_bool_parses_common_values_and_falls_back(self) -> None:
-        with patch.dict(os.environ, {"BOOL_TRUE": "yes", "BOOL_FALSE": "off", "BOOL_BAD": "maybe"}):
-            self.assertTrue(main.config._get_bool("BOOL_TRUE"))
+        with patch.dict(
+            os.environ,
+            {
+                "BOOL_ONE": "1",
+                "BOOL_YES": "yes",
+                "BOOL_ON": "on",
+                "BOOL_FALSE": "false",
+                "BOOL_OFF": "off",
+                "BOOL_BAD": "maybe",
+            },
+        ):
+            self.assertTrue(main.config._get_bool("BOOL_ONE"))
+            self.assertTrue(main.config._get_bool("BOOL_YES"))
+            self.assertTrue(main.config._get_bool("BOOL_ON"))
             self.assertFalse(main.config._get_bool("BOOL_FALSE", True))
+            self.assertFalse(main.config._get_bool("BOOL_OFF", True))
             self.assertTrue(main.config._get_bool("BOOL_BAD", True))
 
     def test_get_float_parses_values_and_falls_back(self) -> None:
@@ -141,6 +154,16 @@ class MainConfigSummaryTests(unittest.TestCase):
 
 
 class MainRestartTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        main._restart_event.clear()
+        main._stop_event.clear()
+
+    def test_request_restart_sets_event_once(self) -> None:
+        self.assertTrue(main._request_restart())
+        self.assertTrue(main._restart_event.is_set())
+        self.assertTrue(main._stop_event.is_set())
+        self.assertFalse(main._request_restart())
+
     def test_exec_restart_marks_dotenv_for_reload(self) -> None:
         with ExitStack() as stack:
             stack.enter_context(patch.dict(os.environ, {"LLM_API_KEY": "old-key"}, clear=True))
@@ -155,6 +178,49 @@ class MainRestartTests(unittest.TestCase):
         self.assertEqual(argv, ["/usr/bin/python", "main.py"])
         self.assertEqual(env["LLM_API_KEY"], "old-key")
         self.assertEqual(env["SMZDM_RESTART_RELOAD_DOTENV"], "1")
+
+
+class MainLifecycleTests(unittest.TestCase):
+    def test_main_closes_smzdm_client_before_shutdown_notification(self) -> None:
+        dedup = MagicMock()
+        near_miss_mgr = MagicMock()
+        binding_store = MagicMock()
+        calls = []
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("smzdm_notice.runtime._ensure_startup_ready"))
+            stack.enter_context(patch("smzdm_notice.runtime._initialize_runtime", return_value=(dedup, near_miss_mgr, binding_store)))
+            stack.enter_context(patch("smzdm_notice.runtime._notify_startup_if_bound"))
+            stack.enter_context(patch("smzdm_notice.runtime._run_poll_loop", side_effect=lambda *_args: calls.append("poll")))
+            stack.enter_context(patch("smzdm_notice.runtime.close_client", side_effect=lambda: calls.append("close")))
+            notify = stack.enter_context(
+                patch("smzdm_notice.runtime._notify_shutdown_or_restart", side_effect=lambda: calls.append("notify"))
+            )
+
+            main.main()
+
+        self.assertEqual(calls, ["poll", "close", "notify"])
+        notify.assert_called_once_with()
+
+    def test_main_closes_smzdm_client_when_poll_loop_raises(self) -> None:
+        dedup = MagicMock()
+        near_miss_mgr = MagicMock()
+        binding_store = MagicMock()
+        error = RuntimeError("poll failed")
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("smzdm_notice.runtime._ensure_startup_ready"))
+            stack.enter_context(patch("smzdm_notice.runtime._initialize_runtime", return_value=(dedup, near_miss_mgr, binding_store)))
+            stack.enter_context(patch("smzdm_notice.runtime._notify_startup_if_bound"))
+            stack.enter_context(patch("smzdm_notice.runtime._run_poll_loop", side_effect=error))
+            close = stack.enter_context(patch("smzdm_notice.runtime.close_client"))
+            notify = stack.enter_context(patch("smzdm_notice.runtime._notify_shutdown_or_restart"))
+
+            with self.assertRaises(RuntimeError):
+                main.main()
+
+        close.assert_called_once_with()
+        notify.assert_not_called()
 
 
 class MainStopSignalTests(unittest.TestCase):

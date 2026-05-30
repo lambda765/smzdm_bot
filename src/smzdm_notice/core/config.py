@@ -105,14 +105,15 @@ def get_smzdm_client_platform() -> str:
         return SMZDM_CLIENT_PLATFORM
     raise RuntimeError("SMZDM_CLIENT_PLATFORM 仅支持 iphone 或 android")
 
+
 # ========== LLM 配置 ==========
 LLM_API_KEY: str = _get("LLM_API_KEY")
 LLM_BASE_URL: str = _get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL: str = _get("LLM_MODEL", "deepseek-chat")
 LLM_MAX_RETRIES: int = _get_int("LLM_MAX_RETRIES", 2)
 LLM_TIMEOUT_SECONDS: float = _get_float_fallback("LLM_TIMEOUT_SECONDS", 300.0)
-LLM_DUAL_FILTER: bool = _get("LLM_DUAL_FILTER", "false").lower() == "true"
-LLM_ARBITER_ENABLED: bool = _get("LLM_ARBITER_ENABLED", "true").lower() == "true"
+LLM_DUAL_FILTER: bool = _get_bool("LLM_DUAL_FILTER", False)
+LLM_ARBITER_ENABLED: bool = _get_bool("LLM_ARBITER_ENABLED", True)
 LLM_ARBITER_API_KEY: str = _get_fallback("LLM_ARBITER_API_KEY", LLM_API_KEY)
 LLM_ARBITER_BASE_URL: str = _get_fallback("LLM_ARBITER_BASE_URL", LLM_BASE_URL)
 LLM_ARBITER_MODEL: str = _get_fallback("LLM_ARBITER_MODEL", LLM_MODEL)

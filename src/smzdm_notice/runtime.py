@@ -37,6 +37,7 @@ from smzdm_notice.llm.filter import filter_items
 from smzdm_notice.llm.models import ArbiterInfo
 from smzdm_notice.preferences.builder import build_arbitration_draft
 from smzdm_notice.preferences.store import CONFIG_FILE_LOCK, DraftStore
+from smzdm_notice.smzdm.client import close_client
 from smzdm_notice.smzdm.keywords import SearchKeywordRule
 from smzdm_notice.smzdm.ranking import RANKINGS, RankingItem
 from smzdm_notice.smzdm.sources import fetch_all_sources
@@ -61,7 +62,8 @@ logger.add(
 # ========== 全局状态 ==========
 
 _stop_event = threading.Event()
-_restart_requested = False
+_restart_event = threading.Event()
+_restart_lock = threading.Lock()
 _last_push_time: float = time.time()
 _ranking_configs: list = []  # 启动时由 _resolve_ranking_configs() 填充
 _search_keywords: list[SearchKeywordRule] = []  # 启动时读取，轮询前刷新
@@ -88,10 +90,10 @@ def _signal_handler(sig, frame) -> None:
 
 def _request_restart() -> bool:
     """由飞书 /restart 触发，标记重启并退出主循环。"""
-    global _restart_requested
-    if _restart_requested:
-        return False
-    _restart_requested = True
+    with _restart_lock:
+        if _restart_event.is_set():
+            return False
+        _restart_event.set()
     _stop_event.set()
     return True
 
@@ -430,6 +432,7 @@ def _dedupe_poll_items(
     all_items: list[RankingItem],
     dedup: DedupManager,
 ) -> tuple[list[RankingItem], PollOutcome | None]:
+    dedup.cleanup()
     new_items = [item for item in all_items if dedup.is_new(item.link)]
     logger.info(f"去重后剩余 {len(new_items)}/{len(all_items)} 条新商品")
 
@@ -539,8 +542,7 @@ def _send_matches_and_update_state(
         global _last_push_time
         _last_push_time = time.time()
         dedup.mark_batch([item.link for item, _ in matched])
-        for item, _ in matched:
-            near_miss_mgr.remove(item.article_id)
+        near_miss_mgr.remove_batch([item.article_id for item, _ in matched])
         logger.info("推送成功，已更新去重缓存")
     else:
         logger.error("推送失败")
@@ -601,14 +603,13 @@ def _check_digest(near_miss_mgr: NearMissManager) -> None:
     entries = near_miss_mgr.get_all_sorted()
     if not entries:
         logger.info("今日无 near-miss 条目，跳过汇总")
-        near_miss_mgr.set_last_digest_date(today_str)
+        near_miss_mgr.clear_and_set_digest_date(today_str)
         return
 
     logger.info(f"发送夜间汇总: {len(entries)} 条 near-miss 条目")
     success = send_digest(entries, today_str)
     if success:
-        near_miss_mgr.set_last_digest_date(today_str)
-        near_miss_mgr.clear()
+        near_miss_mgr.clear_and_set_digest_date(today_str)
         logger.info("夜间汇总发送成功，已清空 near-miss 缓存")
 
 
@@ -691,7 +692,10 @@ def main() -> None:
     _ensure_startup_ready()
     dedup, near_miss_mgr, binding_store = _initialize_runtime()
     _notify_startup_if_bound(binding_store)
-    _run_poll_loop(binding_store, dedup, near_miss_mgr)
+    try:
+        _run_poll_loop(binding_store, dedup, near_miss_mgr)
+    finally:
+        close_client()
     _notify_shutdown_or_restart()
 
 
@@ -802,7 +806,7 @@ def _wait_until_next_poll(poll_interval: int) -> None:
 
 def _notify_shutdown_or_restart() -> None:
     logger.info("👋 好价监控已停止")
-    if _restart_requested:
+    if _restart_event.is_set():
         send_shutdown("正在重启程序...")
         logger.info("🔄 重启程序...")
         _exec_restart()

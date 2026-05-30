@@ -76,13 +76,15 @@ def _build_prompt_context(
 
     for item in items:
         item_id = item.article_id
-        summary = item.to_llm_summary()
+        raw_summary = item.to_llm_summary()
+
+        summary = dict(raw_summary)
         if "rank" in summary:
             del summary["rank"]
 
         items_summary.append(summary)
         item_map[item_id] = item
-        arbiter_summary = item.to_llm_summary()
+        arbiter_summary = dict(raw_summary)
         arbiter_summary["link"] = item.link
         arbiter_items[item_id] = arbiter_summary
 

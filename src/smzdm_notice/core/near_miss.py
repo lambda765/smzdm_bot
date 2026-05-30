@@ -17,6 +17,27 @@ from smzdm_notice.smzdm.ranking import RankingItem
 _STORE_META_KEY = "__meta__"
 
 
+def _serialize_item(item: RankingItem, skip_reason: str, timestamp: float) -> dict:
+    return {
+        "article_id": item.article_id,
+        "title": item.title,
+        "price": item.price,
+        "mall": item.mall,
+        "brand": item.brand,
+        "worthy": item.worthy,
+        "unworthy": item.unworthy,
+        "comments": item.comments,
+        "favorites": item.favorites,
+        "tags": item.tags,
+        "link": item.link,
+        "pic": item.pic,
+        "tab_name": item.tab_name,
+        "rank": item.rank,
+        "skip_reason": skip_reason,
+        "timestamp": timestamp,
+    }
+
+
 class NearMissManager:
     """Near-miss 商品管理器。"""
 
@@ -62,54 +83,30 @@ class NearMissManager:
 
     def add(self, item: RankingItem, skip_reason: str) -> None:
         """添加一条 near-miss（同一 article_id 保留最新记录）。"""
-        self._store[item.article_id] = {
-            "article_id": item.article_id,
-            "title": item.title,
-            "price": item.price,
-            "mall": item.mall,
-            "brand": item.brand,
-            "worthy": item.worthy,
-            "unworthy": item.unworthy,
-            "comments": item.comments,
-            "favorites": item.favorites,
-            "tags": item.tags,
-            "link": item.link,
-            "pic": item.pic,
-            "tab_name": item.tab_name,
-            "rank": item.rank,
-            "skip_reason": skip_reason,
-            "timestamp": time.time(),
-        }
+        self._store[item.article_id] = _serialize_item(item, skip_reason, time.time())
         self._save()
 
     def add_batch(self, items: list[tuple[RankingItem, str]]) -> None:
         """批量添加 near-miss 条目。"""
         now = time.time()
         for item, reason in items:
-            self._store[item.article_id] = {
-                "article_id": item.article_id,
-                "title": item.title,
-                "price": item.price,
-                "mall": item.mall,
-                "brand": item.brand,
-                "worthy": item.worthy,
-                "unworthy": item.unworthy,
-                "comments": item.comments,
-                "favorites": item.favorites,
-                "tags": item.tags,
-                "link": item.link,
-                "pic": item.pic,
-                "tab_name": item.tab_name,
-                "rank": item.rank,
-                "skip_reason": reason,
-                "timestamp": now,
-            }
+            self._store[item.article_id] = _serialize_item(item, reason, now)
         self._save()
 
     def remove(self, article_id: str) -> None:
         """移除单条记录。"""
         if article_id in self._store:
             del self._store[article_id]
+            self._save()
+
+    def remove_batch(self, article_ids: list[str]) -> None:
+        """批量移除多条记录，只在发生变更时写入一次。"""
+        changed = False
+        for article_id in article_ids:
+            if article_id in self._store:
+                del self._store[article_id]
+                changed = True
+        if changed:
             self._save()
 
     def get_all_sorted(self) -> list[dict]:
@@ -130,6 +127,12 @@ class NearMissManager:
 
     def set_last_digest_date(self, date_str: str) -> None:
         """设置上次发送汇总的日期。"""
+        self._meta["last_digest_date"] = date_str
+        self._save()
+
+    def clear_and_set_digest_date(self, date_str: str) -> None:
+        """清空所有条目并记录汇总日期，只写入一次文件。"""
+        self._store.clear()
         self._meta["last_digest_date"] = date_str
         self._save()
 

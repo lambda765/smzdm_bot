@@ -42,6 +42,7 @@ from smzdm_notice.preferences.store import DraftStore
 from smzdm_notice.smzdm import keywords as search_keywords
 
 DRAFT_PROGRESS_INTERVAL_SECONDS = 15
+INTERNAL_ERROR_MESSAGE = "处理消息时遇到内部错误，请稍后重试。"
 
 
 class MessageDeduper:
@@ -151,7 +152,7 @@ class FeishuInteractiveBot:
             self._start_message_worker(text, data, parent_id, message_id)
         except Exception as e:
             logger.error(f"处理飞书消息失败: {e}", exc_info=True)
-            self._reply_text(message_id, f"处理消息失败：{e}")
+            self._reply_text(message_id, INTERNAL_ERROR_MESSAGE)
 
     def _start_reaction_worker(self, message_id: str) -> None:
         if not message_id:
@@ -178,7 +179,7 @@ class FeishuInteractiveBot:
             self._handle_text_command(text, data, parent_id, reply_to_message_id)
         except Exception as e:
             logger.error(f"处理飞书消息失败: {e}", exc_info=True)
-            self._reply_text(reply_to_message_id, f"处理消息失败：{e}")
+            self._reply_text(reply_to_message_id, INTERNAL_ERROR_MESSAGE)
 
     def _add_get_reaction(self, message_id: str) -> None:
         if not message_id:
@@ -249,7 +250,7 @@ class FeishuInteractiveBot:
                 processing,
                 "处理消息失败，没能生成配置修改预览。",
                 reply_to_message_id,
-                f"处理消息失败：{e}",
+                INTERNAL_ERROR_MESSAGE,
             )
             return
         self._stop_draft_processing(processing)
@@ -280,7 +281,7 @@ class FeishuInteractiveBot:
                 processing,
                 "处理修改意见失败，没能生成新的配置修改预览。",
                 reply_to_message_id,
-                f"处理消息失败：{e}",
+                INTERNAL_ERROR_MESSAGE,
             )
             return
         self._stop_draft_processing(processing)
@@ -432,8 +433,8 @@ class FeishuInteractiveBot:
 
             result = self._dispatch_card_action(action, value, operator, reply_to_message_id)
         except Exception as e:
-            message = f"处理卡片操作失败：{e}"
-            logger.error(message, exc_info=True)
+            message = INTERNAL_ERROR_MESSAGE
+            logger.error(f"处理卡片操作失败: {e}", exc_info=True)
             self._reply_text(reply_to_message_id, message)
             result = CardActionResult(message)
         return _card_response(result.message, result.response_card)
@@ -554,7 +555,7 @@ class FeishuInteractiveBot:
                 build_draft_failure_card("商品快捷操作处理失败，没能生成配置修改预览。"),
             ):
                 return
-            self._reply_text(reply_to_message_id, f"商品快捷操作处理失败：{e}")
+            self._reply_text(reply_to_message_id, INTERNAL_ERROR_MESSAGE)
 
     def _handle_slash_command(self, text: str, reply_to_message_id: str = "") -> bool:
         if not text.startswith("/"):
