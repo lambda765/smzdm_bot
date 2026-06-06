@@ -16,6 +16,7 @@ from smzdm_notice.llm.clients import _clear_client_cache, get_client_for_config
 from smzdm_notice.llm.filter import _build_prompt_context, _single_llm_call, filter_items
 from smzdm_notice.llm.models import FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
+from smzdm_notice.llm.prompts import ARBITER_SYSTEM_PROMPT, SYSTEM_PROMPT
 from smzdm_notice.smzdm.ranking import RankingItem
 
 
@@ -102,6 +103,16 @@ def _routing_snapshot() -> RoutingSnapshot:
         },
     }
     return RoutingSnapshot(raw=raw, version=1, path=Path("llm_models.json"), source="test")
+
+
+def _successful_client(captured: dict, content: str | None = None) -> SimpleNamespace:
+    payload = content or json.dumps({"recommendations": [], "near_misses": []}, ensure_ascii=False)
+
+    def create_completion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=payload))])
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
 
 
 def _filter_items_with_mocked_call(*outcomes: LLMCallOutcome, dual_filter: bool = False):
@@ -282,13 +293,85 @@ class LlmPromptContextTests(unittest.TestCase):
         item.rank = 7
         item.link = "https://example.com/deal/1001"
 
-        with patch.object(item, "to_llm_summary", wraps=item.to_llm_summary) as to_llm_summary:
+        with (
+            patch.object(item, "to_llm_summary", wraps=item.to_llm_summary) as to_llm_summary,
+            patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
+        ):
             context = _build_prompt_context([item], "用户偏好", "库存")
 
         to_llm_summary.assert_called_once_with()
         self.assertNotIn("rank", context.items_summary[0])
         self.assertEqual(context.arbiter_items[item.article_id]["rank"], 7)
         self.assertEqual(context.arbiter_items[item.article_id]["link"], "https://example.com/deal/1001")
+
+
+class LlmExtraBodyTests(unittest.TestCase):
+    def test_filter_call_passes_scene_extra_body(self) -> None:
+        captured = {}
+
+        llm_config = replace(_llm_config(), extra_body={"custom_flag": False})
+        outcome = _single_llm_call(_successful_client(captured), llm_config, "user message")
+
+        self.assertIsNotNone(outcome.result)
+        self.assertEqual(captured["extra_body"], {"custom_flag": False})
+
+    def test_filter_call_omits_empty_extra_body(self) -> None:
+        captured = {}
+
+        outcome = _single_llm_call(_successful_client(captured), _llm_config(), "user message")
+
+        self.assertIsNotNone(outcome.result)
+        self.assertNotIn("extra_body", captured)
+
+
+class LlmPromptTests(unittest.TestCase):
+    def test_system_prompt_keeps_generic_examples_without_user_specific_categories(self) -> None:
+        self.assertIn("本系统 Prompt 只定义稳定筛选方法", SYSTEM_PROMPT)
+        self.assertIn("运行时补充说明", SYSTEM_PROMPT)
+        self.assertIn("不是单独推荐条件", SYSTEM_PROMPT)
+        self.assertIn("不是推荐门槛", SYSTEM_PROMPT)
+        self.assertIn("不能作为反向否决理由", SYSTEM_PROMPT)
+        self.assertIn("不应仅因基础值率偏低一票否决", SYSTEM_PROMPT)
+        self.assertIn("只影响质量信号评估", SYSTEM_PROMPT)
+        self.assertIn("质量信号评估", SYSTEM_PROMPT)
+        self.assertIn("只有用户偏好明确写出", SYSTEM_PROMPT)
+        self.assertIn('"一律不推荐"', SYSTEM_PROMPT)
+        self.assertIn("单项硬否决理由", SYSTEM_PROMPT)
+        self.assertIn("不能把这些参考数字转换成硬性门槛", SYSTEM_PROMPT)
+        self.assertIn("反向排除条件", SYSTEM_PROMPT)
+        self.assertIn("按【质量信号评估】和运行时补充说明综合判断", SYSTEM_PROMPT)
+        self.assertIn("带风扇功能的灯具", SYSTEM_PROMPT)
+        self.assertIn("安装形态、容量、使用对象、摆放位置或核心场景", SYSTEM_PROMPT)
+        self.assertIn("不要仅凭品类名称相同直接硬排", SYSTEM_PROMPT)
+        self.assertIn("小容量壁挂或专用设备", SYSTEM_PROMPT)
+        self.assertIn("优先引用商品名、偏好中的品类名、库存项名或质量指标", SYSTEM_PROMPT)
+        self.assertIn('"不符合偏好"', SYSTEM_PROMPT)
+        self.assertIn("near-miss reason 必须保留真实近因", SYSTEM_PROMPT)
+        self.assertIn("值票 8、评论 12，综合热度偏弱", SYSTEM_PROMPT)
+        self.assertIn("未达到评论 >= 100 所以不推荐", SYSTEM_PROMPT)
+        self.assertIn("抽纸库存充足", SYSTEM_PROMPT)
+        self.assertNotIn("质量门槛：", SYSTEM_PROMPT)
+
+    def test_arbiter_prompt_requires_per_item_false_positive_and_false_negative_review(self) -> None:
+        self.assertIn("逐个争议商品", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("误推", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("漏推", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("不要只按推荐数量", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("细分形态差异", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("用户未明确说明", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("不要直接判定推荐方属于硬规则误推", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("不应替用户写死排除该细分形态", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("硬规则误推", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("软信号争议", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("漏推重点品类", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("偏好边界", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("软信号不足不能直接判为硬规则误推", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("不得把这些参考数字升级为硬规则", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("不能作为反向否决条件", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("评论或票数未达该阈值", ARBITER_SYSTEM_PROMPT)
+        self.assertIn('"评论必须 >= X"', ARBITER_SYSTEM_PROMPT)
+        self.assertIn("硬规则误推 > 明显漏推重点品类 > 软信号争议", ARBITER_SYSTEM_PROMPT)
+        self.assertIn("一次模型漏读、软信号边界", ARBITER_SYSTEM_PROMPT)
 
 
 class LlmFilterDiagnosticsTests(unittest.TestCase):
@@ -324,6 +407,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         self.assertIn("low-worthy", captured["user_message"])
         self.assertIn('"worthy": 1', captured["user_message"])
         self.assertIn('"unworthy": 100', captured["user_message"])
+        self.assertNotIn("## 运行时补充说明", captured["user_message"])
 
     def test_prefilter_requires_all_regular_metrics_when_enabled(self) -> None:
         captured = {}
@@ -357,6 +441,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             filter_items(items, "用户偏好", "库存", routing_snapshot=_routing_snapshot())
 
         self.assertIn("pass", captured["user_message"])
+        self.assertNotIn("## 运行时补充说明", captured["user_message"])
         self.assertNotIn("low-comments", captured["user_message"])
         self.assertNotIn("low-rate", captured["user_message"])
 
@@ -423,6 +508,24 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             )
 
         self.assertIn("comment-bypass", captured["user_message"])
+        self.assertIn("## 运行时补充说明", captured["user_message"])
+        self.assertLess(
+            captured["user_message"].index("## 耗材库存记录"),
+            captured["user_message"].index("## 运行时补充说明"),
+        )
+        self.assertLess(
+            captured["user_message"].index("## 运行时补充说明"),
+            captured["user_message"].index("## 当前好价排行榜商品列表"),
+        )
+        self.assertIn("评论数 >= 100", captured["user_message"])
+        self.assertIn("不要仅因值率一项否定", captured["user_message"])
+        self.assertIn("不是推荐门槛", captured["user_message"])
+        self.assertIn("不能作为反向否决理由", captured["user_message"])
+        self.assertNotIn("PREFILTER_MIN_WORTHY", captured["user_message"])
+        self.assertNotIn("普通阈值", captured["user_message"])
+        self.assertNotIn("值票数 >= 100", captured["user_message"])
+        self.assertNotIn("评论数 >= 200", captured["user_message"])
+        self.assertNotIn("收藏 >= 100", captured["user_message"])
 
     def test_prefilter_bypasses_on_worthy_when_enabled(self) -> None:
         captured = {}
@@ -458,6 +561,11 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             )
 
         self.assertIn("worthy-bypass", captured["user_message"])
+        self.assertIn("## 运行时补充说明", captured["user_message"])
+        self.assertIn("值票数 >= 100", captured["user_message"])
+        self.assertIn("不要仅因值率一项否定", captured["user_message"])
+        self.assertIn("不是推荐门槛", captured["user_message"])
+        self.assertIn("不能作为反向否决理由", captured["user_message"])
 
     def test_filter_items_model_argument_overrides_routed_model(self) -> None:
         captured = {}
@@ -589,7 +697,13 @@ class LlmFilterArbitrationTests(unittest.TestCase):
         response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
         )
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
+        captured = {}
+
+        def create_completion(**kwargs):
+            captured.update(kwargs)
+            return response
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
 
         info = arbitrate(
             ArbitrationRequest(
@@ -601,12 +715,16 @@ class LlmFilterArbitrationTests(unittest.TestCase):
                 items_by_id={},
                 user_message="用户偏好",
                 client=client,
-                llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
+                llm_config=replace(
+                    _llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
+                    extra_body={"arbiter_option": {"mode": "strict"}},
+                ),
             )
         )
 
         self.assertIsNotNone(info)
         self.assertEqual(info.chosen, "B")
+        self.assertEqual(captured["extra_body"], {"arbiter_option": {"mode": "strict"}})
         self.assertEqual(info.config_change_draft["target_file"], "preference.md")
         self.assertIn("字面精确匹配", info.config_change_draft["append_text"])
 

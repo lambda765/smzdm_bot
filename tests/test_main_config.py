@@ -108,6 +108,32 @@ class MainConfigParsingTests(unittest.TestCase):
             self.assertEqual(main.config._get_float_fallback("BAD_TIMEOUT", 300.0), 300.0)
             self.assertEqual(main.config._get_float_fallback("MISSING_TIMEOUT", 300.0), 300.0)
 
+    def test_get_json_object_parses_object_values(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"EXTRA_BODY": '{"custom_flag": false, "nested": {"mode": "strict"}, "number": 0.8}'},
+            clear=False,
+        ):
+            self.assertEqual(
+                main.config._get_json_object("EXTRA_BODY"),
+                {"custom_flag": False, "nested": {"mode": "strict"}, "number": 0.8},
+            )
+
+    def test_get_json_object_rejects_empty_invalid_and_non_object_values(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EMPTY_JSON": "",
+                "BAD_JSON": "{bad",
+                "ARRAY_JSON": '["not", "object"]',
+            },
+            clear=False,
+        ):
+            self.assertEqual(main.config._get_json_object("EMPTY_JSON"), {})
+            self.assertEqual(main.config._get_json_object("BAD_JSON"), {})
+            self.assertEqual(main.config._get_json_object("ARRAY_JSON"), {})
+            self.assertEqual(main.config._get_json_object("MISSING_JSON"), {})
+
     def test_clamp_rate_limits_to_zero_one_range(self) -> None:
         self.assertEqual(main.config._clamp_rate(-0.1), 0.0)
         self.assertEqual(main.config._clamp_rate(0.6), 0.6)

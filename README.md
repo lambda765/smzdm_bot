@@ -103,7 +103,7 @@ smzdm-notice setup
 | LLM | `LLM_MODELS_FILE` | 多 connection/agent 路由配置文件（默认 `llm_models.json`） |
 | 预筛选 | `PREFILTER_ENABLED` | 启用粗筛（默认 `false`） |
 | 预筛选 | `PREFILTER_MIN_WORTHY/COMMENTS/FAVORITES` | 最低准入阈值 |
-| 预筛选 | `PREFILTER_BYPASS_ENABLED` | 强信号直通（默认 `false`） |
+| 预筛选 | `PREFILTER_BYPASS_ENABLED` | 强信号直通（默认 `false`）；开启后会在 LLM 输入中补充强信号说明，避免仅因基础值率被否定 |
 | 轮询 | `POLL_INTERVAL_MINUTES` | 轮询间隔（默认 `30`） |
 | 轮询 | `HEARTBEAT_HOURS` | 心跳间隔（默认 `6`） |
 | 轮询 | `FETCH_INTERVAL_SECONDS` | 榜单抓取间隔（默认 `5`） |
@@ -117,6 +117,8 @@ smzdm-notice setup
 **LLM 多模型路由：** 新安装会生成 `llm_models.json` 并默认启用多模型路由。JSON 中只保存 `api_key_env`，真实密钥继续放 `.env`，例如 `LLM_DEEPSEEK_API_KEY=...`。运行时必须有 `llm_models.json`；旧安装可先运行 `smzdm-notice migrate-llm-config` 从旧 LLM 环境变量生成该文件。
 
 配置分三层：`connections` 保存 OpenAI 兼容接口连接，`defaults` 保存默认 connection/model_id/request 参数，`agents.filter/arbiter/draft` 只写覆盖项；未配置的 agent（包括 `draft`）会继承 defaults。`timeout_seconds/max_retries` 可写在 defaults、connection 或 agent 上，优先级为 agent > connection > defaults。运行时内置默认 `response_format={"type":"json_object"}`，即使 JSON 里省略该字段也会发送；用户可用非空 `response_format` 对象覆盖。agent request 中字段值为 `null` 表示继承默认值，不会关闭默认 `response_format`。
+
+`request.extra_body` 会按默认或 agent 覆盖原样透传给 OpenAI SDK，项目不校验 provider 字段含义。不同 provider 支持字段不同，例如 BigModel/智谱可用 `{"do_sample":false}` 降低随机漂移，或用 `{"thinking":{"type":"disabled"}}` 关闭 thinking；vLLM/SGLang 常见写法是 `{"chat_template_kwargs":{"enable_thinking":false}}`。
 
 飞书发送 `/model` 会打开 LLM 模型路由管理卡片，可在卡片中查看当前默认配置和 `filter/arbiter/draft` 的最终路由，选择作用范围、选择已加载 connection、输入 model_id、设置 temperature、reset agent 覆盖并做测试调用。
 

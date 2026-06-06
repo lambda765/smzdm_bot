@@ -77,6 +77,8 @@ def _build_prompt_context(
     user_prompt: str,
     inventory_data: str,
 ) -> FilterPromptContext:
+    from smzdm_notice.core import config
+
     items_summary: list[dict] = []
     item_map: dict[str, RankingItem] = {}
     arbiter_items: dict[str, dict] = {}
@@ -95,10 +97,13 @@ def _build_prompt_context(
         arbiter_summary["link"] = item.link
         arbiter_items[item_id] = arbiter_summary
 
+    prefilter_guidance = _build_prefilter_guidance(config)
+    prefilter_guidance_section = f"## 运行时补充说明\n{prefilter_guidance}\n\n" if prefilter_guidance else ""
     user_message = (
         f"## 当前系统时间\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"## 用户购物偏好\n{user_prompt}\n\n"
         f"## 耗材库存记录\n{inventory_data}\n\n"
+        f"{prefilter_guidance_section}"
         f"## 当前好价排行榜商品列表\n"
         f"```json\n{json.dumps(items_summary, ensure_ascii=False, indent=2)}\n```\n\n"
         f"请根据以上信息，严格执行筛选逻辑并输出推荐结果。"
@@ -296,3 +301,30 @@ def _parse_response(content: str) -> FilterResult:
 
     logger.warning(f"无法解析 LLM 响应: {(content or '')[:200]}")
     return FilterResult()
+
+
+def _build_prefilter_guidance(config) -> str:
+    if not config.PREFILTER_ENABLED or not config.PREFILTER_BYPASS_ENABLED:
+        return ""
+
+    conditions = []
+    if config.PREFILTER_BYPASS_MIN_COMMENTS > 0:
+        conditions.append(f"评论数 >= {config.PREFILTER_BYPASS_MIN_COMMENTS}")
+    if config.PREFILTER_BYPASS_MIN_WORTHY > 0:
+        conditions.append(f"值票数 >= {config.PREFILTER_BYPASS_MIN_WORTHY}")
+
+    if conditions:
+        condition_text = " 或 ".join(conditions)
+        return (
+            f"运行时补充：用户额外允许{condition_text}的商品进入 LLM 评估。"
+            "此类商品即使值率偏低，也不要仅因值率一项否定；"
+            "应结合评论热度、品类、价格、用户偏好、库存和专项品类评估要求综合判断。"
+            "这些阈值只解释候选进入原因，不是推荐门槛；"
+            "未达到某个直通阈值也不能作为反向否决理由。"
+        )
+
+    return (
+        "运行时补充：用户启用了强信号直通策略，允许部分不满足基础预筛选口径的商品进入 LLM 评估。"
+        "此类商品不要仅因值率一项否定；应结合评论热度、品类、价格、用户偏好、库存和专项品类评估要求综合判断。"
+        "这些阈值只解释候选进入原因，不是推荐门槛；未达到某个直通阈值也不能作为反向否决理由。"
+    )

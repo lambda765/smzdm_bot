@@ -23,6 +23,7 @@ from smzdm_notice.preferences.builder import (
     build_revision_draft,
 )
 from smzdm_notice.preferences.models import ConfigDraft
+from smzdm_notice.preferences.prompts import draft_rules_prompt
 from smzdm_notice.preferences.store import DraftStore
 
 
@@ -64,6 +65,26 @@ class PreferenceEditorTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_preference_template_uses_quality_signal_language(self) -> None:
+        template = (Path(__file__).resolve().parents[1] / "preference.md.template").read_text(encoding="utf-8")
+
+        self.assertIn("质量信号评估", template)
+        self.assertIn("开放推荐评估标准与加分项", template)
+        self.assertIn("专项品类评估要求", template)
+        self.assertNotIn("质量门槛（硬性要求，不满足则不推荐）", template)
+        self.assertNotIn("可填写", template)
+        self.assertNotIn("示例数字默认", template)
+        self.assertNotIn("开放推荐通常", template)
+        self.assertNotIn("专项品类可以", template)
+
+    def test_draft_prompt_treats_numbers_as_reference_by_default(self) -> None:
+        prompt = draft_rules_prompt()
+
+        self.assertIn("质量信号", prompt)
+        self.assertIn("专项品类评估要求", prompt)
+        self.assertIn("数字阈值默认写成参考线或质量信号", prompt)
+        self.assertIn('"必须"', prompt)
 
     def test_message_draft_uses_llm_data(self) -> None:
         with patch(

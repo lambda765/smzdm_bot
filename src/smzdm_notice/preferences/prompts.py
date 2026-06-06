@@ -34,7 +34,7 @@ edit_mode 取值：
 
 target_file 只能是 preference.md 或 inventory.md：
 - 库存、剩余数量、补货状态 → inventory.md
-- 想买、不想买、已有物品、质量门槛 → preference.md
+- 想买、不想买、已有物品、质量信号、专项品类评估要求 → preference.md
 </rules>
 
 <constraints>
@@ -45,6 +45,7 @@ target_file 只能是 preference.md 或 inventory.md：
 - 只有当用户意思明确是新增独立条目且文件无合适位置时才用 append
 - append_text/replace_text 使用自然的 Markdown 正文，可直接成为配置文件的一部分
 - 不在 append_text/replace_text 中写"机器人确认修改""来源""仲裁建议""一键采纳"等审计或包装文字
+- 数字阈值默认写成参考线或质量信号，不要写成硬性门槛；只有用户明确使用"必须""一律""不得低于""绝不推荐"等强约束时，才生成硬规则表述
 </constraints>
 """
 
