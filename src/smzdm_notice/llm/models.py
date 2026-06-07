@@ -15,6 +15,7 @@ class Recommendation(BaseModel):
 
     id: str
     reason: str
+    category: str = ""
 
 
 class NearMiss(BaseModel):
@@ -64,6 +65,7 @@ class FilterItemsResult:
 
     matched: list[tuple[RankingItem, str]] = field(default_factory=list)
     near_misses: list[tuple[RankingItem, str]] = field(default_factory=list)
+    categories_by_article_id: dict[str, str] = field(default_factory=dict)
     arbiter_info: ArbiterInfo | None = None
     diagnostics: FilterDiagnostics = field(default_factory=FilterDiagnostics)
 

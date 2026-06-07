@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import re
+from collections import OrderedDict
 from collections.abc import Mapping
+from copy import deepcopy
 from datetime import datetime
 from io import BytesIO
 from typing import Any
 
 from loguru import logger
 
+from smzdm_notice.core import config
 from smzdm_notice.feishu.binding import FeishuBinding, FeishuBindingStore
 from smzdm_notice.feishu.media import get_feishu_image_key
 from smzdm_notice.feishu.sdk import (
@@ -32,6 +35,8 @@ _DIGEST_ATTACHMENT_FORMAT = "markdown"
 _DIGEST_ATTACHMENT_EXTENSIONS = {"markdown": "md"}
 Card = dict[str, Any]
 MessageId = str
+_DEAL_CARD_CACHE_MAX = 100
+_DEAL_CARD_CACHE: OrderedDict[str, Card] = OrderedDict()
 
 
 def _current_binding() -> FeishuBinding | None:
@@ -231,7 +236,12 @@ def send_deals(
     if not items:
         return False
     price_bypass_article_ids = price_bypass_article_ids or set()
-    return _send_card_success(_build_deals_card(items, price_bypass_article_ids))
+    card = _build_deals_card(items, price_bypass_article_ids)
+    message_id = _send_card_message_id(card)
+    if not message_id:
+        return False
+    _remember_deal_card(message_id, card)
+    return True
 
 
 def _build_deals_card(
@@ -248,6 +258,7 @@ def _build_deals_card(
     for item, reason in items:
         elements.extend(_deal_item_elements(item, reason, item.article_id in price_bypass_article_ids))
     return {
+        "config": {"update_multi": True},
         "header": {
             "title": {"tag": "plain_text", "content": "🛒 什么值得买 · 好价推荐"},
             "template": "red",
@@ -261,9 +272,138 @@ def _deal_item_elements(item: RankingItem, reason: str, is_price_bypass: bool) -
     elements: list[Card] = [{"tag": "markdown", "content": "\n".join(_deal_markdown_lines(item, reason, image_key))}]
     if image_key:
         elements.append(_deal_image_element(item, image_key))
-    elements.append({"tag": "action", "actions": _deal_actions(item, is_price_bypass)})
+    # 第一行：偏好反馈（好价/不值）+ 查看详情
+    memory_enabled = config.DEAL_MEMORY_ENABLED and not is_price_bypass
+    memory_actions = _memory_action_buttons(item, enabled=memory_enabled)
+    if memory_actions:
+        elements.append({"tag": "action", "actions": memory_actions})
+    # 第二行：当前需求操作
+    elements.append({"tag": "action", "actions": _config_action_buttons(item, is_price_bypass)})
     elements.append({"tag": "hr"})
     return elements
+
+
+def _memory_action_buttons(item: RankingItem, enabled: bool = True, selected: str = "") -> list[Card]:
+    """长期偏好反馈按钮。"""
+    value = _button_value(item)
+    return _memory_action_buttons_from_value(value, item.link, enabled=enabled, selected=selected)
+
+
+def _memory_action_buttons_from_value(
+    base_value: Card,
+    item_link: str = "",
+    enabled: bool = True,
+    selected: str = "",
+) -> list[Card]:
+    buttons: list[Card] = []
+    if enabled:
+        good_label = "已选好价" if selected == "deal_good" else "好价👍"
+        not_worth_label = "已选不值" if selected == "deal_not_worth" else "不值👎"
+        good_type = "primary" if selected in {"", "deal_good"} else "default"
+        not_worth_type = "danger" if selected in {"", "deal_not_worth"} else "default"
+        buttons.append(_button_from_value(good_label, "deal_good", base_value, good_type))
+        buttons.append(_button_from_value(not_worth_label, "deal_not_worth", base_value, not_worth_type))
+    link = item_link or str(base_value.get("item_link") or "")
+    if link:
+        buttons.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "查看详情"},
+                "url": link,
+                "type": "default",
+            }
+        )
+    return buttons
+
+
+def update_deal_feedback_card(message_id: str, article_id: str, selected: str = "") -> bool:
+    """Update a cached deal card's feedback button state."""
+    if not message_id or not article_id:
+        return False
+    cached = _DEAL_CARD_CACHE.get(message_id)
+    if not cached:
+        return False
+
+    updated = deepcopy(cached)
+    if not _set_deal_feedback_selected(updated, article_id, selected):
+        return False
+    if not update_card_message(message_id, updated):
+        return False
+    _remember_deal_card(message_id, updated)
+    return True
+
+
+def _set_deal_feedback_selected(card: Card, article_id: str, selected: str) -> bool:
+    for element in card.get("elements", []):
+        if element.get("tag") != "action":
+            continue
+        actions = element.get("actions", [])
+        base_value = _memory_row_value(actions, article_id)
+        if base_value is None:
+            continue
+        element["actions"] = _memory_action_buttons_from_value(base_value, enabled=True, selected=selected)
+        return True
+    return False
+
+
+def _memory_row_value(actions: list[Card], article_id: str) -> Card | None:
+    for action in actions:
+        value = action.get("value")
+        if not isinstance(value, dict):
+            continue
+        if str(value.get("article_id") or "") != article_id:
+            continue
+        if value.get("action") in {"deal_good", "deal_not_worth"}:
+            base = dict(value)
+            base.pop("action", None)
+            return base
+    return None
+
+
+def _remember_deal_card(message_id: str, card: Card) -> None:
+    _DEAL_CARD_CACHE[message_id] = deepcopy(card)
+    _DEAL_CARD_CACHE.move_to_end(message_id)
+    while len(_DEAL_CARD_CACHE) > _DEAL_CARD_CACHE_MAX:
+        _DEAL_CARD_CACHE.popitem(last=False)
+
+
+def _button_value(item: RankingItem) -> Card:
+    value: Card = {
+        "item_title": item.title,
+        "item_brand": item.brand,
+        "item_link": item.link,
+        "article_id": item.article_id,
+    }
+    if item.search_keyword:
+        value["search_keyword"] = item.search_keyword
+    if item.search_max_price is not None:
+        value["search_max_price"] = item.search_max_price
+    return value
+
+
+def _button_from_value(label: str, action: str, base_value: Card, button_type: str) -> dict:
+    value = dict(base_value)
+    value["action"] = action
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": label},
+        "type": button_type,
+        "value": value,
+    }
+
+
+def _config_action_buttons(item: RankingItem, is_price_bypass: bool) -> list[Card]:
+    """当前需求操作按钮。"""
+    if is_price_bypass:
+        return [
+            _button("移除搜索词", "search_remove_keyword", item, "danger"),
+            _button("清除价格阈值", "search_clear_price", item, "default"),
+        ]
+    return [
+        _button("不再推荐", "deal_ignore_category", item, "danger"),
+        _button("库存足够", "deal_stock_enough", item, "default"),
+        _button("关注", "deal_follow", item, "default"),
+    ]
 
 
 def _deal_markdown_lines(item: RankingItem, reason: str, image_key: str) -> list[str]:
@@ -288,21 +428,6 @@ def _deal_image_element(item: RankingItem, image_key: str) -> Card:
         "img_key": image_key,
         "alt": {"tag": "plain_text", "content": _compact_table_text(item.title, 60)},
     }
-
-
-def _deal_actions(item: RankingItem, is_price_bypass: bool) -> list[Card]:
-    actions = []
-    if item.link:
-        actions.append(
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "查看详情"},
-                "url": item.link,
-                "type": "primary",
-            }
-        )
-    actions.extend(_item_action_buttons(item, is_price_bypass))
-    return actions
 
 
 def send_heartbeat(hours: int) -> bool:
@@ -1013,36 +1138,7 @@ def send_text(text: str) -> bool:
 
 
 def _button(label: str, action: str, item: RankingItem, button_type: str) -> dict:
-    value: Card = {
-        "action": action,
-        "item_title": item.title,
-        "item_brand": item.brand,
-        "item_link": item.link,
-        "article_id": item.article_id,
-    }
-    if item.search_keyword:
-        value["search_keyword"] = item.search_keyword
-    if item.search_max_price is not None:
-        value["search_max_price"] = item.search_max_price
-    return {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": label},
-        "type": button_type,
-        "value": value,
-    }
-
-
-def _item_action_buttons(item: RankingItem, is_price_bypass: bool = False) -> list[dict]:
-    if is_price_bypass:
-        return [
-            _button("移除搜索词", "search_remove_keyword", item, "danger"),
-            _button("清除价格阈值", "search_clear_price", item, "default"),
-        ]
-    return [
-        _button("不再推荐此类", "deal_ignore_category", item, "danger"),
-        _button("库存充足", "deal_stock_enough", item, "default"),
-        _button("加入关注", "deal_follow", item, "default"),
-    ]
+    return _button_from_value(label, action, _button_value(item), button_type)
 
 
 def _format_arbitration_diffs(

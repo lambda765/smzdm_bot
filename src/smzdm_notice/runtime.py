@@ -11,14 +11,16 @@ import sys
 import threading
 import time
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Literal
 
 from loguru import logger
 
 from smzdm_notice.core import config
+from smzdm_notice.core.calibration import CalibrationGenerator, MemoryAnalyzer, save_calibration_profile
 from smzdm_notice.core.dedup import DedupManager
+from smzdm_notice.core.memory import DealMemoryStore
 from smzdm_notice.core.near_miss import NearMissManager
 from smzdm_notice.feishu.binding import FeishuBindingStore
 from smzdm_notice.feishu.bot import BotRuntime, start_bot_thread
@@ -349,10 +351,13 @@ class MatchEvaluation:
 
     matched: list[tuple[RankingItem, str]]
     near_misses: list[tuple[RankingItem, str]]
+    categories_by_article_id: dict[str, str] = field(default_factory=dict)
     arbiter_info: ArbiterInfo | None = None
 
 
 _poll_failure_tracker = PollFailureTracker()
+_deal_memory: DealMemoryStore | None = None
+_calibration_generator: CalibrationGenerator | None = None
 
 
 # ========== 单次轮询 ==========
@@ -382,6 +387,10 @@ def _poll_once_unlocked(
     routing_snapshot: RoutingSnapshot | None = None,
 ) -> PollOutcome:
     """不负责加锁的单次轮询实现。"""
+    # Deal Memory: 清理过期 pending
+    if _deal_memory is not None:
+        _deal_memory.cleanup_expired_pending(config.DEAL_MEMORY_PENDING_EXPIRE_DAYS)
+
     all_items, early_outcome = _fetch_poll_items()
     if early_outcome:
         return early_outcome
@@ -400,7 +409,14 @@ def _poll_once_unlocked(
 
     _handle_arbitration(evaluation.arbiter_info)
     _record_near_misses(evaluation.matched, evaluation.near_misses, near_miss_mgr)
-    _send_or_log_matches(evaluation.matched, bypass_matches, dedup, near_miss_mgr)
+    _send_or_log_matches(
+        evaluation.matched,
+        bypass_matches,
+        dedup,
+        near_miss_mgr,
+        evaluation.arbiter_info,
+        evaluation.categories_by_article_id,
+    )
     _check_digest(near_miss_mgr)
     if not evaluation.matched:
         _check_heartbeat()
@@ -486,6 +502,7 @@ def _evaluate_poll_matches(
     return MatchEvaluation(
         matched=bypass_matches + filter_result.matched,
         near_misses=filter_result.near_misses,
+        categories_by_article_id=filter_result.categories_by_article_id,
         arbiter_info=filter_result.arbiter_info,
     )
 
@@ -524,6 +541,8 @@ def _send_or_log_matches(
     bypass_matches: list[tuple[RankingItem, str]],
     dedup: DedupManager,
     near_miss_mgr: NearMissManager,
+    arbiter_info: ArbiterInfo | None = None,
+    categories_by_article_id: dict[str, str] | None = None,
 ) -> None:
     if matched:
         _send_matches_and_update_state(
@@ -531,6 +550,8 @@ def _send_or_log_matches(
             dedup,
             near_miss_mgr,
             price_bypass_article_ids={item.article_id for item, _ in bypass_matches},
+            arbiter_info=arbiter_info,
+            categories_by_article_id=categories_by_article_id,
         )
     else:
         logger.info("LLM 判断无匹配商品")
@@ -541,14 +562,29 @@ def _send_matches_and_update_state(
     dedup: DedupManager,
     near_miss_mgr: NearMissManager,
     price_bypass_article_ids: set[str] | None = None,
+    arbiter_info: ArbiterInfo | None = None,
+    categories_by_article_id: dict[str, str] | None = None,
 ) -> bool:
     logger.info(f"发现 {len(matched)} 件匹配商品，推送飞书...")
+    price_bypass_article_ids = price_bypass_article_ids or set()
+    categories_by_article_id = categories_by_article_id or {}
     success = send_deals(matched, price_bypass_article_ids=price_bypass_article_ids)
     if success:
         global _last_push_time
         _last_push_time = time.time()
         dedup.mark_batch([item.link for item, _ in matched])
         near_miss_mgr.remove_batch([item.article_id for item, _ in matched])
+        # Deal Memory: 推送成功后只缓存非价格直推商品的轻量推荐上下文。
+        memory_items = [(item, reason) for item, reason in matched if item.article_id not in price_bypass_article_ids]
+        if _deal_memory is not None and memory_items:
+            try:
+                _deal_memory.record_to_pending(
+                    memory_items,
+                    categories_by_article_id=categories_by_article_id,
+                    arbiter_info=arbiter_info,
+                )
+            except Exception as e:
+                logger.warning(f"Deal Memory 写入 pending 失败: {e}")
         logger.info("推送成功，已更新去重缓存")
     else:
         logger.error("推送失败")
@@ -605,6 +641,11 @@ def _check_digest(near_miss_mgr: NearMissManager) -> None:
     if now.hour < config.DIGEST_HOUR:
         return
 
+    memory_status = _run_memory_analysis(today_str)
+    if memory_status == "retry_later":
+        logger.warning("Deal Memory 分析失败且未达重试上限，本轮暂不发送夜间汇总")
+        return
+
     # 发送汇总
     entries = near_miss_mgr.get_all_sorted()
     if not entries:
@@ -617,6 +658,127 @@ def _check_digest(near_miss_mgr: NearMissManager) -> None:
     if success:
         near_miss_mgr.clear_and_set_digest_date(today_str)
         logger.info("夜间汇总发送成功，已清空 near-miss 缓存")
+
+
+_MAX_ANALYSIS_RETRIES = 3
+MemoryAnalysisStatus = Literal["ready", "retry_later", "abandoned"]
+
+
+def _run_memory_analysis(today_str: str) -> MemoryAnalysisStatus:
+    """执行 Deal Memory 的 LLM 分析和校准文本更新。
+
+    在夜间汇总时调用，最多重试 3 次，全失败后给用户发提醒。
+    """
+    if not config.DEAL_MEMORY_ENABLED or _deal_memory is None:
+        return "ready"
+
+    # 今天已经分析过了（成功或已放弃）
+    if _deal_memory.last_analysis_date == today_str:
+        return "ready"
+
+    # 重新生成校准文本（仅在有足够 records 时写入）
+    if _calibration_generator is not None:
+        profile = _calibration_generator.generate()
+        if profile.record_count >= 5:
+            save_calibration_profile(profile, config.CALIBRATION_FILE)
+            logger.info(f"Deal Memory: 校准文本已更新, {profile.record_count} 条 records")
+
+    # LLM 分析（需要足够的 records）
+    records = _deal_memory.get_records(limit=None)
+    if len(records) < config.MEMORY_PATTERN_MIN_SAMPLES:
+        logger.debug("Deal Memory: records 不足，跳过 LLM 分析")
+        _deal_memory.set_last_analysis_date(today_str)
+        _deal_memory.reset_analysis_state()
+        return "ready"
+
+    try:
+        analyzer = MemoryAnalyzer()
+        analysis = analyzer.analyze(records)
+        if analysis is None:
+            fail_count = _deal_memory.record_analysis_failure()
+            logger.warning(f"Deal Memory: LLM 分析失败（{fail_count}/{_MAX_ANALYSIS_RETRIES}）")
+            if fail_count >= _MAX_ANALYSIS_RETRIES:
+                _deal_memory.set_last_analysis_date(today_str)
+                _deal_memory.reset_analysis_state()
+                _notify_analysis_failure()
+                return "abandoned"
+            return "retry_later"
+
+        _deal_memory.set_last_analysis_date(today_str)
+        _deal_memory.reset_analysis_state()
+        logger.info(f"Deal Memory: LLM 分析完成, {len(analysis.patterns)} 个模式, {len(analysis.suggested_rules)} 条建议")
+
+        # 如果有建议规则，通过 draft 机制推送给用户确认
+        for rule in analysis.suggested_rules:
+            _suggest_memory_rule(rule, analysis.summary)
+        return "ready"
+
+    except Exception as e:
+        logger.error(f"Deal Memory: 分析过程出错: {e}")
+        fail_count = _deal_memory.record_analysis_failure()
+        if fail_count >= _MAX_ANALYSIS_RETRIES:
+            _deal_memory.set_last_analysis_date(today_str)
+            _deal_memory.reset_analysis_state()
+            _notify_analysis_failure()
+            return "abandoned"
+        return "retry_later"
+
+
+def _notify_analysis_failure() -> None:
+    """给用户发提醒：今日偏好分析多次失败。"""
+    try:
+        from smzdm_notice.feishu.notifier import send_text
+        send_text("⚠️ Deal Memory 偏好分析今日多次失败，已暂停重试。明天会自动恢复。如需立即分析，可发送 /run。")
+    except Exception:
+        logger.warning("Deal Memory: 分析失败提醒发送失败")
+
+
+def _suggest_memory_rule(rule: dict, analysis_summary: str) -> None:
+    """将 LLM 分析出的建议规则生成 preference.md 修改草案。"""
+    if not _draft_store:
+        return
+
+    rule_text = str(rule.get("rule", "")).strip()
+    reason = str(rule.get("reason", "")).strip()
+    if not rule_text:
+        return
+
+    # 构造自然语言消息，复用现有的草案生成流程
+    from smzdm_notice.preferences.builder import build_message_draft
+
+    message = (
+        f"Deal Memory 偏好学习建议：{analysis_summary}\n\n"
+        f"建议规则：{rule_text}\n"
+        f"依据：{reason}\n\n"
+        f"请将以上规则添加到 preference.md 中适当的位置。"
+    )
+    try:
+        draft = build_message_draft(message, store=_draft_store)
+        if draft:
+            from smzdm_notice.feishu.notifier import send_draft_preview
+
+            send_draft_preview(draft)
+            logger.info(f"Deal Memory: 偏好草案已推送: {draft.title}")
+    except Exception as e:
+        logger.warning(f"Deal Memory: 偏好草案生成失败: {e}")
+
+
+def _record_memory_feedback(article_id: str, action: str) -> str:
+    """BotRuntime 回调：记录用户的好价/不值反馈。"""
+    if not config.DEAL_MEMORY_ENABLED or _deal_memory is None:
+        return "not_found"
+
+    result = _deal_memory.record_feedback(article_id, action)
+
+    # 反馈后更新校准文本
+    if result in {"recorded", "updated", "cancelled"} and _calibration_generator is not None:
+        try:
+            profile = _calibration_generator.generate()
+            save_calibration_profile(profile, config.CALIBRATION_FILE)
+        except Exception as e:
+            logger.warning(f"Deal Memory: 校准文本更新失败: {e}")
+
+    return result
 
 
 def _status_summary() -> str:
@@ -745,6 +907,22 @@ def _initialize_runtime() -> tuple[DedupManager, NearMissManager, FeishuBindingS
     draft_store = DraftStore()
     _draft_store = draft_store
     _maintain_config_drafts("重启后清理")
+
+    # 初始化 Deal Memory（如果启用）
+    if config.DEAL_MEMORY_ENABLED:
+        global _deal_memory, _calibration_generator
+        _deal_memory = DealMemoryStore(
+            filepath=config.DEAL_MEMORY_FILE,
+            expire_days=config.DEAL_MEMORY_EXPIRE_DAYS,
+        )
+        _calibration_generator = CalibrationGenerator(
+            memory_store=_deal_memory,
+            max_examples=config.CALIBRATION_MAX_EXAMPLES,
+        )
+        logger.info(f"Deal Memory 已加载: {_deal_memory.record_count} 条 records, {_deal_memory.pending_count} 条 pending")
+    else:
+        logger.info("Deal Memory 未启用")
+
     binding_store = FeishuBindingStore()
     _start_bot(draft_store, binding_store)
     return dedup, near_miss_mgr, binding_store
@@ -757,6 +935,7 @@ def _start_bot(draft_store: DraftStore, binding_store: FeishuBindingStore) -> No
         status_provider=_status_summary,
         run_once=_trigger_manual_poll,
         restart=_request_restart,
+        record_memory_feedback=_record_memory_feedback if config.DEAL_MEMORY_ENABLED else None,
     )
     start_bot_thread(runtime)
 

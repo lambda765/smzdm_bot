@@ -209,6 +209,15 @@ def get_search_keywords() -> list[str]:
     return normalized
 
 
+# ========== Deal Memory 配置 ==========
+DEAL_MEMORY_ENABLED: bool = _get_bool("DEAL_MEMORY_ENABLED", False)
+DEAL_MEMORY_FILE: str = _get("DEAL_MEMORY_FILE", str(WORKSPACE_STATE_DIR / "deal_memory.json"))
+DEAL_MEMORY_EXPIRE_DAYS: int = _get_int("DEAL_MEMORY_EXPIRE_DAYS", 90)
+DEAL_MEMORY_PENDING_EXPIRE_DAYS: int = _get_int("DEAL_MEMORY_PENDING_EXPIRE_DAYS", 30)
+CALIBRATION_FILE: str = _get("CALIBRATION_FILE", str(WORKSPACE_STATE_DIR / "calibration_profile.json"))
+CALIBRATION_MAX_EXAMPLES: int = _get_int("CALIBRATION_MAX_EXAMPLES", 5)
+MEMORY_PATTERN_MIN_SAMPLES: int = _get_int("MEMORY_PATTERN_MIN_SAMPLES", 3)
+
 # ========== 去重配置 ==========
 DEDUP_EXPIRE_HOURS: int = _get_int("DEDUP_EXPIRE_HOURS", 24)
 DEDUP_FILE: str = _get("DEDUP_FILE", str(WORKSPACE_STATE_DIR / "dedup_cache.json"))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -64,3 +65,8 @@ def _scan_first_json_object(text: str) -> dict | None:
             pass
         start = text.find("{", start + 1)
     return None
+
+
+def content_hash(text: str, length: int = 16) -> str:
+    """计算文本内容的 SHA256 哈希，用于去重。"""
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:length]

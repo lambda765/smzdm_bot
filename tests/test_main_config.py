@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import smzdm_notice.runtime as main
+from smzdm_notice.core.calibration import MemoryAnalysis
+from smzdm_notice.core.memory import DealMemoryStore
 from smzdm_notice.llm.models import ArbiterInfo, FilterDiagnostics, FilterItemsResult, FilterResult
 from smzdm_notice.preferences.models import ConfigDraft
 from smzdm_notice.preferences.store import DraftStore
@@ -29,6 +31,19 @@ def _item() -> RankingItem:
         brand="测试品牌",
         link="https://example.com/deal/1001",
     )
+
+
+def _memory_record(article_id: str, action: str = "deal_good") -> dict:
+    return {
+        "article_id": article_id,
+        "title": "测试商品",
+        "price": "9.9",
+        "worthy": 10,
+        "unworthy": 0,
+        "comments": 10,
+        "category_hint": "测试品类",
+        "feedback": {"action": action, "acted_at": "2026-06-01T10:00:00"},
+    }
 
 
 class MainConfigValidationTests(unittest.TestCase):
@@ -68,6 +83,147 @@ class MainConfigValidationTests(unittest.TestCase):
 
         send_digest.assert_called_once()
         near_miss_mgr.clear_and_set_digest_date.assert_not_called()
+
+
+class MainMemoryAnalysisDigestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_deal_memory = main._deal_memory
+        self._old_calibration_generator = main._calibration_generator
+
+    def tearDown(self) -> None:
+        main._deal_memory = self._old_deal_memory
+        main._calibration_generator = self._old_calibration_generator
+
+    def _store_with_records(self, tmp: str, count: int = 3) -> DealMemoryStore:
+        store = DealMemoryStore(str(Path(tmp) / "memory.json"))
+        for index in range(count):
+            store._records[str(index)] = _memory_record(str(index))
+        main._deal_memory = store
+        main._calibration_generator = None
+        return store
+
+    def _digest_manager(self, entries: list[dict] | None = None) -> MagicMock:
+        near_miss_mgr = MagicMock()
+        near_miss_mgr.get_last_digest_date.return_value = ""
+        near_miss_mgr.get_all_sorted.return_value = entries if entries is not None else [{"title": "near miss"}]
+        return near_miss_mgr
+
+    def test_memory_analysis_retry_later_blocks_digest_for_first_two_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_records(tmp)
+            near_miss_mgr = self._digest_manager()
+            analyzer = MagicMock()
+            analyzer.analyze.return_value = None
+
+            with (
+                patch("smzdm_notice.runtime.config.DEAL_MEMORY_ENABLED", True),
+                patch("smzdm_notice.runtime.config.DIGEST_HOUR", 0),
+                patch("smzdm_notice.runtime.config.MEMORY_PATTERN_MIN_SAMPLES", 3),
+                patch("smzdm_notice.runtime.MemoryAnalyzer", return_value=analyzer),
+                patch("smzdm_notice.runtime.send_digest", return_value=True) as send_digest,
+            ):
+                main._check_digest(near_miss_mgr)
+                main._check_digest(near_miss_mgr)
+
+            self.assertEqual(store.analysis_failure_count, 2)
+            send_digest.assert_not_called()
+            near_miss_mgr.get_all_sorted.assert_not_called()
+            near_miss_mgr.clear_and_set_digest_date.assert_not_called()
+
+    def test_third_memory_analysis_failure_abandons_and_allows_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_records(tmp)
+            store._meta["analysis_failure_count"] = 2
+            near_miss_mgr = self._digest_manager()
+            analyzer = MagicMock()
+            analyzer.analyze.return_value = None
+            today = main.datetime.now().strftime("%Y-%m-%d")
+
+            with (
+                patch("smzdm_notice.runtime.config.DEAL_MEMORY_ENABLED", True),
+                patch("smzdm_notice.runtime.config.DIGEST_HOUR", 0),
+                patch("smzdm_notice.runtime.config.MEMORY_PATTERN_MIN_SAMPLES", 3),
+                patch("smzdm_notice.runtime.MemoryAnalyzer", return_value=analyzer),
+                patch("smzdm_notice.runtime._notify_analysis_failure") as notify,
+                patch("smzdm_notice.runtime.send_digest", return_value=True) as send_digest,
+            ):
+                main._check_digest(near_miss_mgr)
+
+            notify.assert_called_once_with()
+            send_digest.assert_called_once()
+            near_miss_mgr.clear_and_set_digest_date.assert_called_once_with(today)
+            self.assertEqual(store.analysis_failure_count, 0)
+            self.assertEqual(store.last_analysis_date, today)
+
+    def test_successful_memory_analysis_runs_before_digest_and_resets_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_records(tmp)
+            store._meta["analysis_failure_count"] = 2
+            near_miss_mgr = self._digest_manager()
+            events = []
+            analyzer = MagicMock()
+
+            def analyze(_records):
+                events.append("analysis")
+                return MemoryAnalysis(summary="ok", patterns=[], suggested_rules=[])
+
+            def send_digest(_entries, _date):
+                events.append("digest")
+                return True
+
+            analyzer.analyze.side_effect = analyze
+
+            with (
+                patch("smzdm_notice.runtime.config.DEAL_MEMORY_ENABLED", True),
+                patch("smzdm_notice.runtime.config.DIGEST_HOUR", 0),
+                patch("smzdm_notice.runtime.config.MEMORY_PATTERN_MIN_SAMPLES", 3),
+                patch("smzdm_notice.runtime.MemoryAnalyzer", return_value=analyzer),
+                patch("smzdm_notice.runtime.send_digest", side_effect=send_digest),
+            ):
+                main._check_digest(near_miss_mgr)
+
+            self.assertEqual(events, ["analysis", "digest"])
+            self.assertEqual(store.analysis_failure_count, 0)
+
+    def test_insufficient_memory_records_allows_digest_without_analyzer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_records(tmp, count=2)
+            store._meta["analysis_failure_count"] = 2
+            near_miss_mgr = self._digest_manager()
+
+            with (
+                patch("smzdm_notice.runtime.config.DEAL_MEMORY_ENABLED", True),
+                patch("smzdm_notice.runtime.config.DIGEST_HOUR", 0),
+                patch("smzdm_notice.runtime.config.MEMORY_PATTERN_MIN_SAMPLES", 3),
+                patch("smzdm_notice.runtime.MemoryAnalyzer") as analyzer_cls,
+                patch("smzdm_notice.runtime.send_digest", return_value=True) as send_digest,
+            ):
+                main._check_digest(near_miss_mgr)
+
+            analyzer_cls.assert_not_called()
+            send_digest.assert_called_once()
+            self.assertEqual(store.analysis_failure_count, 0)
+
+    def test_empty_digest_still_waits_for_memory_retry_later(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_records(tmp)
+            near_miss_mgr = self._digest_manager(entries=[])
+            analyzer = MagicMock()
+            analyzer.analyze.return_value = None
+
+            with (
+                patch("smzdm_notice.runtime.config.DEAL_MEMORY_ENABLED", True),
+                patch("smzdm_notice.runtime.config.DIGEST_HOUR", 0),
+                patch("smzdm_notice.runtime.config.MEMORY_PATTERN_MIN_SAMPLES", 3),
+                patch("smzdm_notice.runtime.MemoryAnalyzer", return_value=analyzer),
+                patch("smzdm_notice.runtime.send_digest") as send_digest,
+            ):
+                main._check_digest(near_miss_mgr)
+
+            self.assertEqual(store.analysis_failure_count, 1)
+            send_digest.assert_not_called()
+            near_miss_mgr.get_all_sorted.assert_not_called()
+            near_miss_mgr.clear_and_set_digest_date.assert_not_called()
 
 
 class MainConfigParsingTests(unittest.TestCase):
@@ -419,8 +575,16 @@ class MainArbitrationDraftTests(unittest.TestCase):
 
 
 class MainSearchPriceBypassTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_deal_memory = main._deal_memory
+        self._old_last_user_prompt = main._last_user_prompt
+        self._old_last_inventory_data = main._last_inventory_data
+
     def tearDown(self) -> None:
         main._stop_event.clear()
+        main._deal_memory = self._old_deal_memory
+        main._last_user_prompt = self._old_last_user_prompt
+        main._last_inventory_data = self._old_last_inventory_data
 
     def _search_item(
         self,
@@ -467,6 +631,61 @@ class MainSearchPriceBypassTests(unittest.TestCase):
         self.assertEqual(send_deals.call_args.kwargs["price_bypass_article_ids"], {"bypass"})
         self.assertIn("小于等于阈值", sent[0][1])
         dedup.mark_batch.assert_called_once_with([bypass.link, llm_item.link])
+
+    def test_price_bypass_does_not_write_deal_memory_pending(self) -> None:
+        bypass = self._search_item("bypass", 10.0, 10.0)
+        llm_item = self._search_item("llm", 10.1, 10.0)
+        dedup = MagicMock()
+        dedup.is_new.return_value = True
+        near_miss_mgr = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            main._deal_memory = DealMemoryStore(str(Path(tmp) / "memory.json"))
+            with ExitStack() as stack:
+                stack.enter_context(patch("smzdm_notice.runtime._load_search_keywords", return_value=[]))
+                stack.enter_context(patch("smzdm_notice.runtime.fetch_all_sources", return_value=[bypass, llm_item]))
+                stack.enter_context(patch("smzdm_notice.runtime._refresh_runtime_config", return_value=("pref", "inv")))
+                stack.enter_context(
+                    patch(
+                        "smzdm_notice.runtime.filter_items",
+                        return_value=FilterItemsResult(
+                            matched=[(llm_item, "LLM 推荐")],
+                            categories_by_article_id={"llm": "电脑数码"},
+                        ),
+                    )
+                )
+                stack.enter_context(patch("smzdm_notice.runtime.send_deals", return_value=True))
+                stack.enter_context(patch("smzdm_notice.runtime._check_digest"))
+                stack.enter_context(patch("smzdm_notice.runtime._check_heartbeat"))
+
+                outcome = main._poll_once_unlocked(dedup, near_miss_mgr)
+
+            self.assertEqual(outcome.status, "success")
+            self.assertEqual(main._deal_memory.pending_count, 1)
+            self.assertIsNone(main._deal_memory.get_pending("bypass"))
+            self.assertEqual(main._deal_memory.get_pending("llm")["category_hint"], "电脑数码")
+
+    def test_only_price_bypass_does_not_write_memory_pending(self) -> None:
+        bypass = self._search_item("bypass", 10.0, 10.0)
+        dedup = MagicMock()
+        dedup.is_new.return_value = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            main._deal_memory = DealMemoryStore(str(Path(tmp) / "memory.json"))
+            with ExitStack() as stack:
+                stack.enter_context(patch("smzdm_notice.runtime._load_search_keywords", return_value=[]))
+                stack.enter_context(patch("smzdm_notice.runtime.fetch_all_sources", return_value=[bypass]))
+                stack.enter_context(patch("smzdm_notice.runtime._refresh_runtime_config", return_value=("pref", "inv")))
+                filter_items = stack.enter_context(patch("smzdm_notice.runtime.filter_items"))
+                stack.enter_context(patch("smzdm_notice.runtime.send_deals", return_value=True))
+                stack.enter_context(patch("smzdm_notice.runtime._check_digest"))
+                stack.enter_context(patch("smzdm_notice.runtime._check_heartbeat"))
+
+                outcome = main._poll_once_unlocked(dedup, MagicMock())
+
+            self.assertEqual(outcome.status, "success")
+            filter_items.assert_not_called()
+            self.assertEqual(main._deal_memory.pending_count, 0)
 
     def test_dedup_runs_before_price_bypass(self) -> None:
         bypass = self._search_item("bypass", 9.9, 10.0)

@@ -31,6 +31,7 @@ from smzdm_notice.feishu.notifier import (
     send_text,
     send_text_to,
     update_card_message,
+    update_deal_feedback_card,
     update_draft_preview,
 )
 from smzdm_notice.feishu.sdk import (
@@ -93,6 +94,7 @@ class BotRuntime:
     status_provider: Callable[[], str]
     run_once: Callable[[], bool]
     restart: Callable[[], bool] | None = None
+    record_memory_feedback: Callable[[str, str], str] | None = None
 
 
 @dataclass
@@ -500,6 +502,8 @@ class FeishuInteractiveBot:
             return CardActionResult(message, build_disabled_arbitration_card("旧版卡片已失效"))
         if action == "ignore_arbitration":
             return self._ignore_arbitration_card_action(value, operator, reply_to_message_id)
+        if action in {"deal_good", "deal_not_worth"}:
+            return self._handle_memory_feedback(action, value, reply_to_message_id)
         if action in {"deal_ignore_category", "deal_stock_enough", "deal_follow"}:
             self._start_deal_action_worker(action, dict(value), reply_to_message_id)
             return CardActionResult("正在生成配置修改预览，请稍候。")
@@ -565,6 +569,41 @@ class FeishuInteractiveBot:
             reason = "预览已失效"
         self._reply_text(reply_to_message_id, message)
         return CardActionResult(message, _build_disabled_card_for_action(reason, draft, value))
+
+    def _handle_memory_feedback(
+        self,
+        action: str,
+        value: dict,
+        reply_to_message_id: str,
+    ) -> CardActionResult:
+        """处理好价/不值反馈，记录到 DealMemory。"""
+        article_id = str(value.get("article_id") or "")
+        if not article_id:
+            message = "无法识别商品信息"
+            self._reply_text(reply_to_message_id, message)
+            return CardActionResult(message)
+
+        if self.runtime.record_memory_feedback is not None:
+            result = self.runtime.record_memory_feedback(article_id, action)
+        else:
+            result = "not_found"
+
+        label = "好价" if action == "deal_good" else "不值"
+        if result == "recorded":
+            message = f"已标记为{label}"
+            update_deal_feedback_card(reply_to_message_id, article_id, selected=action)
+        elif result == "updated":
+            message = "已更新反馈"
+            update_deal_feedback_card(reply_to_message_id, article_id, selected=action)
+        elif result == "cancelled":
+            message = "已取消反馈"
+            update_deal_feedback_card(reply_to_message_id, article_id, selected="")
+        elif result == "invalid_action":
+            message = "未知反馈操作"
+        else:
+            message = "反馈记录失败，该商品可能已过期或记忆功能未启用。"
+
+        return CardActionResult(message)
 
     def _start_deal_action_worker(self, action: str, value: dict, reply_to_message_id: str = "") -> None:
         thread = threading.Thread(

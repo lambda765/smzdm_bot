@@ -553,6 +553,33 @@ class FeishuBotParsingTests(unittest.TestCase):
             reply_text.assert_called_once_with("om_status", "status text")
             send_text.assert_not_called()
 
+    def test_memory_feedback_updates_cached_deal_card_for_toggle_states(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            callback = Mock(side_effect=["recorded", "updated", "cancelled"])
+            bot = FeishuInteractiveBot(
+                BotRuntime(
+                    draft_store=DraftStore(root / "drafts.json", root / "backups", root / "audit.jsonl", root=root),
+                    binding_store=FeishuBindingStore(root / "binding.json"),
+                    status_provider=lambda: "status",
+                    run_once=Mock(return_value=True),
+                    record_memory_feedback=callback,
+                )
+            )
+
+            with patch("smzdm_notice.feishu.bot.update_deal_feedback_card", return_value=True) as update_card:
+                first = bot._handle_memory_feedback("deal_good", {"article_id": "1001"}, "om_deal")
+                second = bot._handle_memory_feedback("deal_not_worth", {"article_id": "1001"}, "om_deal")
+                third = bot._handle_memory_feedback("deal_not_worth", {"article_id": "1001"}, "om_deal")
+
+        self.assertEqual(first.message, "已标记为好价")
+        self.assertEqual(second.message, "已更新反馈")
+        self.assertEqual(third.message, "已取消反馈")
+        self.assertEqual(
+            [call.kwargs["selected"] for call in update_card.call_args_list],
+            ["deal_good", "deal_not_worth", ""],
+        )
+
     def test_help_content_includes_every_registered_command(self) -> None:
         content = help_markdown()
 

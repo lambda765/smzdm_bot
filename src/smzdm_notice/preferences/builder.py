@@ -76,7 +76,8 @@ def build_arbitration_draft(
         return None
     draft = _build_draft(data, source="仲裁建议一键采纳")
     if suggestion:
-        draft.metadata["suggestion_hash"] = hashlib.sha256(suggestion.strip().encode("utf-8")).hexdigest()[:16]
+        from smzdm_notice.llm.json_utils import content_hash
+        draft.metadata["suggestion_hash"] = content_hash(suggestion)
     if store:
         return store.create(draft)
     return draft

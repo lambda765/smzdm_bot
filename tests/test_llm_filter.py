@@ -12,6 +12,7 @@ from openai import APITimeoutError, BadRequestError, RateLimitError
 
 from smzdm_notice.llm import clients as llm_clients
 from smzdm_notice.llm.arbitration import ArbitrationRequest, arbitrate
+from smzdm_notice.llm.categories import UNCATEGORIZED_CATEGORY, sanitize_category
 from smzdm_notice.llm.clients import _clear_client_cache, get_client_for_config
 from smzdm_notice.llm.filter import _build_prompt_context, _single_llm_call, filter_items
 from smzdm_notice.llm.models import FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
@@ -347,6 +348,9 @@ class LlmPromptTests(unittest.TestCase):
         self.assertIn("优先引用商品名、偏好中的品类名、库存项名或质量指标", SYSTEM_PROMPT)
         self.assertIn('"不符合偏好"', SYSTEM_PROMPT)
         self.assertIn("near-miss reason 必须保留真实近因", SYSTEM_PROMPT)
+        self.assertIn("category 字段", SYSTEM_PROMPT)
+        self.assertIn("电脑数码、食品生鲜", SYSTEM_PROMPT)
+        self.assertIn("厨房小家电", SYSTEM_PROMPT)
         self.assertIn("值票 8、评论 12，综合热度偏弱", SYSTEM_PROMPT)
         self.assertIn("未达到评论 >= 100 所以不推荐", SYSTEM_PROMPT)
         self.assertIn("抽纸库存充足", SYSTEM_PROMPT)
@@ -375,6 +379,34 @@ class LlmPromptTests(unittest.TestCase):
 
 
 class LlmFilterDiagnosticsTests(unittest.TestCase):
+    def test_recommendation_category_is_sanitized_and_returned(self) -> None:
+        result = _filter_items_with_mocked_call(
+            LLMCallOutcome(
+                result=LLMCallResult(
+                    result=FilterResult(
+                        recommendations=[Recommendation(id="1001", reason="A", category="厨房小家电")]
+                    )
+                )
+            ),
+            dual_filter=False,
+        )
+
+        self.assertEqual(result.categories_by_article_id, {"1001": "厨房小家电"})
+
+    def test_invalid_recommendation_category_becomes_uncategorized(self) -> None:
+        result = _filter_items_with_mocked_call(
+            LLMCallOutcome(
+                result=LLMCallResult(
+                    result=FilterResult(
+                        recommendations=[Recommendation(id="1001", reason="A", category="测试品牌好物")]
+                    )
+                )
+            ),
+            dual_filter=False,
+        )
+
+        self.assertEqual(result.categories_by_article_id, {"1001": UNCATEGORIZED_CATEGORY})
+
     def test_low_quality_items_still_enter_llm_request(self) -> None:
         captured = {}
 
@@ -677,6 +709,23 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         self.assertEqual(captured["temperature"], 0.8)
         self.assertEqual(captured["response_format"], {"type": "json_object"})
         self.assertEqual(captured["extra_body"], {"do_sample": False})
+
+
+class CategorySanitizerTests(unittest.TestCase):
+    def test_accepts_preset_and_valid_custom_category(self) -> None:
+        item = _item()
+
+        self.assertEqual(sanitize_category(" 家用电器 ", item), "家用电器")
+        self.assertEqual(sanitize_category("厨房小家电", item), "厨房小家电")
+
+    def test_rejects_brand_specs_price_and_source_terms(self) -> None:
+        item = _item()
+
+        self.assertEqual(sanitize_category("测试品牌好物", item), UNCATEGORIZED_CATEGORY)
+        self.assertEqual(sanitize_category("5L电压力锅", item), UNCATEGORIZED_CATEGORY)
+        self.assertEqual(sanitize_category("299元好物", item), UNCATEGORIZED_CATEGORY)
+        self.assertEqual(sanitize_category("热卖榜", item), UNCATEGORIZED_CATEGORY)
+        self.assertEqual(sanitize_category("", item), UNCATEGORIZED_CATEGORY)
 
 
 class LlmFilterArbitrationTests(unittest.TestCase):

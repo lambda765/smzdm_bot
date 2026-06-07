@@ -11,6 +11,7 @@ from loguru import logger
 from openai import OpenAI
 
 from smzdm_notice.llm.arbitration import resolve_dual_result
+from smzdm_notice.llm.categories import sanitize_category
 from smzdm_notice.llm.clients import get_client_for_config
 from smzdm_notice.llm.errors import (
     GENERAL_OPENAI_ERRORS,
@@ -99,10 +100,15 @@ def _build_prompt_context(
 
     prefilter_guidance = _build_prefilter_guidance(config)
     prefilter_guidance_section = f"## 运行时补充说明\n{prefilter_guidance}\n\n" if prefilter_guidance else ""
+
+    from smzdm_notice.llm.memory_prompts import build_calibration_section
+    calibration_section = build_calibration_section(items)
+
     user_message = (
         f"## 当前系统时间\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"## 用户购物偏好\n{user_prompt}\n\n"
         f"## 耗材库存记录\n{inventory_data}\n\n"
+        f"{calibration_section}"
         f"{prefilter_guidance_section}"
         f"## 当前好价排行榜商品列表\n"
         f"```json\n{json.dumps(items_summary, ensure_ascii=False, indent=2)}\n```\n\n"
@@ -124,9 +130,13 @@ def _filter_with_single_call(
                 error_summary=call_outcome.error_summary,
             )
         )
-    matched, near_misses = _match_result(call_outcome.result.result, prompt_context.item_map)
+    matched, near_misses, categories_by_article_id = _match_result(call_outcome.result.result, prompt_context.item_map)
     logger.info(f"LLM 筛选完成: {len(matched)}/{len(prompt_context.item_map)} 条推荐, {len(near_misses)} 条 near-miss")
-    return FilterItemsResult(matched=matched, near_misses=near_misses)
+    return FilterItemsResult(
+        matched=matched,
+        near_misses=near_misses,
+        categories_by_article_id=categories_by_article_id,
+    )
 
 
 def _filter_with_dual_calls(
@@ -155,12 +165,13 @@ def _filter_with_dual_calls(
         routing_snapshot=routing_snapshot,
     )
 
-    matched, near_misses = _match_result(final_result, prompt_context.item_map)
+    matched, near_misses, categories_by_article_id = _match_result(final_result, prompt_context.item_map)
     logger.info(f"双重判断完成: {len(matched)}/{len(prompt_context.item_map)} 条推荐, {len(near_misses)} 条 near-miss")
     llm_failed = call_a is None and call_b is None
     return FilterItemsResult(
         matched=matched,
         near_misses=near_misses,
+        categories_by_article_id=categories_by_article_id,
         arbiter_info=arbiter_info,
         diagnostics=FilterDiagnostics(
             llm_failed=llm_failed,
@@ -271,12 +282,15 @@ def _join_error_summaries(*summaries: str) -> str | None:
 def _match_result(
     result: FilterResult,
     item_map: dict[str, RankingItem],
-) -> tuple[list[tuple[RankingItem, str]], list[tuple[RankingItem, str]]]:
+) -> tuple[list[tuple[RankingItem, str]], list[tuple[RankingItem, str]], dict[str, str]]:
     """将 FilterResult 中的 ID 匹配回原始商品。"""
     matched: list[tuple[RankingItem, str]] = []
+    categories_by_article_id: dict[str, str] = {}
     for rec in result.recommendations:
         if rec.id in item_map:
-            matched.append((item_map[rec.id], rec.reason))
+            item = item_map[rec.id]
+            matched.append((item, rec.reason))
+            categories_by_article_id[rec.id] = sanitize_category(rec.category, item)
         else:
             logger.warning(f"LLM 返回了无效推荐 ID: {rec.id}")
 
@@ -287,7 +301,7 @@ def _match_result(
         else:
             logger.warning(f"LLM 返回了无效 near_miss ID: {nm.id}")
 
-    return matched, near_misses
+    return matched, near_misses, categories_by_article_id
 
 
 def _parse_response(content: str) -> FilterResult:
