@@ -577,14 +577,10 @@ class MainArbitrationDraftTests(unittest.TestCase):
 class MainSearchPriceBypassTests(unittest.TestCase):
     def setUp(self) -> None:
         self._old_deal_memory = main._deal_memory
-        self._old_last_user_prompt = main._last_user_prompt
-        self._old_last_inventory_data = main._last_inventory_data
 
     def tearDown(self) -> None:
         main._stop_event.clear()
         main._deal_memory = self._old_deal_memory
-        main._last_user_prompt = self._old_last_user_prompt
-        main._last_inventory_data = self._old_last_inventory_data
 
     def _search_item(
         self,
@@ -612,6 +608,7 @@ class MainSearchPriceBypassTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch("smzdm_notice.runtime._load_search_keywords", return_value=[]))
             stack.enter_context(patch("smzdm_notice.runtime.fetch_all_sources", return_value=[bypass, llm_item]))
+            stack.enter_context(patch("smzdm_notice.runtime._refresh_runtime_config", return_value=("pref", "inv")))
             filter_items = stack.enter_context(
                 patch(
                     "smzdm_notice.runtime.filter_items",
@@ -712,6 +709,7 @@ class MainSearchPriceBypassTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch("smzdm_notice.runtime._load_search_keywords", return_value=[]))
             stack.enter_context(patch("smzdm_notice.runtime.fetch_all_sources", return_value=[llm_item]))
+            stack.enter_context(patch("smzdm_notice.runtime._refresh_runtime_config", return_value=("pref", "inv")))
             filter_items = stack.enter_context(
                 patch("smzdm_notice.runtime.filter_items", return_value=FilterItemsResult())
             )
@@ -743,6 +741,7 @@ class MainPollFailureTests(unittest.TestCase):
         dedup.is_new.return_value = True
         with ExitStack() as stack:
             stack.enter_context(patch("smzdm_notice.runtime.fetch_all_sources", return_value=[_item()]))
+            stack.enter_context(patch("smzdm_notice.runtime._refresh_runtime_config", return_value=("pref", "inv")))
             stack.enter_context(
                 patch(
                     "smzdm_notice.runtime.filter_items",

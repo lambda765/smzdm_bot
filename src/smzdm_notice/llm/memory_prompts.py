@@ -97,20 +97,26 @@ MEMORY_ANALYSIS_SYSTEM_PROMPT = """\
     {
       "rule": "可以直接写入 preference.md 的具体筛选规则",
       "reason": "为什么建议添加这条规则",
-      "evidence": "支撑这条规则的数据摘要"
+      "evidence": "支撑这条规则的数据摘要，必须写明 good/not_worth 样本数量",
+      "good_count": 5,
+      "not_worth_count": 0,
+      "evidence_scope": "可选：该规则基于哪个品类、标签或场景"
     }
   ]
 }
 
 suggested_rules 的 rule 字段必须是面向 preference.md 的具体规则文本，不含分析包装。
 每条 rule 应该是一个独立、明确的筛选条件或偏好表达。
+suggested_rules 不使用 evidence_count 作为证据字段，必须使用 good_count 和 not_worth_count。
+patterns 可以使用 evidence_count 记录探索性发现，但 patterns 不会自动进入 preference.md 草案。
 如果 patterns 的 confidence 都是 low 或数据不足以形成规则，suggested_rules 输出空数组。
 不要重复用户偏好中已有的规则。
 </output_format>
 
 <constraints>
 - 不得生成硬阈值规则，例如"值票 >= X"、"评论 >= X"、"值率 >= X"、"必须 X 票以上"。
-- 每条 suggested_rules 必须在 reason 或 evidence 中注明 good/not_worth 样本数量；合计少于 5 条时不要生成规则。
+- 每条 suggested_rules 必须输出 good_count 和 not_worth_count；两者都必须是非负整数，可以为 0。
+- 每条 suggested_rules 还必须在 reason 或 evidence 中用自然语言注明 good/not_worth 样本数量；合计少于 5 条时不要生成规则。
 - 同一品类 good/not_worth 比例在 1:2 到 2:1 之间时，说明正反样本不稳定，不要生成该品类规则。
 - 不要重复用户偏好中已有的规则；不确定是否已有时只写入 patterns，不写 suggested_rules。
 </constraints>

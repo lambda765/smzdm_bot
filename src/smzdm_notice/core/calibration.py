@@ -275,15 +275,10 @@ def _contains_hard_threshold_rule(rule_text: str) -> bool:
 
 
 def _has_stable_rule_evidence(rule: dict) -> bool:
-    evidence_count = rule.get("evidence_count")
-    if isinstance(evidence_count, int) and evidence_count >= 5:
-        return True
-
-    text = f"{rule.get('reason', '')}\n{rule.get('evidence', '')}"
-    good = _extract_named_count(text, ("good", "deal_good", "好价", "正样本"))
-    not_worth = _extract_named_count(text, ("not_worth", "deal_not_worth", "不值", "反样本"))
-    if good is None or not_worth is None:
+    counts = _extract_rule_counts(rule)
+    if counts is None:
         return False
+    good, not_worth = counts
     total = good + not_worth
     if total < 5:
         return False
@@ -292,6 +287,32 @@ def _has_stable_rule_evidence(rule: dict) -> bool:
         if 0.5 <= ratio <= 2:
             return False
     return True
+
+
+def _extract_rule_counts(rule: dict) -> tuple[int, int] | None:
+    good = _coerce_count(rule.get("good_count"))
+    not_worth = _coerce_count(rule.get("not_worth_count"))
+    if good is not None and not_worth is not None:
+        return good, not_worth
+
+    text = f"{rule.get('reason', '')}\n{rule.get('evidence', '')}"
+    good = _extract_named_count(text, ("good", "deal_good", "好价", "正样本"))
+    not_worth = _extract_named_count(text, ("not_worth", "deal_not_worth", "不值", "反样本"))
+    if good is None or not_worth is None:
+        return None
+    return good, not_worth
+
+
+def _coerce_count(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        count = value
+    elif isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+        count = int(value.strip())
+    else:
+        return None
+    return count if count >= 0 else None
 
 
 def _extract_named_count(text: str, labels: tuple[str, ...]) -> int | None:

@@ -18,7 +18,7 @@ from smzdm_notice.core.calibration import (
     save_calibration_profile,
 )
 from smzdm_notice.core.memory import DealMemoryStore
-from smzdm_notice.llm.memory_prompts import build_calibration_section
+from smzdm_notice.llm.memory_prompts import MEMORY_ANALYSIS_SYSTEM_PROMPT, build_calibration_section
 from smzdm_notice.llm.routing import ResolvedLLMConfig
 from smzdm_notice.smzdm.ranking import RankingItem
 
@@ -273,6 +273,16 @@ class SuggestionHashTests(unittest.TestCase):
 
 
 class MemoryAnalyzerTests(unittest.TestCase):
+    def _parse_suggested_rules(self, rules: list[dict]) -> list[dict]:
+        payload = {
+            "summary": "测试摘要",
+            "patterns": [{"dimension": "品类偏好", "description": "探索性发现", "evidence_count": 3}],
+            "suggested_rules": rules,
+        }
+        analysis = MemoryAnalyzer()._parse_response(json.dumps(payload, ensure_ascii=False))
+        self.assertIsNotNone(analysis)
+        return analysis.suggested_rules
+
     def test_analyzes_three_records_without_internal_five_record_guard(self) -> None:
         captured = {}
         payload = {
@@ -304,6 +314,113 @@ class MemoryAnalyzerTests(unittest.TestCase):
         self.assertIsNotNone(analysis)
         self.assertEqual(analysis.summary, "样本足够形成初步偏好。")
         self.assertEqual(captured["model"], "draft-model")
+
+    def test_suggested_rule_rejects_evidence_count_without_good_not_worth_counts(self) -> None:
+        rules = self._parse_suggested_rules(
+            [
+                {
+                    "rule": "咖啡器具可优先推荐",
+                    "reason": "样本数量足够",
+                    "evidence": "模型只给了总样本数",
+                    "evidence_count": 5,
+                }
+            ]
+        )
+
+        self.assertEqual(rules, [])
+
+    def test_suggested_rule_rejects_balanced_good_not_worth_counts(self) -> None:
+        rules = self._parse_suggested_rules(
+            [
+                {
+                    "rule": "咖啡器具可优先推荐",
+                    "reason": "好价 3，不值 2",
+                    "evidence": "正反样本比例接近",
+                    "good_count": 3,
+                    "not_worth_count": 2,
+                }
+            ]
+        )
+
+        self.assertEqual(rules, [])
+
+    def test_suggested_rule_accepts_one_sided_good_counts(self) -> None:
+        rule = {
+            "rule": "咖啡器具可优先推荐",
+            "reason": "好价 5，不值 0",
+            "evidence": "用户连续认可咖啡器具",
+            "good_count": 5,
+            "not_worth_count": 0,
+        }
+
+        self.assertEqual(self._parse_suggested_rules([rule]), [rule])
+
+    def test_suggested_rule_accepts_directional_good_counts(self) -> None:
+        rule = {
+            "rule": "咖啡器具可优先推荐",
+            "reason": "好价 4，不值 1",
+            "evidence": "正向样本明显多于反向样本",
+            "good_count": 4,
+            "not_worth_count": 1,
+        }
+
+        self.assertEqual(self._parse_suggested_rules([rule]), [rule])
+
+    def test_suggested_rule_rejects_insufficient_counts(self) -> None:
+        rules = self._parse_suggested_rules(
+            [
+                {
+                    "rule": "咖啡器具可优先推荐",
+                    "reason": "好价 2，不值 1",
+                    "evidence": "总样本不足",
+                    "good_count": 2,
+                    "not_worth_count": 1,
+                }
+            ]
+        )
+
+        self.assertEqual(rules, [])
+
+    def test_suggested_rule_accepts_string_counts(self) -> None:
+        rule = {
+            "rule": "咖啡器具可优先推荐",
+            "reason": "好价 5，不值 0",
+            "evidence": "顶层计数为字符串",
+            "good_count": "5",
+            "not_worth_count": "0",
+        }
+
+        self.assertEqual(self._parse_suggested_rules([rule]), [rule])
+
+    def test_suggested_rule_accepts_counts_from_reason_or_evidence_text(self) -> None:
+        rule = {
+            "rule": "咖啡器具可优先推荐",
+            "reason": "用户反馈集中在咖啡器具",
+            "evidence": "好价 5，不值 0",
+        }
+
+        self.assertEqual(self._parse_suggested_rules([rule]), [rule])
+
+    def test_suggested_rule_rejects_hard_threshold_even_with_valid_counts(self) -> None:
+        rules = self._parse_suggested_rules(
+            [
+                {
+                    "rule": "咖啡器具必须值票 >= 100 才推荐",
+                    "reason": "好价 5，不值 0",
+                    "evidence": "硬阈值规则",
+                    "good_count": 5,
+                    "not_worth_count": 0,
+                }
+            ]
+        )
+
+        self.assertEqual(rules, [])
+
+    def test_memory_analysis_prompt_requires_suggested_rule_counts(self) -> None:
+        self.assertIn('"good_count": 5', MEMORY_ANALYSIS_SYSTEM_PROMPT)
+        self.assertIn('"not_worth_count": 0', MEMORY_ANALYSIS_SYSTEM_PROMPT)
+        self.assertIn("suggested_rules 不使用 evidence_count", MEMORY_ANALYSIS_SYSTEM_PROMPT)
+        self.assertIn("两者都必须是非负整数", MEMORY_ANALYSIS_SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":
