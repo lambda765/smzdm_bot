@@ -107,21 +107,9 @@ def get_smzdm_client_platform() -> str:
 
 
 # ========== LLM 配置 ==========
-LLM_API_KEY: str = _get("LLM_API_KEY")
-LLM_BASE_URL: str = _get("LLM_BASE_URL", "https://api.openai.com/v1")
-LLM_MODEL: str = _get("LLM_MODEL", "deepseek-chat")
-LLM_MAX_RETRIES: int = _get_int("LLM_MAX_RETRIES", 2)
-LLM_TIMEOUT_SECONDS: float = _get_float_fallback("LLM_TIMEOUT_SECONDS", 300.0)
 LLM_DUAL_FILTER: bool = _get_bool("LLM_DUAL_FILTER", False)
 LLM_ARBITER_ENABLED: bool = _get_bool("LLM_ARBITER_ENABLED", True)
-LLM_ARBITER_API_KEY: str = _get_fallback("LLM_ARBITER_API_KEY", LLM_API_KEY)
-LLM_ARBITER_BASE_URL: str = _get_fallback("LLM_ARBITER_BASE_URL", LLM_BASE_URL)
-LLM_ARBITER_MODEL: str = _get_fallback("LLM_ARBITER_MODEL", LLM_MODEL)
-LLM_ARBITER_TIMEOUT_SECONDS: float = _get_float_fallback("LLM_ARBITER_TIMEOUT_SECONDS", LLM_TIMEOUT_SECONDS)
-LLM_DRAFT_API_KEY: str = _get_fallback("LLM_DRAFT_API_KEY", LLM_ARBITER_API_KEY)
-LLM_DRAFT_BASE_URL: str = _get_fallback("LLM_DRAFT_BASE_URL", LLM_ARBITER_BASE_URL)
-LLM_DRAFT_MODEL: str = _get_fallback("LLM_DRAFT_MODEL", LLM_ARBITER_MODEL)
-LLM_DRAFT_TIMEOUT_SECONDS: float = _get_float_fallback("LLM_DRAFT_TIMEOUT_SECONDS", LLM_ARBITER_TIMEOUT_SECONDS)
+LLM_MODELS_FILE: str = _get("LLM_MODELS_FILE", "llm_models.json")
 
 # ========== 预筛选配置 ==========
 PREFILTER_ENABLED: bool = _get_bool("PREFILTER_ENABLED", False)

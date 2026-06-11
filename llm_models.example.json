@@ -1,0 +1,47 @@
+{
+  "connections": {
+    "deepseek": {
+      "provider": "openai_compatible",
+      "label": "DeepSeek",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "LLM_DEEPSEEK_API_KEY"
+    },
+    "glm": {
+      "provider": "openai_compatible",
+      "label": "智谱 GLM",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "api_key_env": "LLM_GLM_API_KEY",
+      "timeout_seconds": 300,
+      "max_retries": 2
+    }
+  },
+  "defaults": {
+    "connection": "deepseek",
+    "model_id": "deepseek-chat",
+    "timeout_seconds": 300,
+    "max_retries": 2,
+    "request": {
+      "response_format": {
+        "type": "json_object"
+      },
+      "extra_body": {}
+    }
+  },
+  "agents": {
+    "filter": {
+      "request": {
+        "temperature": 0.3
+      }
+    },
+    "arbiter": {
+      "request": {
+        "temperature": 0.0
+      }
+    },
+    "draft": {
+      "request": {
+        "temperature": 0.0
+      }
+    }
+  }
+}

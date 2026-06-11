@@ -20,6 +20,13 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/status", "/status", "查看运行状态 / Show runtime status."),
     CommandSpec("/run", "/run", "手动触发一次轮询 / Trigger one manual polling run."),
     CommandSpec("/restart", "/restart", "重启程序 / Restart the process when available."),
+    CommandSpec("/model", "/model", "打开 LLM 模型路由管理卡片 / Open the LLM model routing card.", "LLM 模型 / Models"),
+    CommandSpec(
+        "/model status",
+        "/model status",
+        "查看当前 LLM 模型路由状态 / Show current LLM model routing status.",
+        "LLM 模型 / Models",
+    ),
     CommandSpec(
         "/search", "/search", "查看当前搜索关键词 / List current search keywords.", "搜索关键词 / Search keywords"
     ),

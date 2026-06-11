@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from unittest.mock import patch
 import httpx
 from openai import BadRequestError
 
+from smzdm_notice.llm.routing import ResolvedLLMConfig
 from smzdm_notice.preferences.builder import (
     _call_llm_for_draft,
     _deal_action_message,
@@ -27,6 +29,24 @@ from smzdm_notice.preferences.store import DraftStore
 def _openai_response(status_code: int) -> httpx.Response:
     request = httpx.Request("POST", "https://llm.example.com/v1/chat/completions")
     return httpx.Response(status_code, request=request)
+
+
+def _draft_llm_config(api_key: str = "draft-key") -> ResolvedLLMConfig:
+    return ResolvedLLMConfig(
+        agent="draft",
+        connection="draft",
+        connection_label="Draft",
+        provider="openai_compatible",
+        base_url="https://draft.example.com",
+        api_key_env="LLM_DRAFT_TEST_API_KEY",
+        api_key=api_key,
+        model_id="draft-model",
+        timeout_seconds=300.0,
+        max_retries=2,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        extra_body={},
+    )
 
 
 class PreferenceEditorTests(unittest.TestCase):
@@ -62,7 +82,7 @@ class PreferenceEditorTests(unittest.TestCase):
         self.assertIn("抽纸还剩 3 包", draft.append_text)
 
     def test_message_draft_returns_none_without_llm_fallback(self) -> None:
-        with patch("smzdm_notice.preferences.builder.config.LLM_DRAFT_API_KEY", ""):
+        with patch("smzdm_notice.preferences.builder.resolve", return_value=_draft_llm_config(api_key="")):
             draft = build_message_draft("拉黑坚果", self.store)
 
         self.assertIsNone(draft)
@@ -81,15 +101,20 @@ class PreferenceEditorTests(unittest.TestCase):
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
 
         with (
-            patch("smzdm_notice.preferences.builder.config.LLM_DRAFT_API_KEY", "draft-key"),
-            patch("smzdm_notice.preferences.builder.config.LLM_DRAFT_MODEL", "draft-model"),
-            patch("smzdm_notice.preferences.builder.get_draft_client", return_value=fake_client) as get_draft_client,
+            patch(
+                "smzdm_notice.preferences.builder.resolve",
+                return_value=replace(_draft_llm_config(), temperature=0.2, extra_body={"do_sample": False}),
+            ),
+            patch("smzdm_notice.preferences.builder.get_client_for_config", return_value=fake_client) as get_client,
         ):
             data = _draft_with_llm("拉黑坚果")
 
         self.assertEqual(data["target_file"], "preference.md")
-        get_draft_client.assert_called_once_with()
+        get_client.assert_called_once()
         self.assertEqual(create_kwargs["model"], "draft-model")
+        self.assertEqual(create_kwargs["temperature"], 0.2)
+        self.assertEqual(create_kwargs["response_format"], {"type": "json_object"})
+        self.assertEqual(create_kwargs["extra_body"], {"do_sample": False})
 
     def test_call_llm_for_draft_returns_none_on_sdk_error(self) -> None:
         class FailingCompletions:
@@ -98,8 +123,8 @@ class PreferenceEditorTests(unittest.TestCase):
 
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
         with (
-            patch("smzdm_notice.preferences.builder.config.LLM_DRAFT_API_KEY", "draft-key"),
-            patch("smzdm_notice.preferences.builder.get_draft_client", return_value=fake_client),
+            patch("smzdm_notice.preferences.builder.resolve", return_value=_draft_llm_config()),
+            patch("smzdm_notice.preferences.builder.get_client_for_config", return_value=fake_client),
         ):
             data = _call_llm_for_draft([{"role": "user", "content": "改配置"}])
 

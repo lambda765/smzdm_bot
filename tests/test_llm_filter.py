@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 from openai import APITimeoutError, BadRequestError, RateLimitError
 
+from smzdm_notice.llm import clients as llm_clients
 from smzdm_notice.llm.arbitration import ArbitrationRequest, arbitrate
-from smzdm_notice.llm.clients import _clear_client_cache, get_arbiter_client, get_draft_client, get_filter_client
+from smzdm_notice.llm.clients import _clear_client_cache, get_client_for_config
 from smzdm_notice.llm.filter import _build_prompt_context, _single_llm_call, filter_items
 from smzdm_notice.llm.models import FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
+from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
 from smzdm_notice.smzdm.ranking import RankingItem
 
 
@@ -53,18 +57,66 @@ def _failing_client(error: Exception) -> SimpleNamespace:
     return SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
 
 
+def _llm_config(
+    agent: str = "filter",
+    connection: str = "test",
+    api_key: str = "key",
+    base_url: str = "https://llm.example.com",
+    timeout: float = 300.0,
+    max_retries: int = 2,
+    model_id: str = "model",
+    temperature: float = 0.3,
+) -> ResolvedLLMConfig:
+    return ResolvedLLMConfig(
+        agent=agent,
+        connection=connection,
+        connection_label=connection,
+        provider="openai_compatible",
+        base_url=base_url,
+        api_key_env="LLM_TEST_API_KEY",
+        api_key=api_key,
+        model_id=model_id,
+        timeout_seconds=timeout,
+        max_retries=max_retries,
+        temperature=temperature,
+        response_format={"type": "json_object"},
+        extra_body={},
+    )
+
+
+def _routing_snapshot() -> RoutingSnapshot:
+    raw = {
+        "connections": {
+            "test": {
+                "provider": "openai_compatible",
+                "label": "Test",
+                "base_url": "https://llm.example.com",
+                "api_key_env": "LLM_TEST_API_KEY",
+            }
+        },
+        "defaults": {"connection": "test", "model_id": "model"},
+        "agents": {
+            "filter": {"request": {"temperature": 0.3}},
+            "arbiter": {"request": {"temperature": 0.0}},
+            "draft": {"request": {"temperature": 0.0}},
+        },
+    }
+    return RoutingSnapshot(raw=raw, version=1, path=Path("llm_models.json"), source="test")
+
+
 def _filter_items_with_mocked_call(*outcomes: LLMCallOutcome, dual_filter: bool = False):
     with (
         patch("smzdm_notice.core.config.LLM_DUAL_FILTER", dual_filter),
-        patch("smzdm_notice.llm.filter.get_filter_client", return_value=object()),
+        patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
         patch("smzdm_notice.llm.filter._single_llm_call", side_effect=list(outcomes)),
         patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
+        patch.dict("os.environ", {"LLM_TEST_API_KEY": "key"}, clear=False),
     ):
         return filter_items(
             items=[_item()],
             user_prompt="用户偏好",
             inventory_data="库存",
-            model="model",
+            routing_snapshot=_routing_snapshot(),
         )
 
 
@@ -75,134 +127,153 @@ class LlmClientReuseTests(unittest.TestCase):
     def tearDown(self) -> None:
         _clear_client_cache()
 
-    def test_filter_client_reuses_same_scene_slot(self) -> None:
+    def test_client_reuses_same_connection_slot(self) -> None:
         created = []
 
         def openai_factory(**kwargs):
             created.append(kwargs)
             return SimpleNamespace(name=f"client-{len(created)}")
 
-        with (
-            patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory),
-            patch("smzdm_notice.llm.clients.config.LLM_API_KEY", "key"),
-            patch("smzdm_notice.llm.clients.config.LLM_BASE_URL", "https://llm.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_MAX_RETRIES", 4),
-            patch("smzdm_notice.llm.clients.config.LLM_TIMEOUT_SECONDS", 123.0),
-        ):
-            first = get_filter_client()
-            second = get_filter_client()
+        with patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory):
+            first = get_client_for_config(_llm_config(timeout=123.0, max_retries=4))
+            second = get_client_for_config(_llm_config(timeout=123.0, max_retries=4))
 
         self.assertIs(first, second)
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0]["timeout"], 123.0)
         self.assertEqual(created[0]["max_retries"], 4)
 
-    def test_client_scenes_do_not_share_even_when_config_matches(self) -> None:
+    def test_client_connections_do_not_share_even_when_config_matches(self) -> None:
         created = []
 
         def openai_factory(**kwargs):
             created.append(kwargs)
             return SimpleNamespace(name=f"client-{len(created)}")
 
-        with (
-            patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory),
-            patch("smzdm_notice.llm.clients.config.LLM_API_KEY", "key"),
-            patch("smzdm_notice.llm.clients.config.LLM_BASE_URL", "https://llm.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_MAX_RETRIES", 2),
-            patch("smzdm_notice.llm.clients.config.LLM_TIMEOUT_SECONDS", 300.0),
-            patch("smzdm_notice.llm.clients.config.LLM_ARBITER_API_KEY", "key"),
-            patch("smzdm_notice.llm.clients.config.LLM_ARBITER_BASE_URL", "https://llm.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_ARBITER_TIMEOUT_SECONDS", 300.0),
-            patch("smzdm_notice.llm.clients.config.LLM_DRAFT_API_KEY", "key"),
-            patch("smzdm_notice.llm.clients.config.LLM_DRAFT_BASE_URL", "https://llm.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_DRAFT_TIMEOUT_SECONDS", 300.0),
-        ):
-            filter_client = get_filter_client()
-            arbiter_client = get_arbiter_client()
-            draft_client = get_draft_client()
+        with patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory):
+            filter_client = get_client_for_config(_llm_config(connection="filter"))
+            arbiter_client = get_client_for_config(_llm_config(connection="arbiter"))
+            draft_client = get_client_for_config(_llm_config(connection="draft"))
 
         self.assertIsNot(filter_client, arbiter_client)
         self.assertIsNot(arbiter_client, draft_client)
         self.assertEqual(len(created), 3)
         self.assertEqual([kwargs["timeout"] for kwargs in created], [300.0, 300.0, 300.0])
 
-    def test_clients_use_scene_specific_timeout(self) -> None:
+    def test_clients_use_connection_specific_timeout(self) -> None:
         created = []
 
         def openai_factory(**kwargs):
             created.append(kwargs)
             return SimpleNamespace(name=f"client-{len(created)}")
 
-        with (
-            patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory),
-            patch("smzdm_notice.llm.clients.config.LLM_API_KEY", "filter-key"),
-            patch("smzdm_notice.llm.clients.config.LLM_BASE_URL", "https://filter.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_TIMEOUT_SECONDS", 111.0),
-            patch("smzdm_notice.llm.clients.config.LLM_ARBITER_API_KEY", "arbiter-key"),
-            patch("smzdm_notice.llm.clients.config.LLM_ARBITER_BASE_URL", "https://arbiter.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_ARBITER_TIMEOUT_SECONDS", 222.0),
-            patch("smzdm_notice.llm.clients.config.LLM_DRAFT_API_KEY", "draft-key"),
-            patch("smzdm_notice.llm.clients.config.LLM_DRAFT_BASE_URL", "https://draft.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_DRAFT_TIMEOUT_SECONDS", 333.0),
-        ):
-            get_filter_client()
-            get_arbiter_client()
-            get_draft_client()
+        with patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory):
+            get_client_for_config(
+                _llm_config(connection="filter", api_key="filter-key", base_url="https://filter.example.com", timeout=111.0)
+            )
+            get_client_for_config(
+                _llm_config(connection="arbiter", api_key="arbiter-key", base_url="https://arbiter.example.com", timeout=222.0)
+            )
+            get_client_for_config(
+                _llm_config(connection="draft", api_key="draft-key", base_url="https://draft.example.com", timeout=333.0)
+            )
 
         self.assertEqual([kwargs["timeout"] for kwargs in created], [111.0, 222.0, 333.0])
         self.assertEqual(created[2]["api_key"], "draft-key")
         self.assertEqual(created[2]["base_url"], "https://draft.example.com")
 
-    def test_scene_slot_rebuilds_when_spec_changes(self) -> None:
+    def test_client_cache_keeps_distinct_specs_without_thrashing(self) -> None:
         created = []
 
         def openai_factory(**kwargs):
             created.append(kwargs)
             return SimpleNamespace(name=f"client-{len(created)}")
 
-        with (
-            patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory),
-            patch("smzdm_notice.llm.clients.config.LLM_API_KEY", "key"),
-            patch("smzdm_notice.llm.clients.config.LLM_BASE_URL", "https://llm.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_TIMEOUT_SECONDS", 300.0),
-        ):
-            first = get_filter_client()
-        with (
-            patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory),
-            patch("smzdm_notice.llm.clients.config.LLM_API_KEY", "key"),
-            patch("smzdm_notice.llm.clients.config.LLM_BASE_URL", "https://other.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_TIMEOUT_SECONDS", 300.0),
-        ):
-            second = get_filter_client()
+        with patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory):
+            first = get_client_for_config(_llm_config())
+            second = get_client_for_config(_llm_config(base_url="https://other.example.com"))
+            third = get_client_for_config(_llm_config())
 
         self.assertIsNot(first, second)
+        self.assertIs(first, third)
         self.assertEqual(len(created), 2)
         self.assertEqual(created[1]["base_url"], "https://other.example.com")
 
-    def test_scene_slot_rebuilds_when_timeout_changes(self) -> None:
+    def test_client_cache_keeps_same_connection_with_different_timeouts(self) -> None:
         created = []
 
         def openai_factory(**kwargs):
             created.append(kwargs)
             return SimpleNamespace(name=f"client-{len(created)}")
 
-        with (
-            patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory),
-            patch("smzdm_notice.llm.clients.config.LLM_API_KEY", "key"),
-            patch("smzdm_notice.llm.clients.config.LLM_BASE_URL", "https://llm.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_TIMEOUT_SECONDS", 300.0),
-        ):
-            first = get_filter_client()
-        with (
-            patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory),
-            patch("smzdm_notice.llm.clients.config.LLM_API_KEY", "key"),
-            patch("smzdm_notice.llm.clients.config.LLM_BASE_URL", "https://llm.example.com"),
-            patch("smzdm_notice.llm.clients.config.LLM_TIMEOUT_SECONDS", 120.0),
-        ):
-            second = get_filter_client()
+        with patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory):
+            first = get_client_for_config(_llm_config(timeout=300.0))
+            second = get_client_for_config(_llm_config(timeout=120.0))
+            third = get_client_for_config(_llm_config(timeout=300.0))
 
         self.assertIsNot(first, second)
+        self.assertIs(first, third)
+        self.assertEqual(len(created), 2)
         self.assertEqual(created[1]["timeout"], 120.0)
+
+    def test_client_cache_evicts_least_recently_used_spec(self) -> None:
+        created = []
+
+        def openai_factory(**kwargs):
+            client = SimpleNamespace(name=f"client-{len(created) + 1}", close=Mock())
+            created.append((kwargs, client))
+            return client
+
+        with (
+            patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory),
+            patch.object(llm_clients, "CLIENT_CACHE_MAX_SIZE", 2),
+        ):
+            first = get_client_for_config(_llm_config(base_url="https://one.example.com"))
+            second = get_client_for_config(_llm_config(base_url="https://two.example.com"))
+            first_again = get_client_for_config(_llm_config(base_url="https://one.example.com"))
+            third = get_client_for_config(_llm_config(base_url="https://three.example.com"))
+            second_again = get_client_for_config(_llm_config(base_url="https://two.example.com"))
+
+        self.assertIs(first, first_again)
+        self.assertIsNot(second, second_again)
+        self.assertIsNot(third, second_again)
+        self.assertEqual(len(created), 4)
+        self.assertEqual(created[-1][0]["base_url"], "https://two.example.com")
+        second.close.assert_called_once_with()
+        first.close.assert_called_once_with()
+        third.close.assert_not_called()
+        second_again.close.assert_not_called()
+
+    def test_clear_client_cache_closes_cached_clients(self) -> None:
+        created = []
+
+        def openai_factory(**kwargs):
+            client = SimpleNamespace(name=f"client-{len(created) + 1}", close=Mock())
+            created.append(client)
+            return client
+
+        with patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory):
+            get_client_for_config(_llm_config(base_url="https://one.example.com"))
+            get_client_for_config(_llm_config(base_url="https://two.example.com"))
+            _clear_client_cache()
+
+        for client in created:
+            client.close.assert_called_once_with()
+
+    def test_client_close_failure_does_not_interrupt_eviction(self) -> None:
+        first = SimpleNamespace(close=Mock(side_effect=RuntimeError("close failed")))
+        second = SimpleNamespace(close=Mock())
+        third = SimpleNamespace(close=Mock())
+
+        with (
+            patch("smzdm_notice.llm.clients.OpenAI", side_effect=[first, second, third]),
+            patch.object(llm_clients, "CLIENT_CACHE_MAX_SIZE", 2),
+        ):
+            get_client_for_config(_llm_config(base_url="https://one.example.com"))
+            get_client_for_config(_llm_config(base_url="https://two.example.com"))
+            get_client_for_config(_llm_config(base_url="https://three.example.com"))
+
+        first.close.assert_called_once_with()
 
 
 class LlmPromptContextTests(unittest.TestCase):
@@ -240,14 +311,14 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
                 "smzdm_notice.core.config.PREFILTER_MIN_COMMENTS",
                 999,
             ),
-            patch("smzdm_notice.llm.filter.get_filter_client", return_value=object()),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(
                 items=[_item(article_id="low-worthy", worthy=1, unworthy=100)],
                 user_prompt=user_prompt,
                 inventory_data="库存",
-                model="model",
+                routing_snapshot=_routing_snapshot(),
             )
 
         self.assertIn("low-worthy", captured["user_message"])
@@ -280,10 +351,10 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             patch("smzdm_notice.core.config.PREFILTER_MIN_WORTHY_RATE", 0.5),
             patch("smzdm_notice.core.config.PREFILTER_MIN_COMMENTS", 10),
             patch("smzdm_notice.core.config.PREFILTER_MIN_FAVORITES", 5),
-            patch("smzdm_notice.llm.filter.get_filter_client", return_value=object()),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
-            filter_items(items, "用户偏好", "库存", "model")
+            filter_items(items, "用户偏好", "库存", routing_snapshot=_routing_snapshot())
 
         self.assertIn("pass", captured["user_message"])
         self.assertNotIn("low-comments", captured["user_message"])
@@ -341,14 +412,14 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             patch("smzdm_notice.core.config.PREFILTER_MIN_FAVORITES", 100),
             patch("smzdm_notice.core.config.PREFILTER_BYPASS_MIN_COMMENTS", 100),
             patch("smzdm_notice.core.config.PREFILTER_BYPASS_MIN_WORTHY", 999),
-            patch("smzdm_notice.llm.filter.get_filter_client", return_value=object()),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(
                 [_item(article_id="comment-bypass", worthy=1, unworthy=99, comments=100, favorites=0)],
                 "用户偏好",
                 "库存",
-                "model",
+                routing_snapshot=_routing_snapshot(),
             )
 
         self.assertIn("comment-bypass", captured["user_message"])
@@ -376,17 +447,40 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             patch("smzdm_notice.core.config.PREFILTER_MIN_FAVORITES", 100),
             patch("smzdm_notice.core.config.PREFILTER_BYPASS_MIN_COMMENTS", 999),
             patch("smzdm_notice.core.config.PREFILTER_BYPASS_MIN_WORTHY", 100),
-            patch("smzdm_notice.llm.filter.get_filter_client", return_value=object()),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(
                 [_item(article_id="worthy-bypass", worthy=100, unworthy=100, comments=0, favorites=0)],
                 "用户偏好",
                 "库存",
-                "model",
+                routing_snapshot=_routing_snapshot(),
             )
 
         self.assertIn("worthy-bypass", captured["user_message"])
+
+    def test_filter_items_model_argument_overrides_routed_model(self) -> None:
+        captured = {}
+
+        def fake_call(client, llm_config, user_message):
+            captured["model_id"] = llm_config.model_id
+            return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
+
+        with (
+            patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
+            patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
+        ):
+            filter_items(
+                [_item()],
+                "用户偏好",
+                "库存",
+                model="override-model",
+                routing_snapshot=_routing_snapshot(),
+            )
+
+        self.assertEqual(captured["model_id"], "override-model")
 
     def test_single_call_failure_marks_llm_failed(self) -> None:
         result = _filter_items_with_mocked_call(
@@ -428,7 +522,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_single_llm_call_classifies_retryable_error(self) -> None:
         outcome = _single_llm_call(
             _failing_client(RateLimitError("rate limited", response=_openai_response(429), body=None)),
-            "model",
+            _llm_config(),
             "user message",
         )
 
@@ -436,7 +530,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         self.assertIn("可重试/网络类问题", outcome.error_summary)
 
     def test_single_llm_call_classifies_timeout_error(self) -> None:
-        outcome = _single_llm_call(_failing_client(APITimeoutError(_openai_request())), "model", "user message")
+        outcome = _single_llm_call(_failing_client(APITimeoutError(_openai_request())), _llm_config(), "user message")
 
         self.assertIsNone(outcome.result)
         self.assertIn("可重试/网络类问题", outcome.error_summary)
@@ -444,12 +538,37 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_single_llm_call_classifies_non_retryable_error(self) -> None:
         outcome = _single_llm_call(
             _failing_client(BadRequestError("bad request", response=_openai_response(400), body=None)),
-            "model",
+            _llm_config(),
             "user message",
         )
 
         self.assertIsNone(outcome.result)
         self.assertIn("配置或请求不可重试问题", outcome.error_summary)
+
+    def test_single_llm_call_uses_resolved_request_options(self) -> None:
+        captured = {}
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"recommendations": [], "near_misses": []}')
+                )
+            ]
+        )
+
+        def create_completion(**kwargs):
+            captured.update(kwargs)
+            return response
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
+        llm_config = replace(_llm_config(temperature=0.8), extra_body={"do_sample": False})
+
+        outcome = _single_llm_call(client, llm_config, "user message")
+
+        self.assertIsNotNone(outcome.result)
+        self.assertEqual(captured["model"], "model")
+        self.assertEqual(captured["temperature"], 0.8)
+        self.assertEqual(captured["response_format"], {"type": "json_object"})
+        self.assertEqual(captured["extra_body"], {"do_sample": False})
 
 
 class LlmFilterArbitrationTests(unittest.TestCase):
@@ -482,7 +601,7 @@ class LlmFilterArbitrationTests(unittest.TestCase):
                 items_by_id={},
                 user_message="用户偏好",
                 client=client,
-                model="arbiter-model",
+                llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
             )
         )
 
@@ -514,7 +633,7 @@ class LlmFilterArbitrationTests(unittest.TestCase):
                 items_by_id={},
                 user_message="用户偏好",
                 client=client,
-                model="arbiter-model",
+                llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
             )
         )
 
@@ -532,7 +651,7 @@ class LlmFilterArbitrationTests(unittest.TestCase):
                 items_by_id={},
                 user_message="用户偏好",
                 client=_failing_client(RateLimitError("rate limited", response=_openai_response(429), body=None)),
-                model="arbiter-model",
+                llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
             )
         )
 

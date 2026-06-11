@@ -36,14 +36,14 @@ class MainConfigValidationTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch("smzdm_notice.runtime.config.FEISHU_APP_ID", "cli_real_app_id"))
             stack.enter_context(patch("smzdm_notice.runtime.config.FEISHU_APP_SECRET", "secret"))
-            stack.enter_context(patch("smzdm_notice.runtime.config.LLM_API_KEY", "key"))
+            stack.enter_context(patch("smzdm_notice.runtime.llm_routing.initialize"))
             self.assertTrue(main._validate_config())
 
     def test_rejects_incomplete_feishu_app_config(self) -> None:
         with ExitStack() as stack:
             stack.enter_context(patch("smzdm_notice.runtime.config.FEISHU_APP_ID", "cli_real_app_id"))
             stack.enter_context(patch("smzdm_notice.runtime.config.FEISHU_APP_SECRET", ""))
-            stack.enter_context(patch("smzdm_notice.runtime.config.LLM_API_KEY", "key"))
+            stack.enter_context(patch("smzdm_notice.runtime.llm_routing.initialize"))
             stack.enter_context(patch("smzdm_notice.runtime.logger.error"))
             self.assertFalse(main._validate_config())
 
@@ -51,7 +51,7 @@ class MainConfigValidationTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch("smzdm_notice.runtime.config.FEISHU_APP_ID", "cli_xxx"))
             stack.enter_context(patch("smzdm_notice.runtime.config.FEISHU_APP_SECRET", "secret"))
-            stack.enter_context(patch("smzdm_notice.runtime.config.LLM_API_KEY", "key"))
+            stack.enter_context(patch("smzdm_notice.runtime.llm_routing.initialize"))
             stack.enter_context(patch("smzdm_notice.runtime.logger.error"))
             self.assertFalse(main._validate_config())
 
@@ -131,6 +131,7 @@ class MainConfigSummaryTests(unittest.TestCase):
             stack.enter_context(patch.object(main, "_ranking_configs", [SimpleNamespace(name="综合榜")]))
             stack.enter_context(patch.object(main, "_search_keywords", []))
             stack.enter_context(patch.object(main, "_current_user_prompt", "偏好正文"))
+            stack.enter_context(patch("smzdm_notice.runtime.llm_routing.format_status", return_value="**LLM 路由**\n- 默认: test/model"))
             for key, value in defaults.items():
                 stack.enter_context(patch.object(main.config, key, value))
             return main._config_summary()
@@ -180,7 +181,7 @@ class MainRestartTests(unittest.TestCase):
 
     def test_exec_restart_marks_dotenv_for_reload(self) -> None:
         with ExitStack() as stack:
-            stack.enter_context(patch.dict(os.environ, {"LLM_API_KEY": "old-key"}, clear=True))
+            stack.enter_context(patch.dict(os.environ, {"CUSTOM_ENV": "old-value"}, clear=True))
             stack.enter_context(patch.object(main.sys, "executable", "/usr/bin/python"))
             stack.enter_context(patch.object(main.sys, "argv", ["main.py"]))
             execve = stack.enter_context(patch("smzdm_notice.runtime.os.execve"))
@@ -190,7 +191,7 @@ class MainRestartTests(unittest.TestCase):
         executable, argv, env = execve.call_args.args
         self.assertEqual(executable, "/usr/bin/python")
         self.assertEqual(argv, ["/usr/bin/python", "main.py"])
-        self.assertEqual(env["LLM_API_KEY"], "old-key")
+        self.assertEqual(env["CUSTOM_ENV"], "old-value")
         self.assertEqual(env["SMZDM_RESTART_RELOAD_DOTENV"], "1")
 
 
@@ -539,9 +540,12 @@ class MainPollFailureTests(unittest.TestCase):
     def test_poll_once_records_outcome(self) -> None:
         tracker = MagicMock()
         main._poll_failure_tracker = tracker
-        with patch(
-            "smzdm_notice.runtime._poll_once_unlocked",
-            return_value=main.PollOutcome.failure("llm_failed", "429"),
+        with (
+            patch("smzdm_notice.runtime.llm_routing.get_snapshot", return_value=object()),
+            patch(
+                "smzdm_notice.runtime._poll_once_unlocked",
+                return_value=main.PollOutcome.failure("llm_failed", "429"),
+            ),
         ):
             main._poll_once(MagicMock(), MagicMock())
 

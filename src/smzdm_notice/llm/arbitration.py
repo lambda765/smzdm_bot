@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from loguru import logger
 from openai import OpenAI
 
-from smzdm_notice.llm.clients import get_arbiter_client
+from smzdm_notice.llm.clients import get_client_for_config
 from smzdm_notice.llm.errors import (
     GENERAL_OPENAI_ERRORS,
     NON_RETRYABLE_OPENAI_ERRORS,
@@ -18,6 +18,7 @@ from smzdm_notice.llm.errors import (
 from smzdm_notice.llm.json_utils import extract_json_object
 from smzdm_notice.llm.models import ArbiterInfo, FilterResult, LLMCallResult, NearMiss
 from smzdm_notice.llm.prompts import ARBITER_SYSTEM_PROMPT
+from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot, build_chat_completion_kwargs, resolve
 
 
 @dataclass
@@ -30,7 +31,7 @@ class ArbitrationRequest:
     items_by_id: dict[str, dict]
     user_message: str
     client: OpenAI
-    model: str
+    llm_config: ResolvedLLMConfig
 
 
 def resolve_dual_result(
@@ -39,6 +40,7 @@ def resolve_dual_result(
     items_summary: list[dict],
     items_by_id: dict[str, dict],
     user_message: str,
+    routing_snapshot: RoutingSnapshot | None = None,
 ) -> tuple[FilterResult, ArbiterInfo | None]:
     """根据双次调用结果决定最终推荐。"""
     if call_a is None:
@@ -64,7 +66,16 @@ def resolve_dual_result(
     only_b = ids_b - ids_a
     logger.warning(f"两次判断不一致: A 独有 {only_a}, B 独有 {only_b}")
 
-    arbiter_info = _run_arbiter(result_a, result_b, call_a, call_b, items_summary, items_by_id, user_message)
+    arbiter_info = _run_arbiter(
+        result_a,
+        result_b,
+        call_a,
+        call_b,
+        items_summary,
+        items_by_id,
+        user_message,
+        routing_snapshot,
+    )
     final_from_arbitration = _result_from_arbitration(result_a, result_b, arbiter_info)
     if final_from_arbitration is not None:
         return final_from_arbitration, arbiter_info
@@ -80,13 +91,15 @@ def _run_arbiter(
     items_summary: list[dict],
     items_by_id: dict[str, dict],
     user_message: str,
+    routing_snapshot: RoutingSnapshot | None = None,
 ) -> ArbiterInfo | None:
     from smzdm_notice.core import config
 
     if not config.LLM_ARBITER_ENABLED:
         return None
-    logger.info(f"仲裁 LLM 模型: {config.LLM_ARBITER_MODEL}")
-    logger.debug(f"仲裁 LLM Base URL: {config.LLM_ARBITER_BASE_URL}")
+    llm_config = resolve("arbiter", routing_snapshot)
+    logger.info(f"仲裁 LLM 模型: {llm_config.connection}/{llm_config.model_id}")
+    logger.debug(f"仲裁 LLM Base URL: {llm_config.base_url}")
     return arbitrate(
         ArbitrationRequest(
             result_a=result_a,
@@ -96,8 +109,8 @@ def _run_arbiter(
             items_summary=items_summary,
             items_by_id=items_by_id,
             user_message=user_message,
-            client=get_arbiter_client(),
-            model=config.LLM_ARBITER_MODEL,
+            client=get_client_for_config(llm_config),
+            llm_config=llm_config,
         )
     )
 
@@ -132,13 +145,13 @@ def arbitrate(request: ArbitrationRequest) -> ArbiterInfo | None:
     """调用仲裁 agent 决定哪个结果更准确。"""
     try:
         response = request.client.chat.completions.create(
-            model=request.model,
-            messages=[
-                {"role": "system", "content": ARBITER_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_arbitration_message(request)},
-            ],
-            temperature=0.0,
-            response_format={"type": "json_object"},
+            **build_chat_completion_kwargs(
+                request.llm_config,
+                messages=[
+                    {"role": "system", "content": ARBITER_SYSTEM_PROMPT},
+                    {"role": "user", "content": _build_arbitration_message(request)},
+                ],
+            )
         )
         return _parse_arbiter_response(response.choices[0].message.content, request)
     except RETRYABLE_OPENAI_ERRORS as e:

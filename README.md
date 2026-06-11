@@ -59,7 +59,7 @@ pip install -e .
 smzdm-notice setup
 ```
 
-`setup` 会创建 `.env`、`preference.md`、`inventory.md` 和 `workspace/` 目录，已有文件不覆盖。
+`setup` 会创建 `.env`、`llm_models.json`、`preference.md`、`inventory.md` 和 `workspace/` 目录，已有文件不覆盖。
 
 ### 配置
 
@@ -73,9 +73,7 @@ smzdm-notice setup
 | `SMZDM_APP_VERSION` | SMZDM App 版本号 | `11.1.70` |
 | `SMZDM_SIGN_KEY` | SMZDM App 接口签名 key | |
 | `SMZDM_USER_AGENT` | SMZDM App 请求 User-Agent | |
-| `LLM_API_KEY` | LLM API 密钥 | |
-| `LLM_BASE_URL` | LLM 接口地址（OpenAI 兼容） | `https://api.deepseek.com/v1` |
-| `LLM_MODEL` | 模型名称 | `deepseek-chat` |
+| `LLM_DEEPSEEK_API_KEY` | 默认 `llm_models.json` 引用的 DeepSeek API 密钥 | |
 | `RANKING_NAMES` | 监控榜单，逗号分隔；留空抓全部 | `综合榜-全部,综合榜-食品生鲜` |
 
 可选榜单：综合榜-全部、综合榜-电脑数码、综合榜-白菜、综合榜-食品生鲜、综合榜-运动户外、综合榜-家用电器、综合榜-服饰鞋包、综合榜-日用百货、综合榜-母婴用品、综合榜-家居家装、综合榜-办公设备、综合榜-个护化妆、综合榜-本地生活、综合榜-医疗健康、综合榜-图书文娱、综合榜-玩模乐器、热卖榜、热评榜、热搜榜。
@@ -93,13 +91,8 @@ smzdm-notice setup
 | 分类 | Key | 说明 |
 |------|-----|------|
 | LLM | `LLM_DUAL_FILTER` | 双重判断模式（默认 `false`） |
-| LLM | `LLM_MAX_RETRIES` | OpenAI SDK 自动重试次数（默认 `2`） |
-| LLM | `LLM_TIMEOUT_SECONDS` | 主筛选 LLM 请求超时秒数（默认 `300`） |
 | LLM | `LLM_ARBITER_ENABLED` | 仲裁 agent（默认 `true`） |
-| LLM | `LLM_ARBITER_API_KEY/BASE_URL/MODEL` | 仲裁专用 LLM，不填复用主配置 |
-| LLM | `LLM_ARBITER_TIMEOUT_SECONDS` | 仲裁 LLM 请求超时秒数，不填复用主超时 |
-| LLM | `LLM_DRAFT_API_KEY/BASE_URL/MODEL` | 草案专用 LLM，不填复用仲裁配置 |
-| LLM | `LLM_DRAFT_TIMEOUT_SECONDS` | 草案 LLM 请求超时秒数，不填复用仲裁超时 |
+| LLM | `LLM_MODELS_FILE` | 多 connection/agent 路由配置文件（默认 `llm_models.json`） |
 | 预筛选 | `PREFILTER_ENABLED` | 启用粗筛（默认 `false`） |
 | 预筛选 | `PREFILTER_MIN_WORTHY/COMMENTS/FAVORITES` | 最低准入阈值 |
 | 预筛选 | `PREFILTER_BYPASS_ENABLED` | 强信号直通（默认 `false`） |
@@ -112,6 +105,16 @@ smzdm-notice setup
 | 汇总 | `DIGEST_HOUR` | 夜间汇总时间（默认 `22`） |
 
 **偏好与库存：** 编辑 `preference.md` 写购物偏好，编辑 `inventory.md` 写库存状态，两者会完整提供给 LLM。
+
+**LLM 多模型路由：** 新安装会生成 `llm_models.json` 并默认启用多模型路由。JSON 中只保存 `api_key_env`，真实密钥继续放 `.env`，例如 `LLM_DEEPSEEK_API_KEY=...`。运行时必须有 `llm_models.json`；旧安装可先运行 `smzdm-notice migrate-llm-config` 从旧 LLM 环境变量生成该文件。
+
+配置分三层：`connections` 保存 OpenAI 兼容接口连接，`defaults` 保存默认 connection/model_id/request 参数，`agents.filter/arbiter/draft` 只写覆盖项；未配置的 agent（包括 `draft`）会继承 defaults。`timeout_seconds/max_retries` 可写在 defaults、connection 或 agent 上，优先级为 agent > connection > defaults。运行时内置默认 `response_format={"type":"json_object"}`，即使 JSON 里省略该字段也会发送；用户可用非空 `response_format` 对象覆盖。agent request 中字段值为 `null` 表示继承默认值，不会关闭默认 `response_format`。
+
+飞书发送 `/model` 会打开 LLM 模型路由管理卡片，可在卡片中查看当前默认配置和 `filter/arbiter/draft` 的最终路由，选择作用范围、选择已加载 connection、输入 model_id、设置 temperature、reset agent 覆盖并做测试调用。
+
+热切只修改已加载 connection 下的 `defaults` 或 `agents` 覆盖项；新增或修改 `base_url/provider/api_key_env`、修改 `.env` 密钥后需要重启。写回使用唯一临时文件和原子替换；多实例同时热切时以后写入者为准。
+
+旧配置迁移：`smzdm-notice migrate-llm-config` 会读取 `.env` 中已废弃的 `LLM_API_KEY/LLM_BASE_URL/LLM_MODEL` 及仲裁/草案旧变量，生成 `llm_models.json`；已有文件不会覆盖，除非加 `--force`。迁移命令不会删除或改写 `.env`。
 
 **搜索关键词：** 可选创建 `search_keywords.json`：
 

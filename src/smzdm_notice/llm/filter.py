@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from loguru import logger
 from openai import OpenAI
 
 from smzdm_notice.llm.arbitration import resolve_dual_result
-from smzdm_notice.llm.clients import get_filter_client
+from smzdm_notice.llm.clients import get_client_for_config
 from smzdm_notice.llm.errors import (
     GENERAL_OPENAI_ERRORS,
     NON_RETRYABLE_OPENAI_ERRORS,
@@ -27,6 +27,7 @@ from smzdm_notice.llm.models import (
     LLMCallResult,
 )
 from smzdm_notice.llm.prompts import SYSTEM_PROMPT
+from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot, build_chat_completion_kwargs, resolve
 from smzdm_notice.smzdm.ranking import RankingItem
 
 
@@ -42,7 +43,8 @@ def filter_items(
     items: list[RankingItem],
     user_prompt: str,
     inventory_data: str,
-    model: str,
+    model: str | None = None,
+    routing_snapshot: RoutingSnapshot | None = None,
 ) -> FilterItemsResult:
     """使用 LLM 筛选商品。"""
     if not items:
@@ -57,12 +59,17 @@ def filter_items(
         return FilterItemsResult()
 
     prompt_context = _build_prompt_context(items, user_prompt, inventory_data)
-    logger.info(f"发送 {len(prompt_context.item_map)} 条商品到 LLM ({model}) 进行筛选...")
+    llm_config = resolve("filter", routing_snapshot)
+    if model:
+        llm_config = replace(llm_config, model_id=model)
+    logger.info(
+        f"发送 {len(prompt_context.item_map)} 条商品到 LLM ({llm_config.connection}/{llm_config.model_id}) 进行筛选..."
+    )
 
-    client = get_filter_client()
+    client = get_client_for_config(llm_config)
     if not config.LLM_DUAL_FILTER:
-        return _filter_with_single_call(client, model, prompt_context)
-    return _filter_with_dual_calls(client, model, prompt_context)
+        return _filter_with_single_call(client, llm_config, prompt_context)
+    return _filter_with_dual_calls(client, llm_config, prompt_context, routing_snapshot)
 
 
 def _build_prompt_context(
@@ -101,10 +108,10 @@ def _build_prompt_context(
 
 def _filter_with_single_call(
     client: OpenAI,
-    model: str,
+    llm_config: ResolvedLLMConfig,
     prompt_context: FilterPromptContext,
 ) -> FilterItemsResult:
-    call_outcome = _single_llm_call(client, model, prompt_context.user_message)
+    call_outcome = _single_llm_call(client, llm_config, prompt_context.user_message)
     if call_outcome.result is None:
         return FilterItemsResult(
             diagnostics=FilterDiagnostics(
@@ -119,12 +126,13 @@ def _filter_with_single_call(
 
 def _filter_with_dual_calls(
     client: OpenAI,
-    model: str,
+    llm_config: ResolvedLLMConfig,
     prompt_context: FilterPromptContext,
+    routing_snapshot: RoutingSnapshot | None = None,
 ) -> FilterItemsResult:
     with ThreadPoolExecutor(max_workers=2) as executor:
-        future_a = executor.submit(_single_llm_call, client, model, prompt_context.user_message)
-        future_b = executor.submit(_single_llm_call, client, model, prompt_context.user_message)
+        future_a = executor.submit(_single_llm_call, client, llm_config, prompt_context.user_message)
+        future_b = executor.submit(_single_llm_call, client, llm_config, prompt_context.user_message)
 
         outcome_a = future_a.result()
         outcome_b = future_b.result()
@@ -139,6 +147,7 @@ def _filter_with_dual_calls(
         prompt_context.items_summary,
         prompt_context.arbiter_items,
         prompt_context.user_message,
+        routing_snapshot=routing_snapshot,
     )
 
     matched, near_misses = _match_result(final_result, prompt_context.item_map)
@@ -209,19 +218,19 @@ def _worthy_rate(item: RankingItem) -> float:
 
 def _single_llm_call(
     client: OpenAI,
-    model: str,
+    llm_config: ResolvedLLMConfig,
     user_message: str,
 ) -> LLMCallOutcome:
     """执行一次 LLM 调用并解析结果。"""
     try:
         response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.3,
-            response_format={"type": "json_object"},
+            **build_chat_completion_kwargs(
+                llm_config,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+            )
         )
 
         content = response.choices[0].message.content or ""

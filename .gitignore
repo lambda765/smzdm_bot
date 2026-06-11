@@ -6,6 +6,7 @@ workspace/
 inventory.md
 preference.md
 search_keywords.json
+llm_models.json
 
 .dedup_cache.json
 .near_misses.json

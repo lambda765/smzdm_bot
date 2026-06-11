@@ -33,8 +33,10 @@ from smzdm_notice.feishu.notifier import (
     send_shutdown,
     send_startup,
 )
+from smzdm_notice.llm import routing as llm_routing
 from smzdm_notice.llm.filter import filter_items
 from smzdm_notice.llm.models import ArbiterInfo
+from smzdm_notice.llm.routing import RoutingSnapshot
 from smzdm_notice.preferences.builder import build_arbitration_draft
 from smzdm_notice.preferences.store import CONFIG_FILE_LOCK, DraftStore
 from smzdm_notice.smzdm.client import close_client
@@ -136,8 +138,10 @@ def _validate_config() -> bool:
         errors.append("FEISHU_APP_ID 仍是示例占位符，请填入真实 App ID")
     if config.FEISHU_APP_SECRET and _looks_like_placeholder(config.FEISHU_APP_SECRET):
         errors.append("FEISHU_APP_SECRET 仍是示例占位符，请填入真实 App Secret")
-    if not config.LLM_API_KEY:
-        errors.append("LLM_API_KEY 未配置")
+    try:
+        llm_routing.initialize(force=True)
+    except Exception as e:
+        errors.append(f"LLM 路由配置错误: {e}")
 
     if errors:
         for e in errors:
@@ -233,6 +237,7 @@ def _config_summary() -> str:
     ranking_names = [cfg.name for cfg in _ranking_configs]
     search_summary = _search_keywords_summary()
     prefilter_summary = _prefilter_config_summary()
+    llm_summary = llm_routing.format_status()
     return (
         f"**监控配置**\n"
         f"- 🕐 轮询间隔: {config.POLL_INTERVAL_MINUTES} 分钟\n"
@@ -241,15 +246,10 @@ def _config_summary() -> str:
         f"- 📊 监控榜单: {', '.join(ranking_names)}\n"
         f"- 🔎 搜索关键词: {search_summary}\n"
         f"- 🔢 每榜 Top: {config.TOP_N}\n"
-        f"- 🤖 LLM 模型: {config.LLM_MODEL}\n"
+        f"{llm_summary}\n"
         f"- 🔀 双重判断: {'已启用' if config.LLM_DUAL_FILTER else '未启用'}"
         + (" (含仲裁)" if config.LLM_DUAL_FILTER and config.LLM_ARBITER_ENABLED else "")
         + "\n"
-        + (
-            f"- ⚖️ 仲裁模型: {config.LLM_ARBITER_MODEL}\n"
-            if config.LLM_DUAL_FILTER and config.LLM_ARBITER_ENABLED
-            else ""
-        )
         + prefilter_summary
         + f"- 🎯 用户偏好: {_current_user_prompt[:80]}{'...' if len(_current_user_prompt) > 80 else ''}"
     )
@@ -365,9 +365,10 @@ def _poll_once(dedup: DedupManager, near_miss_mgr: NearMissManager) -> None:
     logger.info("=" * 50)
     logger.info("开始新一轮轮询...")
     _last_poll_started_at = time.time()
+    routing_snapshot = llm_routing.get_snapshot()
     _maintain_config_drafts("轮询开始清理")
     try:
-        outcome = _poll_once_unlocked(dedup, near_miss_mgr)
+        outcome = _poll_once_unlocked(dedup, near_miss_mgr, routing_snapshot)
         if _poll_failure_tracker:
             _poll_failure_tracker.record(outcome)
     finally:
@@ -375,7 +376,11 @@ def _poll_once(dedup: DedupManager, near_miss_mgr: NearMissManager) -> None:
         _maintain_config_drafts("轮询结束清理")
 
 
-def _poll_once_unlocked(dedup: DedupManager, near_miss_mgr: NearMissManager) -> PollOutcome:
+def _poll_once_unlocked(
+    dedup: DedupManager,
+    near_miss_mgr: NearMissManager,
+    routing_snapshot: RoutingSnapshot | None = None,
+) -> PollOutcome:
     """不负责加锁的单次轮询实现。"""
     all_items, early_outcome = _fetch_poll_items()
     if early_outcome:
@@ -389,7 +394,7 @@ def _poll_once_unlocked(dedup: DedupManager, near_miss_mgr: NearMissManager) -> 
     if bypass_matches:
         logger.info(f"搜索价格阈值直推: {len(bypass_matches)} 条；其余 {len(llm_candidates)} 条进入 LLM 流程")
 
-    evaluation = _evaluate_poll_matches(bypass_matches, llm_candidates, dedup, near_miss_mgr)
+    evaluation = _evaluate_poll_matches(bypass_matches, llm_candidates, dedup, near_miss_mgr, routing_snapshot)
     if isinstance(evaluation, PollOutcome):
         return evaluation
 
@@ -451,6 +456,7 @@ def _evaluate_poll_matches(
     llm_candidates: list[RankingItem],
     dedup: DedupManager,
     near_miss_mgr: NearMissManager,
+    routing_snapshot: RoutingSnapshot | None = None,
 ) -> MatchEvaluation | PollOutcome:
     if not llm_candidates:
         return MatchEvaluation(matched=bypass_matches, near_misses=[])
@@ -464,7 +470,7 @@ def _evaluate_poll_matches(
         items=llm_candidates,
         user_prompt=user_prompt,
         inventory_data=inventory_data,
-        model=config.LLM_MODEL,
+        routing_snapshot=routing_snapshot,
     )
     if filter_result.diagnostics.llm_failed:
         logger.error("LLM 筛选全失败，跳过 LLM 推荐")

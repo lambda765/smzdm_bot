@@ -11,7 +11,7 @@ from pathlib import Path
 from loguru import logger
 
 from smzdm_notice.core import config
-from smzdm_notice.llm.clients import get_draft_client
+from smzdm_notice.llm.clients import get_client_for_config
 from smzdm_notice.llm.errors import (
     GENERAL_OPENAI_ERRORS,
     NON_RETRYABLE_OPENAI_ERRORS,
@@ -19,6 +19,7 @@ from smzdm_notice.llm.errors import (
     error_summary,
 )
 from smzdm_notice.llm.json_utils import parse_json_object
+from smzdm_notice.llm.routing import build_chat_completion_kwargs, resolve
 from smzdm_notice.preferences.models import ALLOWED_TARGETS, ConfigDraft
 from smzdm_notice.preferences.prompts import (
     draft_rules_prompt,
@@ -126,16 +127,14 @@ def _format_deal_context(value: dict) -> str:
 
 
 def _call_llm_for_draft(messages: list, validate: bool = True) -> dict | None:
-    if not config.LLM_DRAFT_API_KEY:
-        return None
     try:
-        logger.info(f"配置草案 LLM 模型: {config.LLM_DRAFT_MODEL}")
-        client = get_draft_client()
+        llm_config = resolve("draft")
+        if not llm_config.api_key:
+            return None
+        logger.info(f"配置草案 LLM 模型: {llm_config.connection}/{llm_config.model_id}")
+        client = get_client_for_config(llm_config)
         response = client.chat.completions.create(
-            model=config.LLM_DRAFT_MODEL,
-            messages=messages,
-            temperature=0.0,
-            response_format={"type": "json_object"},
+            **build_chat_completion_kwargs(llm_config, messages=messages),
         )
         content = response.choices[0].message.content or ""
         data = _parse_llm_draft_content(content)
