@@ -29,6 +29,14 @@
 - 夜间汇总当日未推送的疑似好价，方便回查是否有漏推和筛选规则优化空间
 - 本地 `workspace/` 保存日志、状态和配置备份
 
+## 最近更新
+
+- **LLM 多模型路由**：支持多 OpenAI 兼容连接，filter / arbiter / draft 三层 agent 配置继承与覆盖
+- **热切换**：飞书 `/model` 命令运行时切换模型，无需重启
+- **配置迁移**：`smzdm-notice migrate-llm-config` 从旧环境变量生成 `llm_models.json`
+- **配置校验增强**：`doctor` 命令校验 `llm_models.json` 格式与密钥引用
+- **飞书模型管理卡片**：查看路由、选择 connection、设置 temperature、测试调用
+
 ## 效果示例
 
 **好价推送卡片**
