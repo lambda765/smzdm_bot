@@ -20,7 +20,7 @@ from smzdm_notice.feishu.bot import (
     _strip_bot_mention,
 )
 from smzdm_notice.feishu.commands import COMMAND_SPECS, help_markdown
-from smzdm_notice.feishu.notifier import build_model_management_card
+from smzdm_notice.feishu.notifier import NOT_WORTH_REASON_FIELD, build_model_management_card
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
 from smzdm_notice.preferences.models import ConfigDraft
 from smzdm_notice.preferences.store import DraftStore
@@ -554,6 +554,7 @@ class FeishuBotParsingTests(unittest.TestCase):
             send_text.assert_not_called()
 
     def test_memory_feedback_updates_cached_deal_card_for_toggle_states(self) -> None:
+        mock_card = {"config": {}, "header": {}, "elements": []}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             callback = Mock(side_effect=["recorded", "updated", "cancelled"])
@@ -567,18 +568,77 @@ class FeishuBotParsingTests(unittest.TestCase):
                 )
             )
 
-            with patch("smzdm_notice.feishu.bot.update_deal_feedback_card", return_value=True) as update_card:
+            with patch("smzdm_notice.feishu.bot.update_deal_feedback_card", return_value=mock_card) as update_card:
                 first = bot._handle_memory_feedback("deal_good", {"article_id": "1001"}, "om_deal")
                 second = bot._handle_memory_feedback("deal_not_worth", {"article_id": "1001"}, "om_deal")
                 third = bot._handle_memory_feedback("deal_not_worth", {"article_id": "1001"}, "om_deal")
 
-        self.assertEqual(first.message, "已标记为好价")
-        self.assertEqual(second.message, "已更新反馈")
+        self.assertEqual(first.message, "已标记为好价，偏好将用于后续推荐")
+        self.assertEqual(first.response_card, mock_card)
+        self.assertEqual(second.message, "已更新为不值，偏好将用于后续推荐")
+        self.assertEqual(second.response_card, mock_card)
         self.assertEqual(third.message, "已取消反馈")
+        self.assertEqual(third.response_card, mock_card)
         self.assertEqual(
             [call.kwargs["selected"] for call in update_card.call_args_list],
             ["deal_good", "deal_not_worth", ""],
         )
+
+    def test_memory_feedback_reason_updates_existing_not_worth_feedback(self) -> None:
+        mock_card = {"config": {}, "header": {}, "elements": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            callback = Mock(return_value="reason_updated")
+            bot = FeishuInteractiveBot(
+                BotRuntime(
+                    draft_store=DraftStore(root / "drafts.json", root / "backups", root / "audit.jsonl", root=root),
+                    binding_store=FeishuBindingStore(root / "binding.json"),
+                    status_provider=lambda: "status",
+                    run_once=Mock(return_value=True),
+                    record_memory_feedback=callback,
+                )
+            )
+
+            with patch("smzdm_notice.feishu.bot.update_deal_feedback_card", return_value=mock_card) as update_card:
+                result = bot._handle_memory_feedback(
+                    "deal_not_worth_reason",
+                    {"article_id": "1001", "form_value": {NOT_WORTH_REASON_FIELD: {"value": "价格一般"}}},
+                    "om_deal",
+                )
+
+        self.assertEqual(result.message, "已保存不值理由")
+        self.assertEqual(result.response_card, mock_card)
+        callback.assert_called_once_with("1001", "deal_not_worth", "价格一般")
+        update_card.assert_called_once_with(
+            "om_deal",
+            "1001",
+            selected="deal_not_worth",
+            reason="价格一般",
+        )
+
+    def test_memory_feedback_reason_allows_empty_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            callback = Mock(return_value="reason_updated")
+            bot = FeishuInteractiveBot(
+                BotRuntime(
+                    draft_store=DraftStore(root / "drafts.json", root / "backups", root / "audit.jsonl", root=root),
+                    binding_store=FeishuBindingStore(root / "binding.json"),
+                    status_provider=lambda: "status",
+                    run_once=Mock(return_value=True),
+                    record_memory_feedback=callback,
+                )
+            )
+
+            with patch("smzdm_notice.feishu.bot.update_deal_feedback_card", return_value=None):
+                result = bot._handle_memory_feedback(
+                    "deal_not_worth_reason",
+                    {"article_id": "1001", "form_value": {NOT_WORTH_REASON_FIELD: {"value": ""}}},
+                    "om_deal",
+                )
+
+        self.assertEqual(result.message, "已清空不值理由")
+        callback.assert_called_once_with("1001", "deal_not_worth", "")
 
     def test_help_content_includes_every_registered_command(self) -> None:
         content = help_markdown()

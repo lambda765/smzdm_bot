@@ -37,6 +37,8 @@ Card = dict[str, Any]
 MessageId = str
 _DEAL_CARD_CACHE_MAX = 100
 _DEAL_CARD_CACHE: OrderedDict[str, Card] = OrderedDict()
+NOT_WORTH_REASON_FIELD = "not_worth_reason"
+NOT_WORTH_REASON_PLACEHOLDER = "可选：价格一般 / 已有类似 / 非刚需 / 品类不合适"
 
 
 def _current_binding() -> FeishuBinding | None:
@@ -294,15 +296,20 @@ def _memory_action_buttons_from_value(
     item_link: str = "",
     enabled: bool = True,
     selected: str = "",
+    reason: str = "",
 ) -> list[Card]:
+    """长期偏好反馈按钮。选中后只显示当前选中项，再次点击取消恢复两个。"""
     buttons: list[Card] = []
     if enabled:
-        good_label = "已选好价" if selected == "deal_good" else "好价👍"
-        not_worth_label = "已选不值" if selected == "deal_not_worth" else "不值👎"
-        good_type = "primary" if selected in {"", "deal_good"} else "default"
-        not_worth_type = "danger" if selected in {"", "deal_not_worth"} else "default"
-        buttons.append(_button_from_value(good_label, "deal_good", base_value, good_type))
-        buttons.append(_button_from_value(not_worth_label, "deal_not_worth", base_value, not_worth_type))
+        if selected == "deal_good":
+            buttons.append(_button_from_value("✅ 好价", "deal_good", base_value, "primary"))
+        elif selected == "deal_not_worth":
+            buttons.append(_button_from_value("❌ 不值", "deal_not_worth", base_value, "danger"))
+            buttons.append(_input(NOT_WORTH_REASON_FIELD, NOT_WORTH_REASON_PLACEHOLDER, default_value=reason))
+            buttons.append(_button_from_value("保存理由", "deal_not_worth_reason", base_value, "default"))
+        else:
+            buttons.append(_button_from_value("好价👍", "deal_good", base_value, "primary"))
+            buttons.append(_button_from_value("不值👎", "deal_not_worth", base_value, "danger"))
     link = item_link or str(base_value.get("item_link") or "")
     if link:
         buttons.append(
@@ -316,34 +323,83 @@ def _memory_action_buttons_from_value(
     return buttons
 
 
-def update_deal_feedback_card(message_id: str, article_id: str, selected: str = "") -> bool:
-    """Update a cached deal card's feedback button state."""
+def update_deal_feedback_card(message_id: str, article_id: str, selected: str = "", reason: str = "") -> Card | None:
+    """Update a cached deal card's feedback button state. Returns the updated card or None."""
     if not message_id or not article_id:
-        return False
+        return None
     cached = _DEAL_CARD_CACHE.get(message_id)
     if not cached:
-        return False
+        return None
 
     updated = deepcopy(cached)
-    if not _set_deal_feedback_selected(updated, article_id, selected):
-        return False
-    if not update_card_message(message_id, updated):
-        return False
+    if not _set_deal_feedback_selected(updated, article_id, selected, reason=reason):
+        return None
+    update_card_message(message_id, updated)  # best-effort PATCH
     _remember_deal_card(message_id, updated)
-    return True
+    return updated
 
 
-def _set_deal_feedback_selected(card: Card, article_id: str, selected: str) -> bool:
-    for element in card.get("elements", []):
+def _set_deal_feedback_selected(card: Card, article_id: str, selected: str, reason: str = "") -> bool:
+    elements = card.get("elements", [])
+    for idx, element in enumerate(elements):
         if element.get("tag") != "action":
             continue
         actions = element.get("actions", [])
         base_value = _memory_row_value(actions, article_id)
         if base_value is None:
             continue
-        element["actions"] = _memory_action_buttons_from_value(base_value, enabled=True, selected=selected)
+        element["actions"] = _memory_action_buttons_from_value(
+            base_value,
+            enabled=True,
+            selected=selected,
+            reason=_clean_feedback_reason(reason),
+        )
+        _update_preceding_markdown(elements, idx, _feedback_status_text(selected, reason=reason))
         return True
     return False
+
+
+_FEEDBACK_STATUS_RE = re.compile(
+    r"\n\n> (✅ 你标记为 \*\*好价\*\*|❌ 你标记为 \*\*不值\*\*)[^\n]*$"
+)
+
+
+def _feedback_status_text(selected: str, reason: str = "") -> str:
+    """生成反馈状态行文本。"""
+    if selected == "deal_good":
+        return "✅ 你标记为 **好价**（再次点击可取消）"
+    if selected == "deal_not_worth":
+        reason_text = _clean_feedback_reason(reason)
+        if reason_text:
+            return f"❌ 你标记为 **不值**：{reason_text}（再次点击可取消）"
+        return "❌ 你标记为 **不值**（再次点击可取消）"
+    return ""
+
+
+def _clean_feedback_reason(reason: str) -> str:
+    text = re.sub(r"\s+", " ", str(reason or "")).strip()
+    if len(text) > 60:
+        return text[:57].rstrip() + "..."
+    return text
+
+
+def _strip_feedback_status_line(content: str) -> str:
+    """移除已有的反馈状态行，仅匹配我们注入的 blockquote。"""
+    return _FEEDBACK_STATUS_RE.sub("", content)
+
+
+def _update_preceding_markdown(elements: list[Card], action_idx: int, feedback_status: str) -> None:
+    """更新 action 元素前方的 markdown 元素，注入或清除反馈状态行。"""
+    for i in range(action_idx - 1, -1, -1):
+        el = elements[i]
+        if el.get("tag") != "markdown":
+            continue
+        content = str(el.get("content", ""))
+        content = _strip_feedback_status_line(content)
+        if feedback_status:
+            content = content.rstrip("\n") + f"\n\n> {feedback_status}"
+        el["content"] = content
+        return
 
 
 def _memory_row_value(actions: list[Card], article_id: str) -> Card | None:
@@ -353,7 +409,7 @@ def _memory_row_value(actions: list[Card], article_id: str) -> Card | None:
             continue
         if str(value.get("article_id") or "") != article_id:
             continue
-        if value.get("action") in {"deal_good", "deal_not_worth"}:
+        if value.get("action") in {"deal_good", "deal_not_worth", "deal_not_worth_reason"}:
             base = dict(value)
             base.pop("action", None)
             return base

@@ -295,6 +295,12 @@ class MainConfigParsingTests(unittest.TestCase):
         self.assertEqual(main.config._clamp_rate(0.6), 0.6)
         self.assertEqual(main.config._clamp_rate(1.5), 1.0)
 
+    def test_deal_memory_calibration_config_uses_dynamic_records(self) -> None:
+        self.assertFalse(hasattr(main.config, "CALIBRATION_FILE"))
+        self.assertEqual(main.config.CALIBRATION_MIN_CATEGORY_RECORDS, 2)
+        with patch.dict(os.environ, {"CALIBRATION_MIN_CATEGORY_RECORDS": "3"}, clear=False):
+            self.assertEqual(main.config._get_int("CALIBRATION_MIN_CATEGORY_RECORDS", 2), 3)
+
 
 class MainConfigSummaryTests(unittest.TestCase):
     def _summary_with_prefilter(self, **values) -> str:
@@ -648,6 +654,15 @@ class MainSearchPriceBypassTests(unittest.TestCase):
                         return_value=FilterItemsResult(
                             matched=[(llm_item, "LLM 推荐")],
                             categories_by_article_id={"llm": "电脑数码"},
+                            contexts_by_article_id={
+                                "llm": {
+                                    "need_state": "normal",
+                                    "inventory_basis": "未命中库存项",
+                                    "preference_basis": ["电脑数码关注"],
+                                    "threshold_adjustment": "strict_normal",
+                                    "context_summary": "普通状态下按严格质量信号推荐",
+                                }
+                            },
                         ),
                     )
                 )
@@ -661,6 +676,10 @@ class MainSearchPriceBypassTests(unittest.TestCase):
             self.assertEqual(main._deal_memory.pending_count, 1)
             self.assertIsNone(main._deal_memory.get_pending("bypass"))
             self.assertEqual(main._deal_memory.get_pending("llm")["category_hint"], "电脑数码")
+            self.assertEqual(
+                main._deal_memory.get_pending("llm")["context"]["decision_context"]["threshold_adjustment"],
+                "strict_normal",
+            )
 
     def test_only_price_bypass_does_not_write_memory_pending(self) -> None:
         bypass = self._search_item("bypass", 10.0, 10.0)
@@ -721,6 +740,24 @@ class MainSearchPriceBypassTests(unittest.TestCase):
 
         self.assertEqual(filter_items.call_args.kwargs["items"], [llm_item])
         send_deals.assert_not_called()
+
+    def test_runtime_passes_calibration_builder_to_filter_without_calling_it_early(self) -> None:
+        old_calibration_generator = main._calibration_generator
+        llm_item = _item()
+        generator = MagicMock()
+        main._calibration_generator = generator
+        try:
+            with (
+                patch("smzdm_notice.runtime._refresh_runtime_config", return_value=("pref", "inv")),
+                patch("smzdm_notice.runtime.filter_items", return_value=FilterItemsResult()) as filter_items,
+            ):
+                result = main._evaluate_poll_matches([], [llm_item], MagicMock(), MagicMock())
+        finally:
+            main._calibration_generator = old_calibration_generator
+
+        self.assertIsInstance(result, main.MatchEvaluation)
+        generator.build_section.assert_not_called()
+        self.assertIs(filter_items.call_args.kwargs["calibration_section_builder"], generator.build_section)
 
 
 class MainPollFailureTests(unittest.TestCase):

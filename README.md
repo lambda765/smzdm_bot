@@ -109,10 +109,19 @@ smzdm-notice setup
 | 轮询 | `FETCH_INTERVAL_SECONDS` | 榜单抓取间隔（默认 `5`） |
 | 排行 | `TOP_N` | 每个榜单条数（默认 `20`） |
 | 搜索 | `SEARCH_KEYWORDS_FILE` | 关键词文件路径（默认 `search_keywords.json`） |
+| Deal Memory | `DEAL_MEMORY_ENABLED` | 启用好价/不值反馈记忆（默认 `false`） |
+| Deal Memory | `DEAL_MEMORY_FILE` | 反馈记忆文件路径（默认 `workspace/state/deal_memory.json`） |
+| Deal Memory | `DEAL_MEMORY_EXPIRE_DAYS` | 已反馈记录保留天数（默认 `90`） |
+| Deal Memory | `DEAL_MEMORY_PENDING_EXPIRE_DAYS` | 待反馈推荐记录保留天数（默认 `30`） |
+| Deal Memory | `CALIBRATION_MAX_EXAMPLES` | 每类注入 prompt 的历史案例上限（默认 `5`） |
+| Deal Memory | `CALIBRATION_MIN_CATEGORY_RECORDS` | 每类至少多少条历史反馈才注入校准案例（默认 `2`） |
+| Deal Memory | `MEMORY_PATTERN_MIN_SAMPLES` | 触发偏好模式分析的最少反馈样本数（默认 `3`） |
 | 去重 | `DEDUP_EXPIRE_HOURS` | 去重过期时间（默认 `24`） |
 | 汇总 | `DIGEST_HOUR` | 夜间汇总时间（默认 `22`） |
 
 **偏好与库存：** 编辑 `preference.md` 写购物偏好，编辑 `inventory.md` 写库存状态，两者会完整提供给 LLM。
+
+**Deal Memory：** 设置 `DEAL_MEMORY_ENABLED=true` 后，推荐卡片会显示「好价/不值」反馈按钮。推送成功的 LLM 推荐会先进入待反馈记录，用户点击反馈后进入长期记忆；夜间汇总前会尝试更新历史决策校准和偏好学习建议。Deal Memory 是辅助功能，连续分析失败达到上限后会放弃当天分析并继续发送 near-miss 夜间汇总。
 
 **LLM 多模型路由：** 新安装会生成 `llm_models.json` 并默认启用多模型路由。JSON 中只保存 `api_key_env`，真实密钥继续放 `.env`，例如 `LLM_DEEPSEEK_API_KEY=...`。运行时必须有 `llm_models.json`；旧安装可先运行 `smzdm-notice migrate-llm-config` 从旧 LLM 环境变量生成该文件。
 

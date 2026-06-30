@@ -85,10 +85,12 @@ class DealMemoryStore:
         self,
         items: list[tuple[RankingItem, str]],
         categories_by_article_id: dict[str, str] | None = None,
+        contexts_by_article_id: dict[str, dict] | None = None,
         arbiter_info: object | None = None,
     ) -> None:
         """推送成功后调用，缓存推荐商品和轻量推荐上下文到 pending。"""
         categories_by_article_id = categories_by_article_id or {}
+        contexts_by_article_id = contexts_by_article_id or {}
         now = time.time()
         with self._lock:
             for item, reason in items:
@@ -96,16 +98,19 @@ class DealMemoryStore:
                     item=item,
                     filter_reason=reason,
                     category_hint=categories_by_article_id.get(item.article_id, UNCATEGORIZED_CATEGORY),
+                    decision_context=contexts_by_article_id.get(item.article_id, {}),
                     arbiter_involved=arbiter_info is not None,
                     timestamp=now,
                 )
             self._save()
             logger.info(f"Deal Memory: 写入 {len(items)} 条 pending")
 
-    def record_feedback(self, article_id: str, action: str) -> str:
+    def record_feedback(self, article_id: str, action: str, reason: str | None = None) -> str:
         """用户点好价/不值时调用，支持首次记录、覆盖和取消。
 
-        Returns: recorded / updated / cancelled / not_found / invalid_action.
+        reason=None 表示普通反馈点击；reason 为字符串时表示补充或更新不值理由。
+
+        Returns: recorded / updated / cancelled / reason_updated / not_found / invalid_action.
         """
         if action not in {"deal_good", "deal_not_worth"}:
             logger.warning(f"未知的 feedback action: {action}")
@@ -114,10 +119,7 @@ class DealMemoryStore:
         with self._lock:
             entry = self._pending.pop(article_id, None)
             if entry is not None:
-                entry["feedback"] = {
-                    "action": action,
-                    "acted_at": _format_timestamp(time.time()),
-                }
+                entry["feedback"] = _build_feedback_payload(action, reason)
                 self._records[article_id] = entry
                 self._save()
                 logger.info(f"Deal Memory: {article_id} feedback={action}, pending → records")
@@ -130,6 +132,17 @@ class DealMemoryStore:
 
             prev = existing.get("feedback") or {}
             prev_action = prev.get("action")
+            if prev_action == action and action == "deal_not_worth" and reason is not None:
+                existing["feedback"] = _build_feedback_payload(
+                    action,
+                    reason,
+                    acted_at=str(prev.get("acted_at") or ""),
+                    previous_action=prev.get("previous_action"),
+                )
+                self._save()
+                logger.info(f"Deal Memory: {article_id} feedback={action} reason updated")
+                return "reason_updated"
+
             if prev_action == action:
                 existing["feedback"] = None
                 self._pending[article_id] = existing
@@ -138,11 +151,7 @@ class DealMemoryStore:
                 logger.info(f"Deal Memory: {article_id} feedback={action} 已取消，records → pending")
                 return "cancelled"
 
-            existing["feedback"] = {
-                "action": action,
-                "acted_at": _format_timestamp(time.time()),
-                "previous_action": prev_action,
-            }
+            existing["feedback"] = _build_feedback_payload(action, reason, previous_action=prev_action)
             self._save()
             logger.info(f"Deal Memory: {article_id} feedback={prev_action} → {action}")
             return "updated"
@@ -262,6 +271,7 @@ def _serialize_pending_entry(
     item: RankingItem,
     filter_reason: str,
     category_hint: str,
+    decision_context: dict,
     arbiter_involved: bool,
     timestamp: float,
 ) -> dict:
@@ -291,10 +301,29 @@ def _serialize_pending_entry(
         "context": {
             "filter_reason": filter_reason,
             "snapshot_time": _format_timestamp(timestamp),
+            "decision_context": dict(decision_context or {}),
         },
         "feedback": None,
         "timestamp": timestamp,
     }
+
+
+def _build_feedback_payload(
+    action: str,
+    reason: str | None,
+    acted_at: str = "",
+    previous_action: object = None,
+) -> dict:
+    payload = {
+        "action": action,
+        "acted_at": acted_at or _format_timestamp(time.time()),
+    }
+    if previous_action:
+        payload["previous_action"] = previous_action
+    clean_reason = str(reason or "").strip()
+    if action == "deal_not_worth" and clean_reason:
+        payload["reason"] = clean_reason
+    return payload
 
 
 def _format_timestamp(ts: float) -> str:

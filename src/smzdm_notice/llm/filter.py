@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -46,6 +47,8 @@ def filter_items(
     inventory_data: str,
     model: str | None = None,
     routing_snapshot: RoutingSnapshot | None = None,
+    calibration_section: str = "",
+    calibration_section_builder: Callable[[list[RankingItem]], str] | None = None,
 ) -> FilterItemsResult:
     """使用 LLM 筛选商品。"""
     if not items:
@@ -59,7 +62,13 @@ def filter_items(
         logger.info("所有新商品均未通过 env 预筛选，无需 LLM 筛选")
         return FilterItemsResult()
 
-    prompt_context = _build_prompt_context(items, user_prompt, inventory_data)
+    if not calibration_section and calibration_section_builder is not None:
+        try:
+            calibration_section = calibration_section_builder(items)
+        except Exception as e:
+            logger.warning(f"Deal Memory: 动态校准文本生成失败: {e}")
+
+    prompt_context = _build_prompt_context(items, user_prompt, inventory_data, calibration_section)
     llm_config = resolve("filter", routing_snapshot)
     if model:
         llm_config = replace(llm_config, model_id=model)
@@ -77,6 +86,7 @@ def _build_prompt_context(
     items: list[RankingItem],
     user_prompt: str,
     inventory_data: str,
+    calibration_section: str = "",
 ) -> FilterPromptContext:
     from smzdm_notice.core import config
 
@@ -101,8 +111,7 @@ def _build_prompt_context(
     prefilter_guidance = _build_prefilter_guidance(config)
     prefilter_guidance_section = f"## 运行时补充说明\n{prefilter_guidance}\n\n" if prefilter_guidance else ""
 
-    from smzdm_notice.llm.memory_prompts import build_calibration_section
-    calibration_section = build_calibration_section(items)
+    calibration_section = str(calibration_section or "")
 
     user_message = (
         f"## 当前系统时间\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -130,12 +139,16 @@ def _filter_with_single_call(
                 error_summary=call_outcome.error_summary,
             )
         )
-    matched, near_misses, categories_by_article_id = _match_result(call_outcome.result.result, prompt_context.item_map)
+    matched, near_misses, categories_by_article_id, contexts_by_article_id = _match_result(
+        call_outcome.result.result,
+        prompt_context.item_map,
+    )
     logger.info(f"LLM 筛选完成: {len(matched)}/{len(prompt_context.item_map)} 条推荐, {len(near_misses)} 条 near-miss")
     return FilterItemsResult(
         matched=matched,
         near_misses=near_misses,
         categories_by_article_id=categories_by_article_id,
+        contexts_by_article_id=contexts_by_article_id,
     )
 
 
@@ -165,13 +178,17 @@ def _filter_with_dual_calls(
         routing_snapshot=routing_snapshot,
     )
 
-    matched, near_misses, categories_by_article_id = _match_result(final_result, prompt_context.item_map)
+    matched, near_misses, categories_by_article_id, contexts_by_article_id = _match_result(
+        final_result,
+        prompt_context.item_map,
+    )
     logger.info(f"双重判断完成: {len(matched)}/{len(prompt_context.item_map)} 条推荐, {len(near_misses)} 条 near-miss")
     llm_failed = call_a is None and call_b is None
     return FilterItemsResult(
         matched=matched,
         near_misses=near_misses,
         categories_by_article_id=categories_by_article_id,
+        contexts_by_article_id=contexts_by_article_id,
         arbiter_info=arbiter_info,
         diagnostics=FilterDiagnostics(
             llm_failed=llm_failed,
@@ -282,15 +299,17 @@ def _join_error_summaries(*summaries: str) -> str | None:
 def _match_result(
     result: FilterResult,
     item_map: dict[str, RankingItem],
-) -> tuple[list[tuple[RankingItem, str]], list[tuple[RankingItem, str]], dict[str, str]]:
+) -> tuple[list[tuple[RankingItem, str]], list[tuple[RankingItem, str]], dict[str, str], dict[str, dict]]:
     """将 FilterResult 中的 ID 匹配回原始商品。"""
     matched: list[tuple[RankingItem, str]] = []
     categories_by_article_id: dict[str, str] = {}
+    contexts_by_article_id: dict[str, dict] = {}
     for rec in result.recommendations:
         if rec.id in item_map:
             item = item_map[rec.id]
             matched.append((item, rec.reason))
             categories_by_article_id[rec.id] = sanitize_category(rec.category, item)
+            contexts_by_article_id[rec.id] = sanitize_decision_context(rec.decision_context)
         else:
             logger.warning(f"LLM 返回了无效推荐 ID: {rec.id}")
 
@@ -301,7 +320,61 @@ def _match_result(
         else:
             logger.warning(f"LLM 返回了无效 near_miss ID: {nm.id}")
 
-    return matched, near_misses, categories_by_article_id
+    return matched, near_misses, categories_by_article_id, contexts_by_article_id
+
+
+_NEED_STATES = {"urgent", "normal", "unknown"}
+_THRESHOLD_ADJUSTMENTS = {"relaxed_due_to_need", "strict_normal", "none", "unknown"}
+_TEXT_FIELD_MAX_LENGTH = 60
+_SUMMARY_MAX_LENGTH = 80
+_PREFERENCE_BASIS_MAX_ITEMS = 3
+
+
+def sanitize_decision_context(raw: object) -> dict:
+    """Normalize the LLM's per-item decision context into a small stable schema."""
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump()
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "need_state": _sanitize_enum(raw.get("need_state"), _NEED_STATES),
+        "inventory_basis": _sanitize_context_text(raw.get("inventory_basis"), _TEXT_FIELD_MAX_LENGTH),
+        "preference_basis": _sanitize_preference_basis(raw.get("preference_basis")),
+        "threshold_adjustment": _sanitize_enum(raw.get("threshold_adjustment"), _THRESHOLD_ADJUSTMENTS),
+        "context_summary": _sanitize_context_text(raw.get("context_summary"), _SUMMARY_MAX_LENGTH),
+    }
+
+
+def _sanitize_enum(value: object, allowed: set[str]) -> str:
+    text = str(value or "").strip()
+    return text if text in allowed else "unknown"
+
+
+def _sanitize_preference_basis(value: object) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = []
+    cleaned: list[str] = []
+    for item in values:
+        text = _sanitize_context_text(item, _TEXT_FIELD_MAX_LENGTH)
+        if text:
+            cleaned.append(text)
+        if len(cleaned) >= _PREFERENCE_BASIS_MAX_ITEMS:
+            break
+    return cleaned
+
+
+def _sanitize_context_text(value: object, max_length: int) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    if len(text) <= max_length:
+        return text
+    return text[:max_length]
 
 
 def _parse_response(content: str) -> FilterResult:

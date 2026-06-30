@@ -14,10 +14,10 @@ from smzdm_notice.llm import clients as llm_clients
 from smzdm_notice.llm.arbitration import ArbitrationRequest, arbitrate
 from smzdm_notice.llm.categories import UNCATEGORIZED_CATEGORY, sanitize_category
 from smzdm_notice.llm.clients import _clear_client_cache, get_client_for_config
-from smzdm_notice.llm.filter import _build_prompt_context, _single_llm_call, filter_items
+from smzdm_notice.llm.filter import _build_prompt_context, _parse_response, _single_llm_call, filter_items
 from smzdm_notice.llm.models import FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
-from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
 from smzdm_notice.llm.prompts import ARBITER_SYSTEM_PROMPT, SYSTEM_PROMPT
+from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
 from smzdm_notice.smzdm.ranking import RankingItem
 
 
@@ -349,6 +349,10 @@ class LlmPromptTests(unittest.TestCase):
         self.assertIn('"不符合偏好"', SYSTEM_PROMPT)
         self.assertIn("near-miss reason 必须保留真实近因", SYSTEM_PROMPT)
         self.assertIn("category 字段", SYSTEM_PROMPT)
+        self.assertIn("decision_context", SYSTEM_PROMPT)
+        self.assertIn('"urgent"', SYSTEM_PROMPT)
+        self.assertIn('"relaxed_due_to_need"', SYSTEM_PROMPT)
+        self.assertIn("80 字以内", SYSTEM_PROMPT)
         self.assertIn("电脑数码、食品生鲜", SYSTEM_PROMPT)
         self.assertIn("厨房小家电", SYSTEM_PROMPT)
         self.assertIn("值票 8、评论 12，综合热度偏弱", SYSTEM_PROMPT)
@@ -393,6 +397,149 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(result.categories_by_article_id, {"1001": "厨房小家电"})
 
+    def test_recommendation_decision_context_is_sanitized_and_returned(self) -> None:
+        result = _filter_items_with_mocked_call(
+            LLMCallOutcome(
+                result=LLMCallResult(
+                    result=FilterResult(
+                        recommendations=[
+                            Recommendation(
+                                id="1001",
+                                reason="A",
+                                category="厨房小家电",
+                                decision_context={
+                                    "need_state": "urgent",
+                                    "inventory_basis": "咖啡豆库存不足",
+                                    "preference_basis": ["关注咖啡器具", "历史低价优先"],
+                                    "threshold_adjustment": "relaxed_due_to_need",
+                                    "context_summary": "急缺补货，放宽质量信号",
+                                },
+                            )
+                        ]
+                    )
+                )
+            ),
+            dual_filter=False,
+        )
+
+        self.assertEqual(
+            result.contexts_by_article_id,
+            {
+                "1001": {
+                    "need_state": "urgent",
+                    "inventory_basis": "咖啡豆库存不足",
+                    "preference_basis": ["关注咖啡器具", "历史低价优先"],
+                    "threshold_adjustment": "relaxed_due_to_need",
+                    "context_summary": "急缺补货，放宽质量信号",
+                }
+            },
+        )
+
+    def test_invalid_decision_context_falls_back_and_truncates(self) -> None:
+        result = _filter_items_with_mocked_call(
+            LLMCallOutcome(
+                result=LLMCallResult(
+                    result=FilterResult(
+                        recommendations=[
+                            Recommendation(
+                                id="1001",
+                                reason="A",
+                                category="厨房小家电",
+                                decision_context={
+                                    "need_state": "emergency",
+                                    "inventory_basis": "咖啡豆库存不足" * 20,
+                                    "preference_basis": ["偏好1", "偏好2", "偏好3", "偏好4"],
+                                    "threshold_adjustment": "loose",
+                                    "context_summary": "急缺补货，结合库存状态放宽质量信号" * 10,
+                                },
+                            )
+                        ]
+                    )
+                )
+            ),
+            dual_filter=False,
+        )
+
+        context = result.contexts_by_article_id["1001"]
+        self.assertEqual(context["need_state"], "unknown")
+        self.assertEqual(context["threshold_adjustment"], "unknown")
+        self.assertLessEqual(len(context["inventory_basis"]), 60)
+        self.assertLessEqual(len(context["context_summary"]), 80)
+        self.assertEqual(context["preference_basis"], ["偏好1", "偏好2", "偏好3"])
+
+    def test_missing_decision_context_keeps_recommendation_flow(self) -> None:
+        result = _filter_items_with_mocked_call(
+            LLMCallOutcome(
+                result=LLMCallResult(
+                    result=FilterResult(
+                        recommendations=[Recommendation(id="1001", reason="A", category="厨房小家电")]
+                    )
+                )
+            ),
+            dual_filter=False,
+        )
+
+        self.assertEqual(len(result.matched), 1)
+        self.assertEqual(result.contexts_by_article_id["1001"]["need_state"], "unknown")
+
+    def test_malformed_decision_context_does_not_drop_recommendation(self) -> None:
+        captured = {}
+        payload = json.dumps(
+            {
+                "recommendations": [
+                    {
+                        "id": "1001",
+                        "reason": "A",
+                        "category": "家用电器",
+                        "decision_context": "not an object",
+                    }
+                ],
+                "near_misses": [],
+            },
+            ensure_ascii=False,
+        )
+
+        with (
+            patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
+            patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=_successful_client(captured, payload)),
+        ):
+            result = filter_items([_item()], "用户偏好", "库存", routing_snapshot=_routing_snapshot())
+
+        self.assertEqual(len(result.matched), 1)
+        self.assertEqual(result.contexts_by_article_id["1001"]["need_state"], "unknown")
+
+    def test_string_preference_basis_does_not_drop_recommendation(self) -> None:
+        captured = {}
+        payload = json.dumps(
+            {
+                "recommendations": [
+                    {
+                        "id": "1001",
+                        "reason": "A",
+                        "category": "家用电器",
+                        "decision_context": {
+                            "need_state": "normal",
+                            "preference_basis": "命中咖啡偏好",
+                            "threshold_adjustment": "none",
+                        },
+                    }
+                ],
+                "near_misses": [],
+            },
+            ensure_ascii=False,
+        )
+
+        with (
+            patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
+            patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=_successful_client(captured, payload)),
+        ):
+            result = filter_items([_item()], "用户偏好", "库存", routing_snapshot=_routing_snapshot())
+
+        self.assertEqual(len(result.matched), 1)
+        self.assertEqual(result.contexts_by_article_id["1001"]["preference_basis"], ["命中咖啡偏好"])
+
     def test_invalid_recommendation_category_becomes_uncategorized(self) -> None:
         result = _filter_items_with_mocked_call(
             LLMCallOutcome(
@@ -406,6 +553,133 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         )
 
         self.assertEqual(result.categories_by_article_id, {"1001": UNCATEGORIZED_CATEGORY})
+
+    def test_malformed_category_does_not_drop_recommendation(self) -> None:
+        captured = {}
+        payload = json.dumps(
+            {
+                "recommendations": [
+                    {
+                        "id": "1001",
+                        "reason": "A",
+                        "category": 123,
+                    }
+                ],
+                "near_misses": [],
+            },
+            ensure_ascii=False,
+        )
+
+        with (
+            patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
+            patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=_successful_client(captured, payload)),
+        ):
+            result = filter_items([_item()], "用户偏好", "库存", routing_snapshot=_routing_snapshot())
+
+        self.assertEqual(len(result.matched), 1)
+        self.assertEqual(result.categories_by_article_id, {"1001": UNCATEGORIZED_CATEGORY})
+
+    def test_parse_response_keeps_recommendation_when_decision_context_is_malformed(self) -> None:
+        payload = json.dumps(
+            {
+                "recommendations": [
+                    {
+                        "id": "1001",
+                        "reason": "值得买",
+                        "decision_context": {
+                            "need_state": None,
+                            "inventory_basis": 123,
+                            "preference_basis": [123, None],
+                            "threshold_adjustment": False,
+                            "context_summary": ["bad"],
+                        },
+                    }
+                ],
+                "near_misses": [],
+            },
+            ensure_ascii=False,
+        )
+
+        result = _parse_response(payload)
+
+        self.assertEqual(len(result.recommendations), 1)
+        context = result.recommendations[0].decision_context
+        self.assertEqual(context.need_state, "")
+        self.assertEqual(context.inventory_basis, "")
+        self.assertEqual(context.preference_basis, [])
+        self.assertEqual(context.threshold_adjustment, "")
+        self.assertEqual(context.context_summary, "")
+
+    def test_filter_items_injects_runtime_calibration_section(self) -> None:
+        captured = {}
+
+        def fake_call(client, model, user_message):
+            captured["user_message"] = user_message
+            return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
+
+        with (
+            patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
+            patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
+        ):
+            filter_items(
+                items=[_item()],
+                user_prompt="用户偏好",
+                inventory_data="库存",
+                routing_snapshot=_routing_snapshot(),
+                calibration_section="## 历史决策校准参考\n\n### 家用电器\n",
+            )
+
+        self.assertIn("## 历史决策校准参考", captured["user_message"])
+        self.assertLess(
+            captured["user_message"].index("## 耗材库存记录"),
+            captured["user_message"].index("## 历史决策校准参考"),
+        )
+        self.assertLess(
+            captured["user_message"].index("## 历史决策校准参考"),
+            captured["user_message"].index("## 当前好价排行榜商品列表"),
+        )
+
+    def test_filter_items_builds_runtime_calibration_after_prefiltering(self) -> None:
+        captured = {}
+        builder_item_ids = []
+
+        def fake_call(client, model, user_message):
+            captured["user_message"] = user_message
+            return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
+
+        def build_calibration(items):
+            builder_item_ids.extend(item.article_id for item in items)
+            return "## 历史决策校准参考\n\n### 预筛后品类\n"
+
+        with (
+            patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
+            patch("smzdm_notice.core.config.PREFILTER_ENABLED", True),
+            patch("smzdm_notice.core.config.PREFILTER_BYPASS_ENABLED", False),
+            patch("smzdm_notice.core.config.PREFILTER_MIN_WORTHY", 50),
+            patch("smzdm_notice.core.config.PREFILTER_MIN_WORTHY_RATE", 0.0),
+            patch("smzdm_notice.core.config.PREFILTER_MIN_COMMENTS", 0),
+            patch("smzdm_notice.core.config.PREFILTER_MIN_FAVORITES", 0),
+            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
+        ):
+            filter_items(
+                items=[
+                    _item(article_id="drop", worthy=1),
+                    _item(article_id="keep", worthy=100),
+                ],
+                user_prompt="用户偏好",
+                inventory_data="库存",
+                routing_snapshot=_routing_snapshot(),
+                calibration_section_builder=build_calibration,
+            )
+
+        self.assertEqual(builder_item_ids, ["keep"])
+        self.assertIn("## 历史决策校准参考", captured["user_message"])
+        self.assertNotIn('"id": "drop"', captured["user_message"])
+        self.assertIn('"id": "keep"', captured["user_message"])
 
     def test_low_quality_items_still_enter_llm_request(self) -> None:
         captured = {}

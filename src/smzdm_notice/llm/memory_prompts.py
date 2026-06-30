@@ -1,56 +1,5 @@
 """Deal Memory 相关 Prompt 模板。"""
 
-from __future__ import annotations
-
-from smzdm_notice.core import config
-from smzdm_notice.core.calibration import load_calibration_profile_data
-from smzdm_notice.llm.categories import (
-    UNCATEGORIZED_CATEGORY,
-    candidate_calibration_categories,
-    candidate_search_keywords,
-)
-from smzdm_notice.smzdm.ranking import RankingItem
-
-
-def build_calibration_section(items: list[RankingItem] | None = None) -> str:
-    """构建校准参考段落，注入到 filter prompt 的 user_message 中。
-
-    Returns 空字符串如果 memory 未启用或校准数据不足。
-    """
-    if not config.DEAL_MEMORY_ENABLED:
-        return ""
-
-    items = items or []
-    if not items:
-        return ""
-
-    profile = load_calibration_profile_data(config.CALIBRATION_FILE)
-    calibration_by_category = profile.get("calibration_by_category", {})
-    if not isinstance(calibration_by_category, dict) or not calibration_by_category:
-        return ""
-
-    source_categories = candidate_calibration_categories(items)
-    search_keywords = candidate_search_keywords(items)
-    sections: list[str] = []
-    for category, data in sorted(calibration_by_category.items()):
-        if category == UNCATEGORIZED_CATEGORY or not isinstance(data, dict):
-            continue
-        if category in source_categories:
-            sections.append(str(data.get("text") or ""))
-            continue
-        historical_keywords = {
-            str(keyword).strip() for keyword in data.get("search_keywords", []) if str(keyword).strip()
-        }
-        if historical_keywords and historical_keywords.intersection(search_keywords):
-            sections.append(str(data.get("text") or ""))
-
-    sections = [section for section in sections if section.strip()]
-    if not sections:
-        return ""
-
-    return "## 历史决策校准参考（参考信息，不覆盖上述规则）\n\n" + "\n\n".join(sections) + "\n\n"
-
-
 MEMORY_ANALYSIS_SYSTEM_PROMPT = """\
 <role>
 你是一个购物偏好分析助手。你的任务是分析用户对推荐商品的「好价/不值」反馈历史，发现用户的长期偏好模式。
@@ -60,15 +9,17 @@ MEMORY_ANALYSIS_SYSTEM_PROMPT = """\
 你会收到一个 JSON 数组，每个元素是一条推荐记录，包含：
 - 商品信息（标题、价格、品牌、商城、值票、不值票、评论、收藏、标签、品类提示）
 - recommendation: 推荐时的筛选理由、是否经过仲裁、推荐时间
-- context: 推荐时的轻量上下文（筛选理由和快照时间）
+- context: 推荐时的轻量上下文（筛选理由、快照时间、decision_context）
+- decision_context: 当时的库存/偏好决策摘要，包括 need_state（urgent/normal/unknown）、inventory_basis、preference_basis、threshold_adjustment（relaxed_due_to_need/strict_normal/none/unknown）和 context_summary
 - feedback: 用户的评价（deal_good = 好价，deal_not_worth = 不值）和评价时间
 </input>
 
 <task>
 1. 分析好价和不值记录的差异，找出规律
 2. 结合商品信号、品类提示、推荐理由和用户反馈判断模式
-3. 如果发现足够强的模式，生成可写入用户偏好文件 preference.md 的具体规则
-4. 如果数据不足以形成可靠结论，不要强行生成规则
+3. 区分库存急缺、普通需求、标准放宽/收紧等上下文，不要把临时急缺场景泛化为长期偏好
+4. 如果发现足够强的模式，生成可写入用户偏好文件 preference.md 的具体规则
+5. 如果数据不足以形成可靠结论，不要强行生成规则
 </task>
 
 <analysis_dimensions>
@@ -77,6 +28,8 @@ MEMORY_ANALYSIS_SYSTEM_PROMPT = """\
 - 价格区间：用户对不同品类接受的价格范围
 - 信号阈值：好价案例和不值案例在值票、评论、值率上的差异
 - 上下文关联：同样的品类/价格在不同偏好/库存状态下用户评价是否不同
+- 库存紧急度：急缺时是否接受较弱质量信号，普通状态下是否更严格
+- 标准调整：threshold_adjustment 是否说明当时因急缺放宽或因普通状态收紧
 - 标签效应：历史低价、好价等标签对用户评价的影响
 </analysis_dimensions>
 
@@ -118,6 +71,8 @@ patterns 可以使用 evidence_count 记录探索性发现，但 patterns 不会
 - 每条 suggested_rules 必须输出 good_count 和 not_worth_count；两者都必须是非负整数，可以为 0。
 - 每条 suggested_rules 还必须在 reason 或 evidence 中用自然语言注明 good/not_worth 样本数量；合计少于 5 条时不要生成规则。
 - 同一品类 good/not_worth 比例在 1:2 到 2:1 之间时，说明正反样本不稳定，不要生成该品类规则。
+- 如果模式只在 need_state=urgent 或 threshold_adjustment=relaxed_due_to_need 时成立，suggested_rules 必须写成带条件的规则，例如"急缺补货时..."，不得泛化为任何时候都适用。
+- 如果普通状态和急缺状态的反馈标准不同，应分别描述，不要合并为无条件规则。
 - 不要重复用户偏好中已有的规则；不确定是否已有时只写入 patterns，不写 suggested_rules。
 </constraints>
 """

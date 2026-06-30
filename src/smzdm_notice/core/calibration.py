@@ -8,58 +8,45 @@ from __future__ import annotations
 
 import json
 import re
-import threading
 from dataclasses import dataclass, field, replace
-from datetime import datetime
-from pathlib import Path
 
 from loguru import logger
 
 from smzdm_notice.core.memory import DealMemoryStore
-from smzdm_notice.llm.categories import UNCATEGORIZED_CATEGORY
+from smzdm_notice.llm.categories import (
+    UNCATEGORIZED_CATEGORY,
+    candidate_calibration_categories,
+    candidate_search_keywords,
+)
 from smzdm_notice.llm.clients import get_client_for_config
 from smzdm_notice.llm.routing import build_chat_completion_kwargs, resolve
+from smzdm_notice.smzdm.ranking import RankingItem
 
-_MIN_RECORDS_FOR_CALIBRATION = 5
-
-
-@dataclass
-class CalibrationProfile:
-    """校准配置文件，包含渲染好的校准文本和分析元数据。"""
-
-    calibration_text: str = ""
-    calibration_by_category: dict[str, dict] = field(default_factory=dict)
-    record_count: int = 0
-    generated_at: str = ""
+_CALIBRATION_SECTION_HEADER = "## 历史决策校准参考（历史个例，仅供校准，不代表稳定规则）"
 
 
 class CalibrationGenerator:
-    """从 DealMemoryStore 生成校准文本。
+    """从 DealMemoryStore 动态生成校准文本。
 
-    纯计算，不调 LLM。渲染带上下文的具体案例文本，供注入 filter prompt。
+    纯计算，不调 LLM，不落盘。渲染当前候选商品相关的历史个例，供注入 filter prompt。
     """
 
-    def __init__(self, memory_store: DealMemoryStore, max_examples: int = 5) -> None:
+    def __init__(self, memory_store: DealMemoryStore, max_examples: int = 5, min_category_records: int = 2) -> None:
         self._store = memory_store
         self._max_examples = max_examples
+        self._min_category_records = max(1, min_category_records)
 
-    def generate(self) -> CalibrationProfile:
-        """生成校准文本。records 不足时返回空文本。"""
+    def build_section(self, items: list[RankingItem]) -> str:
+        """为当前候选商品生成相关历史校准个例。"""
+        if not items:
+            return ""
         records = self._store.get_records()
-        if len(records) < _MIN_RECORDS_FOR_CALIBRATION:
-            logger.debug(f"Deal Memory: records {len(records)} < {_MIN_RECORDS_FOR_CALIBRATION}，跳过校准生成")
-            return CalibrationProfile(record_count=len(records))
+        if not records:
+            return ""
+        calibration_by_category = self._build_related_calibration_by_category(items, records)
+        return self._join_category_texts(calibration_by_category)
 
-        calibration_by_category = self._build_calibration_by_category(records)
-        calibration_text = self._join_category_texts(calibration_by_category)
-        return CalibrationProfile(
-            calibration_text=calibration_text,
-            calibration_by_category=calibration_by_category,
-            record_count=len(records),
-            generated_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-        )
-
-    def _build_calibration_by_category(self, records: list[dict]) -> dict[str, dict]:
+    def _build_related_calibration_by_category(self, items: list[RankingItem], records: list[dict]) -> dict[str, dict]:
         grouped: dict[str, list[dict]] = {}
         for record in records:
             category = str(record.get("category_hint") or "").strip()
@@ -67,11 +54,18 @@ class CalibrationGenerator:
                 continue
             grouped.setdefault(category, []).append(record)
 
+        source_categories = candidate_calibration_categories(items)
+        search_keywords = candidate_search_keywords(items)
         calibration_by_category: dict[str, dict] = {}
         for category in sorted(grouped):
             category_records = grouped[category]
-            good_records = [r for r in category_records if r.get("feedback", {}).get("action") == "deal_good"]
-            not_worth_records = [r for r in category_records if r.get("feedback", {}).get("action") == "deal_not_worth"]
+            if len(category_records) < self._min_category_records:
+                continue
+            if not self._is_related_category(category, category_records, source_categories, search_keywords):
+                continue
+            selected_records = category_records[: self._max_examples]
+            good_records = [r for r in selected_records if r.get("feedback", {}).get("action") == "deal_good"]
+            not_worth_records = [r for r in selected_records if r.get("feedback", {}).get("action") == "deal_not_worth"]
             text = self._build_category_text(category, good_records, not_worth_records)
             if not text:
                 continue
@@ -92,6 +86,24 @@ class CalibrationGenerator:
                 ),
             }
         return calibration_by_category
+
+    @staticmethod
+    def _is_related_category(
+        category: str,
+        records: list[dict],
+        source_categories: set[str],
+        search_keywords: set[str],
+    ) -> bool:
+        if category in source_categories:
+            return True
+        if not search_keywords:
+            return False
+        historical_keywords = {
+            str(record.get("search_keyword") or "").strip()
+            for record in records
+            if str(record.get("search_keyword") or "").strip()
+        }
+        return bool(historical_keywords.intersection(search_keywords))
 
     def _build_category_text(self, category: str, good_records: list[dict], not_worth_records: list[dict]) -> str:
         """渲染单个品类的校准文本。"""
@@ -119,7 +131,7 @@ class CalibrationGenerator:
         sections = [data.get("text", "") for _, data in sorted(calibration_by_category.items()) if data.get("text")]
         if not sections:
             return ""
-        return "## 历史决策校准参考（参考信息，不覆盖上述规则）\n\n" + "\n\n".join(sections)
+        return _CALIBRATION_SECTION_HEADER + "\n\n" + "\n\n".join(sections) + "\n\n"
 
 
 def _render_record_case(index: int, record: dict) -> str:
@@ -141,10 +153,50 @@ def _render_record_case(index: int, record: dict) -> str:
     filter_reason = str(recommendation.get("filter_reason") or record.get("context", {}).get("filter_reason") or "").strip()
     if filter_reason:
         signal_line += f" | 推荐理由：{_truncate_context(filter_reason, 60)}"
+    decision_context = _render_decision_context(record)
+    if decision_context:
+        signal_line += f" | 上下文：{decision_context}"
     acted_at = str((record.get("feedback") or {}).get("acted_at") or "").strip()
     if acted_at:
         signal_line += f" | 反馈时间：{acted_at}"
     return signal_line
+
+
+def _render_decision_context(record: dict) -> str:
+    context = record.get("context") or {}
+    decision_context = context.get("decision_context") or {}
+    if not isinstance(decision_context, dict):
+        return ""
+
+    need_label = {
+        "urgent": "急缺补货",
+        "normal": "普通需求",
+        "unknown": "",
+    }.get(str(decision_context.get("need_state") or ""), "")
+    threshold_label = {
+        "relaxed_due_to_need": "标准放宽",
+        "strict_normal": "标准严格",
+        "none": "标准未调整",
+        "unknown": "",
+    }.get(str(decision_context.get("threshold_adjustment") or ""), "")
+
+    parts: list[str] = []
+    if need_label:
+        parts.append(need_label)
+    inventory_basis = str(decision_context.get("inventory_basis") or "").strip()
+    if inventory_basis:
+        parts.append(inventory_basis)
+    preference_basis = decision_context.get("preference_basis")
+    if isinstance(preference_basis, list):
+        basis_text = "、".join(str(item).strip() for item in preference_basis if str(item).strip())
+        if basis_text:
+            parts.append(f"偏好：{basis_text}")
+    if threshold_label:
+        parts.append(threshold_label)
+    context_summary = str(decision_context.get("context_summary") or "").strip()
+    if context_summary:
+        parts.append(context_summary)
+    return "，".join(parts)
 
 
 def _truncate_context(text: str, max_length: int) -> str:
@@ -210,7 +262,7 @@ class MemoryAnalyzer:
         records_text = json.dumps(records, ensure_ascii=False, indent=2)
         user_message = (
             f"以下是用户对推荐商品的好价/不值反馈历史记录，每条记录包含商品信号、"
-            f"推荐理由、品类提示和用户评价。\n\n"
+            f"推荐理由、品类提示、决策上下文和用户评价。\n\n"
             f"```json\n{records_text}\n```\n\n"
             f"请分析这些记录，发现用户的长期偏好模式。"
         )
@@ -324,59 +376,3 @@ def _extract_named_count(text: str, labels: tuple[str, ...]) -> int | None:
         if match:
             return int(match.group(1))
     return None
-
-
-_calibration_lock = threading.Lock()
-
-
-def save_calibration_profile(profile: CalibrationProfile, filepath: str) -> None:
-    """保存校准配置文件到磁盘。"""
-    path = Path(filepath)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "__meta__": {
-            "generated_at": profile.generated_at,
-            "record_count": profile.record_count,
-        },
-        "calibration_text": profile.calibration_text,
-        "calibration_by_category": profile.calibration_by_category,
-    }
-    with _calibration_lock, open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def load_calibration_text(filepath: str) -> str:
-    """从磁盘加载校准文本。文件不存在或记录不足时返回空字符串。"""
-    path = Path(filepath)
-    if not path.exists():
-        return ""
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        meta = data.get("__meta__", {})
-        if meta.get("record_count", 0) < _MIN_RECORDS_FOR_CALIBRATION:
-            return ""
-        return data.get("calibration_text", "")
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"校准配置加载失败: {e}")
-        return ""
-
-
-def load_calibration_profile_data(filepath: str) -> dict:
-    """加载新结构校准配置。文件不存在、记录不足或旧格式时返回空分组。"""
-    path = Path(filepath)
-    if not path.exists():
-        return {"calibration_by_category": {}}
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        meta = data.get("__meta__", {})
-        if meta.get("record_count", 0) < _MIN_RECORDS_FOR_CALIBRATION:
-            return {"calibration_by_category": {}}
-        calibration_by_category = data.get("calibration_by_category")
-        if not isinstance(calibration_by_category, dict):
-            return {"calibration_by_category": {}}
-        return {"calibration_by_category": calibration_by_category}
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"校准配置加载失败: {e}")
-        return {"calibration_by_category": {}}

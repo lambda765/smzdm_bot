@@ -201,6 +201,13 @@ class NotifierBindingTests(unittest.TestCase):
         self.assertIn("deal_follow", all_action_values)
         self.assertNotIn("search_remove_keyword", all_action_values)
         self.assertNotIn("search_clear_price", all_action_values)
+        self.assertFalse(
+            any(
+                action.get("name") == notifier.NOT_WORTH_REASON_FIELD
+                for row in action_rows
+                for action in row["actions"]
+            )
+        )
 
     def test_send_deals_hides_memory_buttons_when_disabled(self) -> None:
         sent_cards = []
@@ -242,7 +249,8 @@ class NotifierBindingTests(unittest.TestCase):
         ):
             item = _item()
             self.assertTrue(notifier.send_deals([(item, "LLM 推荐")]))
-            self.assertTrue(notifier.update_deal_feedback_card("om_deal_toggle", item.article_id, selected="deal_good"))
+            result = notifier.update_deal_feedback_card("om_deal_toggle", item.article_id, selected="deal_good")
+            self.assertIsNotNone(result)
 
         update_card.assert_called_once()
         action_rows = [element for element in updated_cards[0]["elements"] if element.get("tag") == "action"]
@@ -251,7 +259,41 @@ class NotifierBindingTests(unittest.TestCase):
             for action in action_rows[0]["actions"]
             if action.get("value", {}).get("action") in {"deal_good", "deal_not_worth"}
         ]
-        self.assertEqual(memory_labels, ["已选好价", "不值👎"])
+        self.assertEqual(memory_labels, ["✅ 好价"])
+
+    def test_update_deal_feedback_card_shows_optional_not_worth_reason_input(self) -> None:
+        sent_cards = []
+        updated_cards = []
+        with (
+            patch("smzdm_notice.feishu.notifier.get_feishu_image_key", return_value=""),
+            patch("smzdm_notice.feishu.notifier.config.DEAL_MEMORY_ENABLED", True),
+            patch(
+                "smzdm_notice.feishu.notifier._send_card_message_id",
+                side_effect=lambda card: sent_cards.append(card) or "om_deal_reason",
+            ),
+            patch(
+                "smzdm_notice.feishu.notifier.update_card_message",
+                side_effect=lambda _message_id, card: updated_cards.append(card) or True,
+            ),
+        ):
+            item = _item()
+            self.assertTrue(notifier.send_deals([(item, "LLM 推荐")]))
+            result = notifier.update_deal_feedback_card(
+                "om_deal_reason",
+                item.article_id,
+                selected="deal_not_worth",
+                reason="价格一般\n非刚需",
+            )
+            self.assertIsNotNone(result)
+
+        action_rows = [element for element in updated_cards[0]["elements"] if element.get("tag") == "action"]
+        memory_actions = action_rows[0]["actions"]
+        self.assertTrue(any(action.get("name") == notifier.NOT_WORTH_REASON_FIELD for action in memory_actions))
+        self.assertTrue(
+            any(action.get("value", {}).get("action") == "deal_not_worth_reason" for action in memory_actions)
+        )
+        markdown = "\n".join(element.get("content", "") for element in updated_cards[0]["elements"])
+        self.assertIn("价格一般 非刚需", markdown)
 
     def test_send_digest_without_overflow_sends_only_card(self) -> None:
         sent_cards = []

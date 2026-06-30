@@ -8,17 +8,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from smzdm_notice.core.calibration import (
-    _MIN_RECORDS_FOR_CALIBRATION,
     CalibrationGenerator,
-    CalibrationProfile,
     MemoryAnalyzer,
     compute_suggestion_hash,
-    load_calibration_profile_data,
-    load_calibration_text,
-    save_calibration_profile,
 )
 from smzdm_notice.core.memory import DealMemoryStore
-from smzdm_notice.llm.memory_prompts import MEMORY_ANALYSIS_SYSTEM_PROMPT, build_calibration_section
+from smzdm_notice.llm.categories import UNCATEGORIZED_CATEGORY
+from smzdm_notice.llm.memory_prompts import MEMORY_ANALYSIS_SYSTEM_PROMPT
 from smzdm_notice.llm.routing import ResolvedLLMConfig
 from smzdm_notice.smzdm.ranking import RankingItem
 
@@ -26,7 +22,8 @@ from smzdm_notice.smzdm.ranking import RankingItem
 def _make_record(article_id: str, action: str, category: str = "厨房小家电",
                  title: str = "测试商品", price: str = "99.9",
                  worthy: int = 100, unworthy: int = 5, comments: int = 200,
-                 tags: list | None = None, search_keyword: str = "") -> dict:
+                 tags: list | None = None, search_keyword: str = "",
+                 decision_context: dict | None = None) -> dict:
     return {
         "article_id": article_id, "title": title, "price": price,
         "mall": "京东", "brand": "测试品牌",
@@ -38,6 +35,7 @@ def _make_record(article_id: str, action: str, category: str = "厨房小家电"
         "context": {
             "filter_reason": "好价",
             "snapshot_time": "2026-06-01T10:00:00",
+            "decision_context": decision_context or {},
         },
         "feedback": {"action": action, "acted_at": "2026-06-01T10:30:00"},
     }
@@ -80,184 +78,168 @@ def _draft_llm_config(api_key: str = "draft-key") -> ResolvedLLMConfig:
 
 
 class CalibrationGeneratorTests(unittest.TestCase):
-    def test_returns_empty_when_insufficient_records(self) -> None:
+    def test_returns_empty_when_no_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             filepath = str(Path(tmp) / "memory.json")
             store = DealMemoryStore(filepath)
             gen = CalibrationGenerator(store, max_examples=5)
 
-            # 直接写入少量 records
-            for i in range(_MIN_RECORDS_FOR_CALIBRATION - 1):
-                store._records[str(i)] = _make_record(str(i), "deal_good")
+            text = gen.build_section([_ranking_item("综合榜-家用电器")])
 
-            profile = gen.generate()
-            self.assertEqual(profile.calibration_text, "")
-            self.assertEqual(profile.record_count, _MIN_RECORDS_FOR_CALIBRATION - 1)
+            self.assertEqual(text, "")
 
-    def test_generates_text_with_enough_records(self) -> None:
+    def test_skips_category_below_min_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             filepath = str(Path(tmp) / "memory.json")
             store = DealMemoryStore(filepath)
-            gen = CalibrationGenerator(store, max_examples=5)
+            gen = CalibrationGenerator(store, max_examples=5, min_category_records=2)
+            store._records["1"] = _make_record("1", "deal_good", category="家用电器")
 
-            for i in range(_MIN_RECORDS_FOR_CALIBRATION):
-                action = "deal_good" if i < 3 else "deal_not_worth"
-                store._records[str(i)] = _make_record(str(i), action)
+            text = gen.build_section([_ranking_item("综合榜-家用电器")])
 
-            profile = gen.generate()
-            self.assertTrue(len(profile.calibration_text) > 0)
-            self.assertIn("历史决策校准参考", profile.calibration_text)
-            self.assertIn("厨房小家电", profile.calibration_text)
-            self.assertIn("好价案例", profile.calibration_text)
-            self.assertIn("不值案例", profile.calibration_text)
-            self.assertIn("厨房小家电", profile.calibration_by_category)
+            self.assertEqual(text, "")
+
+    def test_injects_related_category_when_category_meets_min_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = str(Path(tmp) / "memory.json")
+            store = DealMemoryStore(filepath)
+            gen = CalibrationGenerator(store, max_examples=5, min_category_records=2)
+            store._records["1"] = _make_record("1", "deal_good", category="家用电器")
+            store._records["2"] = _make_record("2", "deal_not_worth", category="家用电器")
+
+            text = gen.build_section([_ranking_item("综合榜-家用电器")])
+
+            self.assertIn("历史决策校准参考", text)
+            self.assertIn("历史个例", text)
+            self.assertIn("家用电器", text)
+            self.assertIn("好价案例", text)
+            self.assertIn("不值案例", text)
 
     def test_omits_snapshot_context_in_calibration_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             filepath = str(Path(tmp) / "memory.json")
             store = DealMemoryStore(filepath)
-            gen = CalibrationGenerator(store, max_examples=5)
+            gen = CalibrationGenerator(store, max_examples=5, min_category_records=2)
 
-            for i in range(_MIN_RECORDS_FOR_CALIBRATION):
-                store._records[str(i)] = _make_record(str(i), "deal_good")
+            for i in range(2):
+                store._records[str(i)] = _make_record(str(i), "deal_good", category="家用电器")
 
-            profile = gen.generate()
-            self.assertIn("推荐理由", profile.calibration_text)
-            self.assertNotIn("当时偏好", profile.calibration_text)
-            self.assertNotIn("当时库存", profile.calibration_text)
+            text = gen.build_section([_ranking_item("综合榜-家用电器")])
+            self.assertIn("推荐理由", text)
+            self.assertNotIn("当时偏好", text)
+            self.assertNotIn("当时库存", text)
+
+    def test_includes_decision_context_in_calibration_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = str(Path(tmp) / "memory.json")
+            store = DealMemoryStore(filepath)
+            gen = CalibrationGenerator(store, max_examples=5, min_category_records=2)
+            decision_context = {
+                "need_state": "urgent",
+                "inventory_basis": "咖啡豆库存不足",
+                "preference_basis": ["关注咖啡器具"],
+                "threshold_adjustment": "relaxed_due_to_need",
+                "context_summary": "急缺补货，允许放宽质量信号",
+            }
+
+            for i in range(2):
+                store._records[str(i)] = _make_record(
+                    str(i),
+                    "deal_good",
+                    category="咖啡器具",
+                    search_keyword="咖啡豆",
+                    decision_context=decision_context,
+                )
+
+            text = gen.build_section([_ranking_item("搜索-咖啡豆", source_type="search", search_keyword="咖啡豆")])
+
+            self.assertIn("上下文", text)
+            self.assertIn("急缺补货", text)
+            self.assertIn("咖啡豆库存不足", text)
+            self.assertIn("标准放宽", text)
 
     def test_respects_max_examples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             filepath = str(Path(tmp) / "memory.json")
             store = DealMemoryStore(filepath)
-            gen = CalibrationGenerator(store, max_examples=2)
+            gen = CalibrationGenerator(store, max_examples=2, min_category_records=2)
 
             for i in range(10):
-                store._records[str(i)] = _make_record(str(i), "deal_good")
+                store._records[str(i)] = _make_record(str(i), "deal_good", category="家用电器")
 
-            profile = gen.generate()
+            text = gen.build_section([_ranking_item("综合榜-家用电器")])
             # 好价案例最多 2 条（max_examples=2）
-            good_count = profile.calibration_text.count(". [")
+            good_count = text.count(". [")
             self.assertLessEqual(good_count, 2)
 
     def test_only_good_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             filepath = str(Path(tmp) / "memory.json")
             store = DealMemoryStore(filepath)
-            gen = CalibrationGenerator(store)
+            gen = CalibrationGenerator(store, min_category_records=2)
 
-            for i in range(_MIN_RECORDS_FOR_CALIBRATION):
-                store._records[str(i)] = _make_record(str(i), "deal_good")
+            for i in range(2):
+                store._records[str(i)] = _make_record(str(i), "deal_good", category="家用电器")
 
-            profile = gen.generate()
-            self.assertIn("好价案例", profile.calibration_text)
-            self.assertNotIn("不值案例", profile.calibration_text)
+            text = gen.build_section([_ranking_item("综合榜-家用电器")])
+            self.assertIn("好价案例", text)
+            self.assertNotIn("不值案例", text)
 
-    def test_groups_by_category_and_records_search_keywords(self) -> None:
+    def test_search_keyword_selects_related_custom_category(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             filepath = str(Path(tmp) / "memory.json")
             store = DealMemoryStore(filepath)
-            gen = CalibrationGenerator(store)
+            gen = CalibrationGenerator(store, min_category_records=2)
 
-            for i in range(_MIN_RECORDS_FOR_CALIBRATION):
-                category = "咖啡器具" if i < 3 else "宠物用品"
-                keyword = "咖啡豆" if category == "咖啡器具" else ""
+            for i in range(4):
+                category = "咖啡器具" if i < 2 else "宠物用品"
+                keyword = "咖啡豆" if category == "咖啡器具" else "猫粮"
                 store._records[str(i)] = _make_record(str(i), "deal_good", category=category, search_keyword=keyword)
 
-            profile = gen.generate()
-            self.assertIn("咖啡器具", profile.calibration_by_category)
-            self.assertIn("宠物用品", profile.calibration_by_category)
-            self.assertEqual(profile.calibration_by_category["咖啡器具"]["search_keywords"], ["咖啡豆"])
+            text = gen.build_section([_ranking_item("搜索-咖啡豆", source_type="search", search_keyword="咖啡豆")])
 
+            self.assertIn("咖啡器具", text)
+            self.assertNotIn("宠物用品", text)
 
-class CalibrationProfileIOTests(unittest.TestCase):
-    def test_save_and_load(self) -> None:
+    def test_global_records_do_not_override_per_category_minimum(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            filepath = str(Path(tmp) / "calibration.json")
+            filepath = str(Path(tmp) / "memory.json")
+            store = DealMemoryStore(filepath)
+            gen = CalibrationGenerator(store, min_category_records=2)
+            categories = ["家用电器", "食品生鲜", "电脑数码", "运动户外", "图书文娱"]
+            for i, category in enumerate(categories):
+                store._records[str(i)] = _make_record(str(i), "deal_good", category=category)
 
-            profile = CalibrationProfile(
-                calibration_text="## 校准参考\n测试文本",
-                calibration_by_category={
-                    "咖啡器具": {
-                        "text": "### 咖啡器具\n1. 测试",
-                        "good_count": 5,
-                        "not_worth_count": 0,
-                        "search_keywords": ["咖啡豆"],
-                    }
-                },
-                record_count=10,
-                generated_at="2026-06-07T10:00:00",
-            )
-            save_calibration_profile(profile, filepath)
+            text = gen.build_section([_ranking_item("综合榜-家用电器")])
 
-            text = load_calibration_text(filepath)
-            self.assertIn("校准参考", text)
-            self.assertIn("测试文本", text)
-            data = load_calibration_profile_data(filepath)
-            self.assertIn("咖啡器具", data["calibration_by_category"])
-
-    def test_load_returns_empty_when_insufficient_records(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            filepath = str(Path(tmp) / "calibration.json")
-
-            profile = CalibrationProfile(
-                calibration_text="some text",
-                record_count=3,  # 低于阈值
-                generated_at="2026-06-07T10:00:00",
-            )
-            save_calibration_profile(profile, filepath)
-
-            text = load_calibration_text(filepath)
             self.assertEqual(text, "")
-            data = load_calibration_profile_data(filepath)
-            self.assertEqual(data["calibration_by_category"], {})
 
-    def test_load_returns_empty_for_missing_file(self) -> None:
-        text = load_calibration_text("/nonexistent/path.json")
-        self.assertEqual(text, "")
-
-    def test_build_calibration_section_selects_related_category_groups(self) -> None:
+    def test_unrelated_and_uncategorized_records_are_not_injected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            filepath = str(Path(tmp) / "calibration.json")
-            profile = CalibrationProfile(
-                calibration_text="legacy",
-                calibration_by_category={
-                    "家用电器": {
-                        "text": "### 家用电器\n1. 电饭锅",
-                        "good_count": 5,
-                        "not_worth_count": 0,
-                        "record_count": 5,
-                        "search_keywords": [],
-                    },
-                    "咖啡器具": {
-                        "text": "### 咖啡器具\n1. 手冲壶",
-                        "good_count": 5,
-                        "not_worth_count": 0,
-                        "record_count": 5,
-                        "search_keywords": ["咖啡豆"],
-                    },
-                },
-                record_count=10,
-                generated_at="2026-06-07T10:00:00",
-            )
-            save_calibration_profile(profile, filepath)
+            filepath = str(Path(tmp) / "memory.json")
+            store = DealMemoryStore(filepath)
+            gen = CalibrationGenerator(store, min_category_records=2)
+            store._records["1"] = _make_record("1", "deal_good", category="食品生鲜")
+            store._records["2"] = _make_record("2", "deal_good", category="食品生鲜")
+            store._records["3"] = _make_record("3", "deal_good", category=UNCATEGORIZED_CATEGORY)
+            store._records["4"] = _make_record("4", "deal_good", category=UNCATEGORIZED_CATEGORY)
 
-            appliance = _ranking_item("综合榜-家用电器")
-            search = _ranking_item("搜索-咖啡豆", source_type="search", search_keyword="咖啡豆")
-            hot = _ranking_item("热卖榜")
+            text = gen.build_section([_ranking_item("综合榜-家用电器")])
 
-            with (
-                patch("smzdm_notice.llm.memory_prompts.config.DEAL_MEMORY_ENABLED", True),
-                patch("smzdm_notice.llm.memory_prompts.config.CALIBRATION_FILE", filepath),
-            ):
-                appliance_text = build_calibration_section([appliance])
-                search_text = build_calibration_section([search])
-                hot_text = build_calibration_section([hot])
+            self.assertEqual(text, "")
 
-            self.assertIn("家用电器", appliance_text)
-            self.assertNotIn("咖啡器具", appliance_text)
-            self.assertIn("咖啡器具", search_text)
-            self.assertEqual(hot_text, "")
+    def test_min_category_records_is_configurable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = str(Path(tmp) / "memory.json")
+            store = DealMemoryStore(filepath)
+            gen = CalibrationGenerator(store, min_category_records=3)
+            store._records["1"] = _make_record("1", "deal_good", category="家用电器")
+            store._records["2"] = _make_record("2", "deal_good", category="家用电器")
+
+            self.assertEqual(gen.build_section([_ranking_item("综合榜-家用电器")]), "")
+
+            store._records["3"] = _make_record("3", "deal_not_worth", category="家用电器")
+            self.assertIn("家用电器", gen.build_section([_ranking_item("综合榜-家用电器")]))
 
 
 class SuggestionHashTests(unittest.TestCase):
@@ -421,6 +403,9 @@ class MemoryAnalyzerTests(unittest.TestCase):
         self.assertIn('"not_worth_count": 0', MEMORY_ANALYSIS_SYSTEM_PROMPT)
         self.assertIn("suggested_rules 不使用 evidence_count", MEMORY_ANALYSIS_SYSTEM_PROMPT)
         self.assertIn("两者都必须是非负整数", MEMORY_ANALYSIS_SYSTEM_PROMPT)
+        self.assertIn("decision_context", MEMORY_ANALYSIS_SYSTEM_PROMPT)
+        self.assertIn("relaxed_due_to_need", MEMORY_ANALYSIS_SYSTEM_PROMPT)
+        self.assertIn("不得泛化为任何时候都适用", MEMORY_ANALYSIS_SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

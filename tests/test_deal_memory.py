@@ -97,6 +97,30 @@ class DealMemoryStoreTests(unittest.TestCase):
             records = store.get_records()
             self.assertEqual(records[0]["feedback"]["action"], "deal_not_worth")
 
+    def test_deal_not_worth_reason_can_be_added_and_cleared_without_cancelling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._new_store(tmp)
+            item = _MockRankingItem(article_id="1004")
+            store.record_to_pending([(item, "test")])
+
+            self.assertEqual(store.record_feedback("1004", "deal_not_worth"), "recorded")
+            self.assertEqual(store.record_feedback("1004", "deal_not_worth", "价格一般"), "reason_updated")
+            records = store.get_records()
+            self.assertEqual(records[0]["feedback"]["action"], "deal_not_worth")
+            self.assertEqual(records[0]["feedback"]["reason"], "价格一般")
+            self.assertEqual(store.pending_count, 0)
+            self.assertEqual(store.record_count, 1)
+
+            self.assertEqual(store.record_feedback("1004", "deal_not_worth", ""), "reason_updated")
+            records = store.get_records()
+            self.assertNotIn("reason", records[0]["feedback"])
+            self.assertEqual(store.pending_count, 0)
+            self.assertEqual(store.record_count, 1)
+
+            self.assertEqual(store.record_feedback("1004", "deal_not_worth"), "cancelled")
+            self.assertEqual(store.pending_count, 1)
+            self.assertEqual(store.record_count, 0)
+
     def test_cleanup_expired_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self._new_store(tmp)
@@ -211,11 +235,23 @@ class DealMemoryStoreTests(unittest.TestCase):
             store.record_to_pending(
                 [(item, "test")],
                 categories_by_article_id={"ctx1": "咖啡器具"},
+                contexts_by_article_id={
+                    "ctx1": {
+                        "need_state": "urgent",
+                        "inventory_basis": "咖啡豆库存不足",
+                        "preference_basis": ["关注咖啡器具"],
+                        "threshold_adjustment": "relaxed_due_to_need",
+                        "context_summary": "急缺补货，标准放宽",
+                    }
+                },
             )
 
             pending = store.get_pending("ctx1")
             self.assertEqual(pending["category_hint"], "咖啡器具")
             self.assertEqual(pending["context"]["filter_reason"], "test")
+            self.assertEqual(pending["context"]["decision_context"]["need_state"], "urgent")
+            self.assertEqual(pending["context"]["decision_context"]["inventory_basis"], "咖啡豆库存不足")
+            self.assertEqual(pending["context"]["decision_context"]["threshold_adjustment"], "relaxed_due_to_need")
             self.assertNotIn("preferences_snapshot", pending["context"])
             self.assertNotIn("inventory_snapshot", pending["context"])
 

@@ -23,6 +23,7 @@ SYSTEM_PROMPT = """\
 7. 品类精确对应：细分品类不扩展、不替代（指定品牌不替换为其他品牌，除非另一品牌绝对值/热度极高）。若两个物品包含相似功能，但在使用场景、摆放位置、或核心形态上存在显著差异，就不应视为同一品类。
 8. 推荐来源：只推荐商品列表中存在的商品，禁止虚构或编造商品 id。
 9. 推荐品类标签：每个推荐商品必须输出 category 字段。能命中预设品类时，category 必须严格等于预设之一；无法命中预设时，可生成 2-8 字可复用自定义品类。自定义品类不得包含品牌、商城、型号、容量、价格、促销词、榜单词，也不得把商品标题压缩成品类。
+10. 推荐决策上下文：每个推荐商品必须输出 decision_context，记录当时为什么按这个标准推荐。它只做事实摘要，不得新增推荐理由或替代 reason。
 </rules>
 
 <examples>
@@ -74,10 +75,27 @@ reason 示例：
 
 - recommendations.reason：30 字以内，说明推荐依据（符合了哪项偏好、价格或票数有何优势）
 - recommendations.category：优先从以下预设中选择：电脑数码、食品生鲜、运动户外、家用电器、服饰鞋包、日用百货、母婴用品、家居家装、办公设备、个护化妆、本地生活、医疗健康、图书文娱、玩模乐器。若都不合适，可生成 2-8 字自定义品类，如"厨房小家电""咖啡器具""宠物用品"；不得包含品牌、商城、型号、容量、价格、促销词、榜单词
+- recommendations.decision_context：记录当时的轻量决策上下文，用于历史学习。字段要求：
+  - need_state：只能是 "urgent"、"normal"、"unknown"。库存告急或明确需要补货时用 urgent；普通需求或非耗材场景用 normal；无法判断用 unknown
+  - inventory_basis：简短说明库存依据，如"咖啡豆库存不足""未命中库存项"
+  - preference_basis：命中的偏好依据列表，最多 3 条，每条简短
+  - threshold_adjustment：只能是 "relaxed_due_to_need"、"strict_normal"、"none"、"unknown"。因急缺而放宽质量信号时用 relaxed_due_to_need；普通状态下按更严格标准判断时用 strict_normal；无明显调整用 none
+  - context_summary：80 字以内，总结为什么当时按这个标准推荐
 - near_misses.reason：单一真实近因，可适当展开，不必压缩到 30 字
 
 {
-  "recommendations": [{"id": "174000000", "reason": "推荐理由", "category": "家用电器"}],
+  "recommendations": [{
+    "id": "174000000",
+    "reason": "推荐理由",
+    "category": "家用电器",
+    "decision_context": {
+      "need_state": "urgent",
+      "inventory_basis": "咖啡豆库存不足",
+      "preference_basis": ["关注咖啡器具", "历史低价优先"],
+      "threshold_adjustment": "relaxed_due_to_need",
+      "context_summary": "急缺补货，结合历史低价和库存不足放宽质量信号"
+    }
+  }],
   "near_misses": [{"id": "174000001", "reason": "跳过原因：真实近因"}]
 }
 </output_format>

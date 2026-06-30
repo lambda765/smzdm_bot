@@ -16,6 +16,7 @@ from smzdm_notice.feishu.commands import find_command_spec, help_markdown
 from smzdm_notice.feishu.notifier import (
     ARBITRATION_CARD_KIND,
     ARBITRATION_CARD_METADATA_KEY,
+    NOT_WORTH_REASON_FIELD,
     build_disabled_arbitration_card,
     build_disabled_draft_card,
     build_draft_failure_card,
@@ -94,7 +95,7 @@ class BotRuntime:
     status_provider: Callable[[], str]
     run_once: Callable[[], bool]
     restart: Callable[[], bool] | None = None
-    record_memory_feedback: Callable[[str, str], str] | None = None
+    record_memory_feedback: Callable[..., str] | None = None
 
 
 @dataclass
@@ -502,7 +503,7 @@ class FeishuInteractiveBot:
             return CardActionResult(message, build_disabled_arbitration_card("旧版卡片已失效"))
         if action == "ignore_arbitration":
             return self._ignore_arbitration_card_action(value, operator, reply_to_message_id)
-        if action in {"deal_good", "deal_not_worth"}:
+        if action in {"deal_good", "deal_not_worth", "deal_not_worth_reason"}:
             return self._handle_memory_feedback(action, value, reply_to_message_id)
         if action in {"deal_ignore_category", "deal_stock_enough", "deal_follow"}:
             self._start_deal_action_worker(action, dict(value), reply_to_message_id)
@@ -583,27 +584,51 @@ class FeishuInteractiveBot:
             self._reply_text(reply_to_message_id, message)
             return CardActionResult(message)
 
+        feedback_action = "deal_not_worth" if action == "deal_not_worth_reason" else action
+        reason = _card_field_optional(value, NOT_WORTH_REASON_FIELD) if action == "deal_not_worth_reason" else None
         if self.runtime.record_memory_feedback is not None:
-            result = self.runtime.record_memory_feedback(article_id, action)
+            if reason is None:
+                result = self.runtime.record_memory_feedback(article_id, feedback_action)
+            else:
+                result = self.runtime.record_memory_feedback(article_id, feedback_action, reason)
         else:
             result = "not_found"
 
-        label = "好价" if action == "deal_good" else "不值"
+        label = "好价" if feedback_action == "deal_good" else "不值"
+        updated_card = None
         if result == "recorded":
-            message = f"已标记为{label}"
-            update_deal_feedback_card(reply_to_message_id, article_id, selected=action)
+            message = f"已标记为{label}，偏好将用于后续推荐"
+            updated_card = update_deal_feedback_card(
+                reply_to_message_id,
+                article_id,
+                selected=feedback_action,
+                reason=reason or "",
+            )
         elif result == "updated":
-            message = "已更新反馈"
-            update_deal_feedback_card(reply_to_message_id, article_id, selected=action)
+            message = f"已更新为{label}，偏好将用于后续推荐"
+            updated_card = update_deal_feedback_card(
+                reply_to_message_id,
+                article_id,
+                selected=feedback_action,
+                reason=reason or "",
+            )
+        elif result == "reason_updated":
+            message = "已保存不值理由" if reason else "已清空不值理由"
+            updated_card = update_deal_feedback_card(
+                reply_to_message_id,
+                article_id,
+                selected="deal_not_worth",
+                reason=reason or "",
+            )
         elif result == "cancelled":
             message = "已取消反馈"
-            update_deal_feedback_card(reply_to_message_id, article_id, selected="")
+            updated_card = update_deal_feedback_card(reply_to_message_id, article_id, selected="")
         elif result == "invalid_action":
             message = "未知反馈操作"
         else:
             message = "反馈记录失败，该商品可能已过期或记忆功能未启用。"
 
-        return CardActionResult(message)
+        return CardActionResult(message, updated_card)
 
     def _start_deal_action_worker(self, action: str, value: dict, reply_to_message_id: str = "") -> None:
         thread = threading.Thread(
@@ -1278,6 +1303,13 @@ def _model_card_required(value: dict, key: str, message: str) -> str:
     return clean
 
 
+def _card_field_optional(value: dict, key: str) -> str:
+    raw = _model_card_raw_value(value, key)
+    if raw is None:
+        return ""
+    return str(raw).strip()
+
+
 def _model_card_optional(value: dict, key: str) -> str:
     raw = _model_card_raw_value(value, key)
     if raw is None:
@@ -1302,6 +1334,8 @@ def _normalize_card_form_value(raw):
                 return raw.get(key)
         if raw.get("option") is not None:
             return _normalize_card_form_value(raw.get("option"))
+        if any(key in raw for key in ("value", "text", "content")):
+            return ""
     if isinstance(raw, list):
         if not raw:
             return ""

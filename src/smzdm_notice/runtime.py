@@ -18,7 +18,7 @@ from typing import Callable, Literal
 from loguru import logger
 
 from smzdm_notice.core import config
-from smzdm_notice.core.calibration import CalibrationGenerator, MemoryAnalyzer, save_calibration_profile
+from smzdm_notice.core.calibration import CalibrationGenerator, MemoryAnalyzer
 from smzdm_notice.core.dedup import DedupManager
 from smzdm_notice.core.memory import DealMemoryStore
 from smzdm_notice.core.near_miss import NearMissManager
@@ -352,6 +352,7 @@ class MatchEvaluation:
     matched: list[tuple[RankingItem, str]]
     near_misses: list[tuple[RankingItem, str]]
     categories_by_article_id: dict[str, str] = field(default_factory=dict)
+    contexts_by_article_id: dict[str, dict] = field(default_factory=dict)
     arbiter_info: ArbiterInfo | None = None
 
 
@@ -416,6 +417,7 @@ def _poll_once_unlocked(
         near_miss_mgr,
         evaluation.arbiter_info,
         evaluation.categories_by_article_id,
+        evaluation.contexts_by_article_id,
     )
     _check_digest(near_miss_mgr)
     if not evaluation.matched:
@@ -482,11 +484,14 @@ def _evaluate_poll_matches(
         logger.info("收到停止信号，跳过 LLM 筛选")
         return PollOutcome.skipped("stopped")
 
+    calibration_section_builder = _calibration_generator.build_section if _calibration_generator is not None else None
+
     filter_result = filter_items(
         items=llm_candidates,
         user_prompt=user_prompt,
         inventory_data=inventory_data,
         routing_snapshot=routing_snapshot,
+        calibration_section_builder=calibration_section_builder,
     )
     if filter_result.diagnostics.llm_failed:
         logger.error("LLM 筛选全失败，跳过 LLM 推荐")
@@ -503,6 +508,7 @@ def _evaluate_poll_matches(
         matched=bypass_matches + filter_result.matched,
         near_misses=filter_result.near_misses,
         categories_by_article_id=filter_result.categories_by_article_id,
+        contexts_by_article_id=filter_result.contexts_by_article_id,
         arbiter_info=filter_result.arbiter_info,
     )
 
@@ -543,6 +549,7 @@ def _send_or_log_matches(
     near_miss_mgr: NearMissManager,
     arbiter_info: ArbiterInfo | None = None,
     categories_by_article_id: dict[str, str] | None = None,
+    contexts_by_article_id: dict[str, dict] | None = None,
 ) -> None:
     if matched:
         _send_matches_and_update_state(
@@ -552,6 +559,7 @@ def _send_or_log_matches(
             price_bypass_article_ids={item.article_id for item, _ in bypass_matches},
             arbiter_info=arbiter_info,
             categories_by_article_id=categories_by_article_id,
+            contexts_by_article_id=contexts_by_article_id,
         )
     else:
         logger.info("LLM 判断无匹配商品")
@@ -564,10 +572,12 @@ def _send_matches_and_update_state(
     price_bypass_article_ids: set[str] | None = None,
     arbiter_info: ArbiterInfo | None = None,
     categories_by_article_id: dict[str, str] | None = None,
+    contexts_by_article_id: dict[str, dict] | None = None,
 ) -> bool:
     logger.info(f"发现 {len(matched)} 件匹配商品，推送飞书...")
     price_bypass_article_ids = price_bypass_article_ids or set()
     categories_by_article_id = categories_by_article_id or {}
+    contexts_by_article_id = contexts_by_article_id or {}
     success = send_deals(matched, price_bypass_article_ids=price_bypass_article_ids)
     if success:
         global _last_push_time
@@ -581,6 +591,7 @@ def _send_matches_and_update_state(
                 _deal_memory.record_to_pending(
                     memory_items,
                     categories_by_article_id=categories_by_article_id,
+                    contexts_by_article_id=contexts_by_article_id,
                     arbiter_info=arbiter_info,
                 )
             except Exception as e:
@@ -676,22 +687,15 @@ def _run_memory_analysis(today_str: str) -> MemoryAnalysisStatus:
     if _deal_memory.last_analysis_date == today_str:
         return "ready"
 
-    # 重新生成校准文本（仅在有足够 records 时写入）
-    if _calibration_generator is not None:
-        profile = _calibration_generator.generate()
-        if profile.record_count >= 5:
-            save_calibration_profile(profile, config.CALIBRATION_FILE)
-            logger.info(f"Deal Memory: 校准文本已更新, {profile.record_count} 条 records")
-
-    # LLM 分析（需要足够的 records）
-    records = _deal_memory.get_records(limit=None)
-    if len(records) < config.MEMORY_PATTERN_MIN_SAMPLES:
-        logger.debug("Deal Memory: records 不足，跳过 LLM 分析")
-        _deal_memory.set_last_analysis_date(today_str)
-        _deal_memory.reset_analysis_state()
-        return "ready"
-
     try:
+        # LLM 分析（需要足够的 records）
+        records = _deal_memory.get_records(limit=None)
+        if len(records) < config.MEMORY_PATTERN_MIN_SAMPLES:
+            logger.debug("Deal Memory: records 不足，跳过 LLM 分析")
+            _deal_memory.set_last_analysis_date(today_str)
+            _deal_memory.reset_analysis_state()
+            return "ready"
+
         analyzer = MemoryAnalyzer()
         analysis = analyzer.analyze(records)
         if analysis is None:
@@ -763,20 +767,12 @@ def _suggest_memory_rule(rule: dict, analysis_summary: str) -> None:
         logger.warning(f"Deal Memory: 偏好草案生成失败: {e}")
 
 
-def _record_memory_feedback(article_id: str, action: str) -> str:
+def _record_memory_feedback(article_id: str, action: str, reason: str | None = None) -> str:
     """BotRuntime 回调：记录用户的好价/不值反馈。"""
     if not config.DEAL_MEMORY_ENABLED or _deal_memory is None:
         return "not_found"
 
-    result = _deal_memory.record_feedback(article_id, action)
-
-    # 反馈后更新校准文本
-    if result in {"recorded", "updated", "cancelled"} and _calibration_generator is not None:
-        try:
-            profile = _calibration_generator.generate()
-            save_calibration_profile(profile, config.CALIBRATION_FILE)
-        except Exception as e:
-            logger.warning(f"Deal Memory: 校准文本更新失败: {e}")
+    result = _deal_memory.record_feedback(article_id, action, reason)
 
     return result
 
@@ -918,6 +914,7 @@ def _initialize_runtime() -> tuple[DedupManager, NearMissManager, FeishuBindingS
         _calibration_generator = CalibrationGenerator(
             memory_store=_deal_memory,
             max_examples=config.CALIBRATION_MAX_EXAMPLES,
+            min_category_records=config.CALIBRATION_MIN_CATEGORY_RECORDS,
         )
         logger.info(f"Deal Memory 已加载: {_deal_memory.record_count} 条 records, {_deal_memory.pending_count} 条 pending")
     else:
