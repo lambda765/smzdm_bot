@@ -1,4 +1,4 @@
-"""Deal Memory 相关 Prompt 模板。"""
+"""用于 Deal Memory 的 Prompt 模板。"""
 
 MEMORY_ANALYSIS_SYSTEM_PROMPT = """\
 <role>

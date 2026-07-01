@@ -52,7 +52,7 @@ class DealMemoryStoreTests(unittest.TestCase):
             self.assertEqual(store.pending_count, 1)
             self.assertEqual(store.record_count, 0)
 
-            # pending 中有数据
+            # 待反馈 pending 中有数据
             pending = store.get_pending("1001")
             self.assertIsNotNone(pending)
             self.assertEqual(pending["title"], "测试电饭锅")
@@ -66,7 +66,7 @@ class DealMemoryStoreTests(unittest.TestCase):
             self.assertEqual(store.pending_count, 0)
             self.assertEqual(store.record_count, 1)
 
-            # records 中有完整数据
+            # 已确认 records 中有完整数据
             records = store.get_records()
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["feedback"]["action"], "deal_good")

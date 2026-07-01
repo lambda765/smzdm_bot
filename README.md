@@ -33,7 +33,6 @@
 
 - **LLM 多模型路由**：支持多 OpenAI 兼容连接，filter / arbiter / draft 三层 agent 配置继承与覆盖
 - **热切换**：飞书 `/model` 命令运行时切换模型，无需重启
-- **配置迁移**：`smzdm-notice migrate-llm-config` 从旧环境变量生成 `llm_models.json`
 - **配置校验增强**：`doctor` 命令校验 `llm_models.json` 格式与密钥引用
 - **飞书模型管理卡片**：查看路由、选择 connection、设置 temperature、测试调用
 
@@ -123,7 +122,7 @@ smzdm-notice setup
 
 **Deal Memory：** 设置 `DEAL_MEMORY_ENABLED=true` 后，推荐卡片会显示「好价/不值」反馈按钮。推送成功的 LLM 推荐会先进入待反馈记录，用户点击反馈后进入长期记忆；夜间汇总前会尝试更新历史决策校准和偏好学习建议。Deal Memory 是辅助功能，连续分析失败达到上限后会放弃当天分析并继续发送 near-miss 夜间汇总。
 
-**LLM 多模型路由：** 新安装会生成 `llm_models.json` 并默认启用多模型路由。JSON 中只保存 `api_key_env`，真实密钥继续放 `.env`，例如 `LLM_DEEPSEEK_API_KEY=...`。运行时必须有 `llm_models.json`；旧安装可先运行 `smzdm-notice migrate-llm-config` 从旧 LLM 环境变量生成该文件。
+**LLM 多模型路由：** `setup` 会生成 `llm_models.json` 并默认启用多模型路由。JSON 中只保存 `api_key_env`，真实密钥继续放 `.env`，例如 `LLM_DEEPSEEK_API_KEY=...`。运行时必须有 `llm_models.json`。
 
 配置分三层：`connections` 保存 OpenAI 兼容接口连接，`defaults` 保存默认 connection/model_id/request 参数，`agents.filter/arbiter/draft` 只写覆盖项；未配置的 agent（包括 `draft`）会继承 defaults。`timeout_seconds/max_retries` 可写在 defaults、connection 或 agent 上，优先级为 agent > connection > defaults。运行时内置默认 `response_format={"type":"json_object"}`，即使 JSON 里省略该字段也会发送；用户可用非空 `response_format` 对象覆盖。agent request 中字段值为 `null` 表示继承默认值，不会关闭默认 `response_format`。
 
@@ -132,8 +131,6 @@ smzdm-notice setup
 飞书发送 `/model` 会打开 LLM 模型路由管理卡片，可在卡片中查看当前默认配置和 `filter/arbiter/draft` 的最终路由，选择作用范围、选择已加载 connection、输入 model_id、设置 temperature、reset agent 覆盖并做测试调用。
 
 热切只修改已加载 connection 下的 `defaults` 或 `agents` 覆盖项；新增或修改 `base_url/provider/api_key_env`、修改 `.env` 密钥后需要重启。写回使用唯一临时文件和原子替换；多实例同时热切时以后写入者为准。
-
-旧配置迁移：`smzdm-notice migrate-llm-config` 会读取 `.env` 中已废弃的 `LLM_API_KEY/LLM_BASE_URL/LLM_MODEL` 及仲裁/草案旧变量，生成 `llm_models.json`；已有文件不会覆盖，除非加 `--force`。迁移命令不会删除或改写 `.env`。
 
 **搜索关键词：** 可选创建 `search_keywords.json`：
 

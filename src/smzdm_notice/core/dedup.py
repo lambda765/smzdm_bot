@@ -11,6 +11,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from smzdm_notice.core.json_store import read_json_file, write_json_file
+
 
 class DedupManager:
     """商品去重管理器。"""
@@ -25,8 +27,7 @@ class DedupManager:
         """从文件加载缓存。"""
         if self._filepath.exists():
             try:
-                with open(self._filepath, encoding="utf-8") as f:
-                    self._cache = json.load(f)
+                self._cache = read_json_file(self._filepath)
                 logger.debug(f"加载去重缓存: {len(self._cache)} 条记录")
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning(f"去重缓存加载失败，重新创建: {e}")
@@ -35,9 +36,7 @@ class DedupManager:
 
     def _save(self) -> None:
         """保存缓存到文件。"""
-        self._filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._filepath, "w", encoding="utf-8") as f:
-            json.dump(self._cache, f, ensure_ascii=False, indent=2)
+        write_json_file(self._filepath, self._cache)
 
     def _cleanup(self) -> None:
         """清理过期记录。"""
@@ -59,11 +58,6 @@ class DedupManager:
         if ts is None:
             return True
         return time.time() - ts > self._expire_seconds
-
-    def mark_sent(self, url: str) -> None:
-        """标记该 URL 已推送。"""
-        self._cache[url] = time.time()
-        self._save()
 
     def mark_batch(self, urls: list[str]) -> None:
         """批量标记已推送。"""

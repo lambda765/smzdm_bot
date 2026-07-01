@@ -1,4 +1,4 @@
-"""Deal Memory 存储模块。
+"""用于 Deal Memory 的存储模块。
 
 记录每次推荐的评估数据和用户的显式反馈（好价/不值），
 供校准生成和长期偏好学习使用。
@@ -13,6 +13,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from smzdm_notice.core.json_store import read_json_file, write_json_file
 from smzdm_notice.llm.categories import UNCATEGORIZED_CATEGORY
 from smzdm_notice.smzdm.ranking import RankingItem
 
@@ -34,6 +35,7 @@ class DealMemoryStore:
         self._meta: dict = {}
         self._records: dict[str, dict] = {}
         self._pending: dict[str, dict] = {}
+        self._analysis_failure_count = 0
         self._lock = threading.Lock()
         self._load()
 
@@ -43,9 +45,9 @@ class DealMemoryStore:
         """从文件加载。仅在 __init__ 中调用，此时对象未共享，不需要锁。"""
         if self._filepath.exists():
             try:
-                with open(self._filepath, encoding="utf-8") as f:
-                    data = json.load(f)
-                self._meta = data.pop(_STORE_META_KEY, {})
+                data = read_json_file(self._filepath)
+                meta_data = data.pop(_STORE_META_KEY, {})
+                self._meta = meta_data if isinstance(meta_data, dict) else {}
                 records_data = data.pop(_RECORDS_KEY, None)
                 if isinstance(records_data, dict):
                     self._records = records_data
@@ -70,14 +72,12 @@ class DealMemoryStore:
 
     def _save(self) -> None:
         """保存到文件。"""
-        self._filepath.parent.mkdir(parents=True, exist_ok=True)
         data = {
             _STORE_META_KEY: self._meta,
             _RECORDS_KEY: self._records,
             _PENDING_KEY: self._pending,
         }
-        with open(self._filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        write_json_file(self._filepath, data)
 
     # ── 写入操作 ──
 
@@ -229,23 +229,20 @@ class DealMemoryStore:
 
     @property
     def analysis_failure_count(self) -> int:
-        """今天分析连续失败次数。"""
+        """当前进程内的分析连续失败次数。"""
         with self._lock:
-            return self._meta.get("analysis_failure_count", 0)
+            return self._analysis_failure_count
 
     def record_analysis_failure(self) -> int:
-        """记录一次分析失败，返回当前失败次数。"""
+        """记录一次分析失败，返回当前进程内失败次数。"""
         with self._lock:
-            count = self._meta.get("analysis_failure_count", 0) + 1
-            self._meta["analysis_failure_count"] = count
-            self._save()
-            return count
+            self._analysis_failure_count += 1
+            return self._analysis_failure_count
 
     def reset_analysis_state(self) -> None:
         """分析成功后重置失败计数。"""
         with self._lock:
-            self._meta["analysis_failure_count"] = 0
-            self._save()
+            self._analysis_failure_count = 0
 
     # ── 内部方法 ──
 
@@ -314,7 +311,7 @@ def _build_feedback_payload(
     acted_at: str = "",
     previous_action: object = None,
 ) -> dict:
-    payload = {
+    payload: dict[str, object] = {
         "action": action,
         "acted_at": acted_at or _format_timestamp(time.time()),
     }

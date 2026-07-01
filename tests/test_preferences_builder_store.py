@@ -139,7 +139,8 @@ class PreferenceEditorTests(unittest.TestCase):
 
     def test_call_llm_for_draft_returns_none_on_sdk_error(self) -> None:
         class FailingCompletions:
-            def create(self, **kwargs):
+            # 为匹配 OpenAI SDK create 签名，这里保留关键字参数；测试替身只需抛出固定异常。
+            def create(self, **_kwargs):
                 raise BadRequestError("bad request", response=_openai_response(400), body=None)
 
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))

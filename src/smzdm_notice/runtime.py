@@ -1,4 +1,4 @@
-"""SMZDM 好价提醒机器人 — 主入口。
+"""什么值得买好价提醒机器人主入口。
 
 定时轮询什么值得买排行榜，通过 LLM 筛选后推送到飞书。
 """
@@ -86,9 +86,9 @@ _BINDING_WAIT_SECONDS = 60
 _RESTART_RELOAD_DOTENV_ENV = "SMZDM_RESTART_RELOAD_DOTENV"
 
 
-def _signal_handler(sig, frame) -> None:
-    """优雅退出。"""
-    logger.info("收到退出信号，正在停止...")
+def _signal_handler(signum, _frame) -> None:
+    """这是 Python signal.signal handler 协议签名；当前不需要使用栈帧。"""
+    logger.info(f"收到退出信号 {signum}，正在停止...")
     _stop_event.set()
 
 
@@ -374,7 +374,7 @@ def _poll_once(dedup: DedupManager, near_miss_mgr: NearMissManager) -> None:
     routing_snapshot = llm_routing.get_snapshot()
     _maintain_config_drafts("轮询开始清理")
     try:
-        outcome = _poll_once_unlocked(dedup, near_miss_mgr, routing_snapshot)
+        outcome = _run_poll_pipeline_unlocked(dedup, near_miss_mgr, routing_snapshot)
         if _poll_failure_tracker:
             _poll_failure_tracker.record(outcome)
     finally:
@@ -382,21 +382,21 @@ def _poll_once(dedup: DedupManager, near_miss_mgr: NearMissManager) -> None:
         _maintain_config_drafts("轮询结束清理")
 
 
-def _poll_once_unlocked(
+def _run_poll_pipeline_unlocked(
     dedup: DedupManager,
     near_miss_mgr: NearMissManager,
     routing_snapshot: RoutingSnapshot | None = None,
 ) -> PollOutcome:
-    """不负责加锁的单次轮询实现。"""
-    # Deal Memory: 清理过期 pending
+    """在不持有轮询锁的前提下执行抓取、去重、筛选、通知和汇总。"""
+    # 待反馈记忆只在原商品仍可能收到反馈时有价值；放在轮询热路径清理可避免依赖启动流程。
     if _deal_memory is not None:
         _deal_memory.cleanup_expired_pending(config.DEAL_MEMORY_PENDING_EXPIRE_DAYS)
 
-    all_items, early_outcome = _fetch_poll_items()
+    all_items, early_outcome = _fetch_source_items_for_poll()
     if early_outcome:
         return early_outcome
 
-    new_items, early_outcome = _dedupe_poll_items(all_items, dedup)
+    new_items, early_outcome = _select_new_poll_items(all_items, dedup)
     if early_outcome:
         return early_outcome
 
@@ -410,7 +410,7 @@ def _poll_once_unlocked(
 
     _handle_arbitration(evaluation.arbiter_info)
     _record_near_misses(evaluation.matched, evaluation.near_misses, near_miss_mgr)
-    _send_or_log_matches(
+    _deliver_poll_matches_or_log_empty(
         evaluation.matched,
         bypass_matches,
         dedup,
@@ -419,13 +419,14 @@ def _poll_once_unlocked(
         evaluation.categories_by_article_id,
         evaluation.contexts_by_article_id,
     )
-    _check_digest(near_miss_mgr)
+    _maybe_send_daily_digest(near_miss_mgr)
     if not evaluation.matched:
         _check_heartbeat()
     return PollOutcome.success()
 
 
-def _fetch_poll_items() -> tuple[list[RankingItem], PollOutcome | None]:
+def _fetch_source_items_for_poll() -> tuple[list[RankingItem], PollOutcome | None]:
+    """刷新来源配置并抓取本轮榜单/搜索商品。"""
     global _search_keywords
 
     _search_keywords = _load_search_keywords(_search_keywords)
@@ -451,10 +452,11 @@ def _fetch_poll_items() -> tuple[list[RankingItem], PollOutcome | None]:
     return all_items, None
 
 
-def _dedupe_poll_items(
+def _select_new_poll_items(
     all_items: list[RankingItem],
     dedup: DedupManager,
 ) -> tuple[list[RankingItem], PollOutcome | None]:
+    """在进入 LLM 前过滤已推送商品，避免重复付出筛选成本。"""
     dedup.cleanup()
     new_items = [item for item in all_items if dedup.is_new(item.link)]
     logger.info(f"去重后剩余 {len(new_items)}/{len(all_items)} 条新商品")
@@ -476,6 +478,7 @@ def _evaluate_poll_matches(
     near_miss_mgr: NearMissManager,
     routing_snapshot: RoutingSnapshot | None = None,
 ) -> MatchEvaluation | PollOutcome:
+    """合并价格阈值直推商品和 LLM 候选商品，得到本轮筛选结果。"""
     if not llm_candidates:
         return MatchEvaluation(matched=bypass_matches, near_misses=[])
 
@@ -496,7 +499,7 @@ def _evaluate_poll_matches(
     if filter_result.diagnostics.llm_failed:
         logger.error("LLM 筛选全失败，跳过 LLM 推荐")
         if bypass_matches:
-            _send_matches_and_update_state(
+            _send_matches_and_persist_runtime_state(
                 bypass_matches,
                 dedup,
                 near_miss_mgr,
@@ -542,7 +545,7 @@ def _record_near_misses(
             logger.info(f"收集 {len(filtered_near_misses)} 条 near-miss 条目")
 
 
-def _send_or_log_matches(
+def _deliver_poll_matches_or_log_empty(
     matched: list[tuple[RankingItem, str]],
     bypass_matches: list[tuple[RankingItem, str]],
     dedup: DedupManager,
@@ -551,8 +554,9 @@ def _send_or_log_matches(
     categories_by_article_id: dict[str, str] | None = None,
     contexts_by_article_id: dict[str, dict] | None = None,
 ) -> None:
+    """有匹配商品时发送通知；无匹配时留下明确轮询日志。"""
     if matched:
-        _send_matches_and_update_state(
+        _send_matches_and_persist_runtime_state(
             matched,
             dedup,
             near_miss_mgr,
@@ -565,7 +569,7 @@ def _send_or_log_matches(
         logger.info("LLM 判断无匹配商品")
 
 
-def _send_matches_and_update_state(
+def _send_matches_and_persist_runtime_state(
     matched: list[tuple[RankingItem, str]],
     dedup: DedupManager,
     near_miss_mgr: NearMissManager,
@@ -574,6 +578,7 @@ def _send_matches_and_update_state(
     categories_by_article_id: dict[str, str] | None = None,
     contexts_by_article_id: dict[str, dict] | None = None,
 ) -> bool:
+    """先发送好价卡片，仅在发送成功后持久化去重、near-miss 和记忆状态。"""
     logger.info(f"发现 {len(matched)} 件匹配商品，推送飞书...")
     price_bypass_article_ids = price_bypass_article_ids or set()
     categories_by_article_id = categories_by_article_id or {}
@@ -584,7 +589,7 @@ def _send_matches_and_update_state(
         _last_push_time = time.time()
         dedup.mark_batch([item.link for item, _ in matched])
         near_miss_mgr.remove_batch([item.article_id for item, _ in matched])
-        # Deal Memory: 推送成功后只缓存非价格直推商品的轻量推荐上下文。
+        # 推送成功后，Deal Memory 只缓存非价格直推商品的轻量推荐上下文。
         memory_items = [(item, reason) for item, reason in matched if item.article_id not in price_bypass_article_ids]
         if _deal_memory is not None and memory_items:
             try:
@@ -603,6 +608,7 @@ def _send_matches_and_update_state(
 
 
 def _split_price_bypass_items(items: list[RankingItem]) -> tuple[list[tuple[RankingItem, str]], list[RankingItem]]:
+    """将满足最高价规则的搜索商品从 LLM 候选中分离出来。"""
     bypass_matches = []
     llm_candidates = []
     for item in items:
@@ -639,8 +645,8 @@ def _check_heartbeat() -> None:
             _last_push_time = time.time()
 
 
-def _check_digest(near_miss_mgr: NearMissManager) -> None:
-    """检查是否需要发送夜间汇总。"""
+def _maybe_send_daily_digest(near_miss_mgr: NearMissManager) -> None:
+    """在 Deal Memory 分析完成或放弃后发送当天 near-miss 汇总。"""
     now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
 
@@ -652,7 +658,7 @@ def _check_digest(near_miss_mgr: NearMissManager) -> None:
     if now.hour < config.DIGEST_HOUR:
         return
 
-    memory_status = _run_memory_analysis(today_str)
+    memory_status = _run_daily_memory_analysis(today_str)
     if memory_status == "retry_later":
         logger.warning("Deal Memory 分析失败且未达重试上限，本轮暂不发送夜间汇总")
         return
@@ -675,10 +681,11 @@ _MAX_ANALYSIS_RETRIES = 3
 MemoryAnalysisStatus = Literal["ready", "retry_later", "abandoned"]
 
 
-def _run_memory_analysis(today_str: str) -> MemoryAnalysisStatus:
+def _run_daily_memory_analysis(today_str: str) -> MemoryAnalysisStatus:
     """执行 Deal Memory 的 LLM 分析和校准文本更新。
 
-    在夜间汇总时调用，最多重试 3 次，全失败后给用户发提醒。
+    当状态为 retry_later 时，夜间汇总会等待后续重试；成功、样本不足或放弃后
+    再放行汇总，确保偏好草案和失败提醒保持日级幂等。
     """
     if not config.DEAL_MEMORY_ENABLED or _deal_memory is None:
         return "ready"
@@ -688,7 +695,7 @@ def _run_memory_analysis(today_str: str) -> MemoryAnalysisStatus:
         return "ready"
 
     try:
-        # LLM 分析（需要足够的 records）
+        # 执行 LLM 分析，需要足够的 records。
         records = _deal_memory.get_records(limit=None)
         if len(records) < config.MEMORY_PATTERN_MIN_SAMPLES:
             logger.debug("Deal Memory: records 不足，跳过 LLM 分析")
@@ -768,7 +775,7 @@ def _suggest_memory_rule(rule: dict, analysis_summary: str) -> None:
 
 
 def _record_memory_feedback(article_id: str, action: str, reason: str | None = None) -> str:
-    """BotRuntime 回调：记录用户的好价/不值反馈。"""
+    """作为 BotRuntime 回调，记录用户的好价/不值反馈。"""
     if not config.DEAL_MEMORY_ENABLED or _deal_memory is None:
         return "not_found"
 

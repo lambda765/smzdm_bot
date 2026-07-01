@@ -114,7 +114,7 @@ SMZDM_USER_AGENT: str = _get("SMZDM_USER_AGENT")
 
 
 def get_smzdm_client_platform() -> str:
-    """Return the SMZDM app platform value used in signed request params."""
+    """返回签名请求参数中使用的 SMZDM app 平台值。"""
     if SMZDM_CLIENT_PLATFORM in {"iphone", "android"}:
         return SMZDM_CLIENT_PLATFORM
     raise RuntimeError("SMZDM_CLIENT_PLATFORM 仅支持 iphone 或 android")

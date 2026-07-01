@@ -1,4 +1,4 @@
-"""OpenAI SDK client reuse by LLM usage scenario."""
+"""按 LLM 使用场景复用 OpenAI SDK client。"""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ _CLIENT_SLOTS: OrderedDict[ClientSpec, OpenAI] = OrderedDict()
 
 
 def get_client_for_config(llm_config: ResolvedLLMConfig) -> OpenAI:
-    """Return a cached OpenAI-compatible client for a resolved LLM config."""
+    """为已解析的 LLM 配置返回缓存的 OpenAI-compatible client。"""
     return _get_client(
         ClientSpec(
             connection=llm_config.connection,
@@ -40,11 +40,10 @@ def get_client_for_config(llm_config: ResolvedLLMConfig) -> OpenAI:
 
 
 def _get_client(spec: ClientSpec) -> OpenAI:
-    """Return a cached OpenAI client, creating one only on first use for this spec.
+    """返回缓存的 OpenAI client，仅在首次遇到该规格时创建。
 
-    Uses ClientSpec (frozen dataclass) as dict key so agents that share the
-    same connection parameters (api_key, base_url, timeout, etc.) reuse a
-    single OpenAI instance rather than creating duplicate clients.
+    使用 frozen dataclass ClientSpec 作为 dict key，让共享相同连接参数
+    （api_key、base_url、timeout 等）的 agent 复用同一个 OpenAI 实例。
     """
     with _CLIENT_LOCK:
         if spec in _CLIENT_SLOTS:
@@ -64,7 +63,7 @@ def _get_client(spec: ClientSpec) -> OpenAI:
 
 
 def _clear_client_cache() -> None:
-    """Clear cached SDK clients for tests."""
+    """清空测试中使用的 SDK client 缓存。"""
     with _CLIENT_LOCK:
         for client in _CLIENT_SLOTS.values():
             _close_client(client)

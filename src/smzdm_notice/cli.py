@@ -1,4 +1,4 @@
-"""Command line interface for smzdm-notice."""
+"""项目 smzdm-notice 的命令行入口。"""
 
 from __future__ import annotations
 
@@ -48,15 +48,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     diff_config.set_defaults(func=_cmd_diff_config)
 
-    # --- Migration: 可随旧配置迁移逻辑一起删除 ---
-    migrate_llm = subparsers.add_parser("migrate-llm-config", help="从旧 LLM env 配置生成 llm_models.json")
-    migrate_llm.add_argument("--force", action="store_true", help="覆盖已有 llm_models.json")
-    migrate_llm.set_defaults(func=_cmd_migrate_llm_config)
-
     return parser
 
 
 def _cmd_run(_args: argparse.Namespace, _root: Path) -> int:
+    """作为 CLI 子命令 handler 统一接收 args/root；run 当前不需要直接使用它们。"""
     from smzdm_notice import runtime
 
     runtime.main()
@@ -64,6 +60,7 @@ def _cmd_run(_args: argparse.Namespace, _root: Path) -> int:
 
 
 def _cmd_setup(_args: argparse.Namespace, root: Path) -> int:
+    """作为 CLI 子命令 handler 统一接收 args/root；setup 当前只需要 root。"""
     root.mkdir(parents=True, exist_ok=True)
     workspace_dirs = ["workspace/state", "workspace/logs", "workspace/audit", "workspace/backups"]
     for relative in workspace_dirs:
@@ -108,6 +105,7 @@ def _llm_models_path(root: Path, env_values: dict[str, str]) -> Path:
 
 
 def _cmd_save_config(_args: argparse.Namespace, root: Path) -> int:
+    """作为 CLI 子命令 handler 统一接收 args/root；save-config 当前只需要 root。"""
     backup_dir = root / "workspace/backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -198,6 +196,7 @@ def _print_diff(left: Path, right: Path, left_label: str, right_label: str) -> N
 
 
 def _cmd_doctor(_args: argparse.Namespace, root: Path) -> int:
+    """作为 CLI 子命令 handler 统一接收 args/root；doctor 当前只需要 root。"""
     env_values = _doctor_env_values(root)
     llm_models_check, llm_models_data = _check_llm_models_file(root, env_values)
     checks = [
@@ -341,203 +340,3 @@ def _check_workspace(root: Path) -> tuple[bool, str]:
     except OSError as exc:
         return False, f"workspace not writable: {exc}"
     return True, "workspace writable"
-
-
-# ============================================================================
-# 旧 LLM 配置迁移逻辑 — 当所有用户完成迁移后可一键删除此区块
-# 对应 subparser: migrate-llm-config (见 _build_parser 末尾)
-# ============================================================================
-
-
-def _cmd_migrate_llm_config(args: argparse.Namespace, root: Path) -> int:
-    env_path = root / ".env"
-    if not env_path.exists():
-        print("error: .env missing")
-        return 1
-    env_values = _parse_env_values(env_path.read_text(encoding="utf-8"))
-    target = _llm_models_path(root, env_values)
-    if target.exists() and not args.force:
-        print(f"exists: {target.name}; use --force to overwrite")
-        return 1
-
-    try:
-        migrated = _build_migrated_llm_models(env_values)
-    except ValueError as exc:
-        print(f"error: {exc}")
-        return 1
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(migrated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"created: {target.relative_to(root) if target.is_relative_to(root) else target}")
-    print(_format_migrated_llm_summary(migrated))
-    return 0
-
-
-def _build_migrated_llm_models(values: dict[str, str]) -> dict:
-    base_url = _required_env_value(values, "LLM_BASE_URL")
-    model_id = _required_env_value(values, "LLM_MODEL")
-    _required_env_value(values, "LLM_API_KEY")
-
-    connections: dict[str, dict[str, str]] = {}
-    connection_by_spec: dict[tuple[str, str], str] = {}
-
-    def add_connection(name: str, label: str, url: str, key_env: str) -> str:
-        spec = (url, key_env)
-        if spec in connection_by_spec:
-            return connection_by_spec[spec]
-        final_name = name
-        suffix = 2
-        while final_name in connections:
-            final_name = f"{name}_{suffix}"
-            suffix += 1
-        connections[final_name] = {
-            "provider": "openai_compatible",
-            "label": label,
-            "base_url": url,
-            "api_key_env": key_env,
-        }
-        connection_by_spec[spec] = final_name
-        return final_name
-
-    main_timeout = _float_env_value(values, "LLM_TIMEOUT_SECONDS", 300.0)
-    main_spec = {
-        "base_url": base_url,
-        "model_id": model_id,
-        "api_key_env": "LLM_API_KEY",
-        "timeout_seconds": main_timeout,
-    }
-    arbiter_spec = _legacy_agent_spec(
-        values,
-        fallback=main_spec,
-        base_url_key="LLM_ARBITER_BASE_URL",
-        api_key_key="LLM_ARBITER_API_KEY",
-        model_key="LLM_ARBITER_MODEL",
-        timeout_key="LLM_ARBITER_TIMEOUT_SECONDS",
-    )
-    draft_spec = _legacy_agent_spec(
-        values,
-        fallback=arbiter_spec,
-        base_url_key="LLM_DRAFT_BASE_URL",
-        api_key_key="LLM_DRAFT_API_KEY",
-        model_key="LLM_DRAFT_MODEL",
-        timeout_key="LLM_DRAFT_TIMEOUT_SECONDS",
-    )
-
-    default_connection = add_connection("default", "Migrated default LLM", base_url, "LLM_API_KEY")
-    defaults = {
-        "connection": default_connection,
-        "model_id": model_id,
-        "timeout_seconds": main_timeout,
-        "max_retries": _int_env_value(values, "LLM_MAX_RETRIES", 2),
-        "request": {
-            "response_format": {"type": "json_object"},
-            "extra_body": {},
-        },
-    }
-    agents: dict[str, dict] = {
-        "filter": {"request": {"temperature": 0.3}},
-        "arbiter": {"request": {"temperature": 0.0}},
-        "draft": {"request": {"temperature": 0.0}},
-    }
-
-    _apply_migrated_agent_override(
-        agents,
-        add_connection,
-        agent="arbiter",
-        spec=arbiter_spec,
-        default_spec=main_spec,
-    )
-    _apply_migrated_agent_override(
-        agents,
-        add_connection,
-        agent="draft",
-        spec=draft_spec,
-        default_spec=main_spec,
-    )
-
-    return {
-        "connections": connections,
-        "defaults": defaults,
-        "agents": agents,
-    }
-
-
-def _legacy_agent_spec(
-    values: dict[str, str],
-    fallback: dict,
-    base_url_key: str,
-    api_key_key: str,
-    model_key: str,
-    timeout_key: str,
-) -> dict:
-    return {
-        "base_url": values.get(base_url_key) or fallback["base_url"],
-        "model_id": values.get(model_key) or fallback["model_id"],
-        "api_key_env": api_key_key if values.get(api_key_key) else fallback["api_key_env"],
-        "timeout_seconds": _float_env_value(values, timeout_key, float(fallback["timeout_seconds"])),
-    }
-
-
-def _apply_migrated_agent_override(
-    agents: dict[str, dict],
-    add_connection,
-    agent: str,
-    spec: dict,
-    default_spec: dict,
-) -> None:
-    if spec["base_url"] != default_spec["base_url"] or spec["api_key_env"] != default_spec["api_key_env"]:
-        agents[agent]["connection"] = add_connection(
-            agent,
-            f"Migrated {agent} LLM",
-            spec["base_url"],
-            spec["api_key_env"],
-        )
-    if spec["model_id"] != default_spec["model_id"]:
-        agents[agent]["model_id"] = spec["model_id"]
-    if spec["timeout_seconds"] != default_spec["timeout_seconds"]:
-        agents[agent]["timeout_seconds"] = spec["timeout_seconds"]
-
-
-def _required_env_value(values: dict[str, str], key: str) -> str:
-    value = values.get(key, "").strip()
-    if not value:
-        raise ValueError(f"{key} missing in .env")
-    return value
-
-
-def _float_env_value(values: dict[str, str], key: str, default: float) -> float:
-    raw = values.get(key, "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError as exc:
-        raise ValueError(f"{key} must be a number") from exc
-
-
-def _int_env_value(values: dict[str, str], key: str, default: int) -> int:
-    raw = values.get(key, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{key} must be an integer") from exc
-
-
-def _format_migrated_llm_summary(data: dict) -> str:
-    lines = ["LLM routing:"]
-    for name, conn in data.get("connections", {}).items():
-        lines.append(f"- connection {name}: {conn.get('base_url')} via {conn.get('api_key_env')}")
-    defaults = data.get("defaults", {})
-    lines.append(f"- default: {defaults.get('connection')}/{defaults.get('model_id')}")
-    for agent, cfg in data.get("agents", {}).items():
-        connection = cfg.get("connection") or defaults.get("connection")
-        model_id = cfg.get("model_id") or defaults.get("model_id")
-        lines.append(f"- {agent}: {connection}/{model_id}")
-    return "\n".join(lines)
-
-
-# ============================================================================
-# 迁移区块结束
-# ============================================================================

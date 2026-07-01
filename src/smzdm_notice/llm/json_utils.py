@@ -1,4 +1,4 @@
-"""LLM JSON 响应解析工具。"""
+"""用于解析 LLM JSON 响应的工具。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Feishu slash command metadata and help rendering."""
+"""用于 Feishu slash 命令的元数据与帮助内容渲染。"""
 
 from __future__ import annotations
 

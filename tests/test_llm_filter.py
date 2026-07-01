@@ -53,7 +53,8 @@ def _openai_response(status_code: int) -> httpx.Response:
 
 def _failing_client(error: Exception) -> SimpleNamespace:
     class FailingCompletions:
-        def create(self, **kwargs):
+        # 为匹配 OpenAI SDK create 签名，这里保留关键字参数；测试替身只需抛出固定异常。
+        def create(self, **_kwargs):
             raise error
 
     return SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
@@ -259,7 +260,8 @@ class LlmClientReuseTests(unittest.TestCase):
     def test_clear_client_cache_closes_cached_clients(self) -> None:
         created = []
 
-        def openai_factory(**kwargs):
+        # 为匹配 OpenAI 构造函数签名，这里保留连接参数；本测试只验证清理时会关闭缓存 client。
+        def openai_factory(**_kwargs):
             client = SimpleNamespace(name=f"client-{len(created) + 1}", close=Mock())
             created.append(client)
             return client
@@ -614,7 +616,8 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_filter_items_injects_runtime_calibration_section(self) -> None:
         captured = {}
 
-        def fake_call(client, model, user_message):
+        # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
+        def fake_call(_client, _llm_config, user_message):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -646,7 +649,8 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         captured = {}
         builder_item_ids = []
 
-        def fake_call(client, model, user_message):
+        # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
+        def fake_call(_client, _llm_config, user_message):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -684,7 +688,8 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_low_quality_items_still_enter_llm_request(self) -> None:
         captured = {}
 
-        def fake_call(client, model, user_message):
+        # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
+        def fake_call(_client, _llm_config, user_message):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -718,7 +723,8 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_prefilter_requires_all_regular_metrics_when_enabled(self) -> None:
         captured = {}
 
-        def fake_call(client, model, user_message):
+        # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
+        def fake_call(_client, _llm_config, user_message):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -783,7 +789,8 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_prefilter_bypasses_on_comments_when_enabled(self) -> None:
         captured = {}
 
-        def fake_call(client, model, user_message):
+        # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
+        def fake_call(_client, _llm_config, user_message):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -836,7 +843,8 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_prefilter_bypasses_on_worthy_when_enabled(self) -> None:
         captured = {}
 
-        def fake_call(client, model, user_message):
+        # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
+        def fake_call(_client, _llm_config, user_message):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -876,7 +884,8 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_filter_items_model_argument_overrides_routed_model(self) -> None:
         captured = {}
 
-        def fake_call(client, llm_config, user_message):
+        # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
+        def fake_call(_client, llm_config, _user_message):
             captured["model_id"] = llm_config.model_id
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -1062,7 +1071,8 @@ class LlmFilterArbitrationTests(unittest.TestCase):
         response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
         )
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
+        # 为匹配 OpenAI SDK create 签名，这里保留关键字参数；此处只需返回固定响应。
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: response)))
 
         info = arbitrate(
             ArbitrationRequest(

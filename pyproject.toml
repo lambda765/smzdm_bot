@@ -14,7 +14,7 @@ dependencies = [
     "lark-oapi",
     "loguru",
     "openai",
-    "pydantic",
+    "pydantic>=2",
     "python-dotenv",
     "urllib3<2",
 ]

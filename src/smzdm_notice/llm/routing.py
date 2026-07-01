@@ -1,4 +1,4 @@
-"""Runtime LLM routing for model connections and agent-level overrides."""
+"""运行时 LLM 连接路由与 agent 级覆盖配置。"""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ SUPPORTED_PROVIDERS = {"openai_compatible"}
 
 
 class LLMRoutingError(ValueError):
-    """Raised when LLM routing configuration or updates are invalid."""
+    """当 LLM 路由配置或更新无效时抛出。"""
 
 
 @dataclass(frozen=True)
@@ -69,25 +69,26 @@ class _RoutingState:
         return RoutingSnapshot(raw=deepcopy(self.raw), version=self.version, path=self.path, source=self.source)
 
 
+# _UPDATE_LOCK 串行化文件写入；_LOCK 保护内存中的路由快照。
 _LOCK = RLock()
 _UPDATE_LOCK = RLock()
 _STATE: _RoutingState | None = None
 
 
 def initialize(force: bool = False) -> RoutingSnapshot:
-    """Load routing state from llm_models.json."""
+    """从 llm_models.json 加载路由状态。"""
     with _UPDATE_LOCK, _LOCK:
         return _initialize_locked(force=force)
 
 
 def _initialize_locked(force: bool = False) -> RoutingSnapshot:
-    """Load routing state while _LOCK is already held."""
+    """在已经持有 _LOCK 时加载路由状态。"""
     global _STATE
     if _STATE is not None and not force:
         return _STATE.snapshot()
     path = _routing_path()
     if not path.exists():
-        raise LLMRoutingError(f"{path.name} missing; run smzdm-notice migrate-llm-config or smzdm-notice setup")
+        raise LLMRoutingError(f"{path.name} missing; run smzdm-notice setup")
     raw = _load_json(path)
     _validate_raw(raw)
     _STATE = _RoutingState(raw=raw, path=path, source="file")
@@ -100,7 +101,7 @@ def get_snapshot() -> RoutingSnapshot:
 
 
 def _clear_routing_state() -> None:
-    """Clear cached routing state for tests."""
+    """清空测试使用的路由状态缓存。"""
     global _STATE
     with _LOCK:
         _STATE = None
@@ -111,7 +112,7 @@ def resolve(agent: str, snapshot: RoutingSnapshot | None = None) -> ResolvedLLMC
 
 
 def build_chat_completion_kwargs(llm_config: ResolvedLLMConfig, messages: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build OpenAI chat completion kwargs from a resolved LLM config."""
+    """根据已解析的 LLM 配置构造 OpenAI chat completion kwargs。"""
     options: dict[str, Any] = {"model": llm_config.model_id, "messages": messages}
     if llm_config.temperature is not None:
         options["temperature"] = llm_config.temperature
@@ -123,7 +124,7 @@ def build_chat_completion_kwargs(llm_config: ResolvedLLMConfig, messages: list[d
 
 
 def validate_raw(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> None:
-    """Validate routing data with the same rules used at runtime."""
+    """使用运行时同一套规则校验路由数据。"""
     _validate_raw(raw, env=env)
 
 
@@ -148,7 +149,7 @@ def format_status(snapshot: RoutingSnapshot | None = None) -> str:
 
 
 def model_card_state(snapshot: RoutingSnapshot | None = None) -> dict[str, Any]:
-    """Return safe routing data for the Feishu model management card."""
+    """返回可安全展示在 Feishu 模型管理卡片中的路由数据。"""
     snap = snapshot or get_snapshot()
     raw = snap.raw
     defaults = _object(raw.get("defaults"), "defaults")
@@ -175,7 +176,7 @@ def model_card_state(snapshot: RoutingSnapshot | None = None) -> dict[str, Any]:
 
 
 def _connection_card_info(name: str, conn: dict[str, Any]) -> dict[str, Any]:
-    """Build safe connection info dict for the model management card."""
+    """为模型管理卡片构造可安全展示的 connection 信息。"""
     base_url = str(conn.get("base_url") or "")
     api_key_env = str(conn.get("api_key_env") or "")
     return {
@@ -204,7 +205,7 @@ def _agent_card_state(snap: RoutingSnapshot, agents: dict[str, Any], agent: str)
 
 
 def use_default_connection_model(connection: str, model_id: str) -> RoutingSnapshot:
-    """Set the default connection and model_id, persisting to llm_models.json."""
+    """设置默认 connection 和 model_id，并持久化到 llm_models.json。"""
     connection = _clean_required(connection, "connection")
     model_id = _clean_required(model_id, "model_id")
 
@@ -217,7 +218,7 @@ def use_default_connection_model(connection: str, model_id: str) -> RoutingSnaps
 
 
 def use_default_model(model_id: str) -> RoutingSnapshot:
-    """Set the default model_id without changing the default connection."""
+    """只设置默认 model_id，不改变默认 connection。"""
     model_id = _clean_required(model_id, "model_id")
 
     def mutate(raw: dict[str, Any]) -> None:
@@ -227,7 +228,7 @@ def use_default_model(model_id: str) -> RoutingSnapshot:
 
 
 def use_agent_model(agent: str, model_id: str, connection: str | None = None) -> RoutingSnapshot:
-    """Override model_id (and optionally connection) for a specific agent."""
+    """覆盖指定 agent 的 model_id，并可选覆盖 connection。"""
     agent = _validate_agent(agent)
     model_id = _clean_required(model_id, "model_id")
     connection = _clean_optional(connection)
@@ -242,7 +243,7 @@ def use_agent_model(agent: str, model_id: str, connection: str | None = None) ->
 
 
 def reset_agent(agent: str) -> RoutingSnapshot:
-    """Remove agent-level overrides so it falls back to defaults."""
+    """移除 agent 级覆盖，让它回退到默认配置。"""
     agent = _validate_agent(agent)
 
     def mutate(raw: dict[str, Any]) -> None:
@@ -254,7 +255,7 @@ def reset_agent(agent: str) -> RoutingSnapshot:
 
 
 def set_default_temperature(temperature: float) -> RoutingSnapshot:
-    """Set the default temperature in defaults.request."""
+    """设置 defaults.request 中的默认 temperature。"""
     _validate_temperature(temperature)
 
     def mutate(raw: dict[str, Any]) -> None:
@@ -266,7 +267,7 @@ def set_default_temperature(temperature: float) -> RoutingSnapshot:
 
 
 def set_agent_temperature(agent: str, temperature: float) -> RoutingSnapshot:
-    """Override temperature for a specific agent's request settings."""
+    """覆盖指定 agent 请求配置中的 temperature。"""
     agent = _validate_agent(agent)
     _validate_temperature(temperature)
 
@@ -291,15 +292,15 @@ def test_config_for_connection(connection: str, model_id: str) -> ResolvedLLMCon
 
 
 def _update_routing(mutator) -> RoutingSnapshot:
-    """Apply a mutation to routing config, validate, persist, and return updated snapshot.
+    """应用一次路由配置修改，校验并持久化后返回新快照。
 
-    Uses two locks to avoid holding _LOCK during disk I/O:
-    - _UPDATE_LOCK serialises concurrent writes (only one mutation at a time).
-    - _LOCK protects in-memory _STATE reads/writes (released before I/O).
+    这里使用两把锁，避免磁盘 I/O 期间长期持有 _LOCK：
+    - _UPDATE_LOCK 串行化并发写入，确保同一时间只有一次修改。
+    - _LOCK 保护内存 _STATE 的读写，并在 I/O 前释放。
     """
     global _STATE
     with _UPDATE_LOCK:
-        # Read current state under _LOCK, then release it before disk I/O
+        # 在 _LOCK 内读取当前状态，然后在磁盘 I/O 前释放。
         with _LOCK:
             if _STATE is None:
                 _initialize_locked()
@@ -309,11 +310,11 @@ def _update_routing(mutator) -> RoutingSnapshot:
             path = _STATE.path
             source = _STATE.source
             version = _STATE.version + 1
-        # Mutation and validation run outside _LOCK so readers aren't blocked
+        # 修改与校验在 _LOCK 外执行，避免阻塞读者。
         mutator(raw)
         _validate_raw(raw)
         _write_json_atomic(path, raw)
-        # Re-acquire _LOCK to commit the new state
+        # 重新获取 _LOCK 后提交新的内存状态。
         with _LOCK:
             _STATE = _RoutingState(raw=raw, path=path, source=source, version=version)
             return _STATE.snapshot()
@@ -325,12 +326,12 @@ def _resolve_agent(
     allow_test_agent: bool = False,
     env: Mapping[str, str] | None = None,
 ) -> ResolvedLLMConfig:
-    """Resolve the effective LLM config for an agent.
+    """解析某个 agent 最终生效的 LLM 配置。
 
-    Inheritance priority (agent-level overrides take precedence):
+    继承优先级如下，agent 级覆盖优先：
       connection/model_id: agent_cfg → defaults
-      request (temperature, response_format, extra_body): merged via _merge_request
-      timeout_seconds/max_retries: agent_cfg → connection → defaults (via _first_config_value)
+      request（temperature、response_format、extra_body）：通过 _merge_request 合并
+      timeout_seconds/max_retries: agent_cfg → connection → defaults（通过 _first_config_value）
     """
     if not allow_test_agent:
         agent = _validate_agent(agent)
@@ -338,7 +339,7 @@ def _resolve_agent(
     agents = _object(raw.get("agents", {}), "agents")
     agent_cfg = _object(agents.get(agent, {}), f"agents.{agent}")
 
-    # Inherit: agent connection overrides default connection
+    # 继承规则：agent connection 覆盖默认 connection。
     connection_name = str(agent_cfg.get("connection") or defaults.get("connection") or "").strip()
     if not connection_name:
         raise LLMRoutingError("defaults.connection 未配置")
@@ -347,17 +348,17 @@ def _resolve_agent(
         raise LLMRoutingError(f"未知 LLM connection: {connection_name}")
     conn = _object(connections[connection_name], f"connections.{connection_name}")
 
-    # Inherit: agent model_id overrides default model_id
+    # 继承规则：agent model_id 覆盖默认 model_id。
     model_id = str(agent_cfg.get("model_id") or defaults.get("model_id") or "").strip()
     if not model_id:
         raise LLMRoutingError(f"{agent} 未解析到 model_id")
 
-    # Merge request-level settings: defaults.request ← agent.request
+    # 合并请求级配置：defaults.request ← agent.request。
     request = _merge_request(defaults.get("request", {}), agent_cfg.get("request", {}))
     provider = str(conn.get("provider") or "").strip()
     base_url = str(conn.get("base_url") or "").strip()
     api_key_env = str(conn.get("api_key_env") or "").strip()
-    # env param allows tests to inject keys without touching os.environ
+    # 测试可通过 env 参数注入密钥，避免直接修改 os.environ。
     api_key = str((env.get(api_key_env) if env is not None else os.getenv(api_key_env)) or "").strip()
 
     response_format = _optional_object(request.get("response_format"), "response_format")
@@ -422,13 +423,13 @@ def _validate_raw(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> 
 
 
 def _merge_request(default_request: Any, agent_request: Any) -> dict[str, Any]:
-    """Merge defaults.request with agent-specific request overrides.
+    """合并 defaults.request 和 agent 专属请求覆盖项。
 
-    Strategy:
-    - Start from the built-in default request as the base.
-    - Overlay defaults.request and then agent.request, skipping None values
-      (None means "keep inherited default").
-    - extra_body is deep-merged: agent keys override default keys.
+    策略：
+    - 以内置默认 request 作为基础。
+    - 依次覆盖 defaults.request 和 agent.request，跳过 None 值
+      （None 表示保留继承到的默认值）。
+    - extra_body 做深合并：agent key 覆盖 default key。
     """
     default_obj = _object(default_request, "defaults.request")
     agent_obj = _object(agent_request, "agent.request")
@@ -443,7 +444,7 @@ def _merge_request(default_request: Any, agent_request: Any) -> dict[str, Any]:
 
 
 def _first_config_value(*objects: dict[str, Any], key: str, default: Any) -> Any:
-    """Return the first non-None/non-empty value for *key* across *objects* (left-to-right priority)."""
+    """按从左到右优先级返回第一个非 None、非空字符串的配置值。"""
     for obj in objects:
         if key in obj and obj[key] not in (None, ""):
             return obj[key]
@@ -469,7 +470,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json_atomic(path: Path, raw: dict[str, Any]) -> None:
-    """Write JSON to a temp file then atomically replace the target (os.replace)."""
+    """先写临时 JSON 文件，再用 os.replace 原子替换目标文件。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -477,7 +478,7 @@ def _write_json_atomic(path: Path, raw: dict[str, Any]) -> None:
 
 
 def _extract_host(url: str) -> str:
-    """Extract hostname from a URL, falling back to the raw string."""
+    """从 URL 提取 hostname；解析失败时回退为原始字符串。"""
     return urlparse(url).netloc or url
 
 

@@ -1,4 +1,4 @@
-"""SMZDM API shared request, signing, and parsing helpers."""
+"""什么值得买 API 共用请求、签名与解析工具。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ ValueNormalizer = Callable[[str], str]
 
 
 def compact_sign_value(value: str) -> str:
-    """Normalize search API values before signing."""
+    """签名前归一化搜索 API 参数值。"""
     return value.replace(" ", "").replace("\t", "").replace("\n", "")
 
 
@@ -39,7 +39,7 @@ def _require_smzdm_user_agent() -> str:
 
 
 def get_client() -> httpx.Client:
-    """Return the shared SMZDM HTTP client."""
+    """返回共用的 SMZDM HTTP client。"""
     global _SHARED_CLIENT
     with _CLIENT_LOCK:
         if _SHARED_CLIENT is None:
@@ -48,7 +48,7 @@ def get_client() -> httpx.Client:
 
 
 def close_client() -> None:
-    """Close and clear the shared SMZDM HTTP client."""
+    """关闭并清空共用的 SMZDM HTTP client。"""
     global _SHARED_CLIENT
     with _CLIENT_LOCK:
         if _SHARED_CLIENT is not None:
@@ -62,7 +62,7 @@ def build_signed_params(
     value_normalizer: ValueNormalizer | None = None,
     now_ms: int | None = None,
 ) -> dict:
-    """Return request params with a SMZDM app timestamp and MD5 sign."""
+    """返回带 SMZDM app 时间戳和 MD5 sign 的请求参数。"""
     signed = dict(params)
     if now_ms is not None or "time" not in signed:
         signed["time"] = now_ms if now_ms is not None else int(round(time.time() * 1000))
@@ -87,7 +87,7 @@ def get_json(
     *,
     value_normalizer: ValueNormalizer | None = None,
 ) -> dict:
-    """Send a signed SMZDM GET request and return decoded JSON."""
+    """发送已签名的 SMZDM GET 请求并返回解析后的 JSON。"""
     signed = build_signed_params(params, value_normalizer=value_normalizer)
     headers = {
         "accept-encoding": "gzip",
@@ -104,7 +104,7 @@ def get_json(
 
 
 def extract_nested_title(raw) -> str:
-    """Extract article_title from a string or a single-item dict list."""
+    """从字符串或单元素 dict 列表中提取 article_title。"""
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list) and raw:
@@ -115,7 +115,7 @@ def extract_nested_title(raw) -> str:
 
 
 def extract_article_tags(*sources) -> list[str]:
-    """Extract and dedupe user-facing tag strings from SMZDM tag shapes."""
+    """从 SMZDM 多种 tag 结构中提取并去重用户可见标签。"""
     tags: list[str] = []
     seen: set[str] = set()
 
@@ -140,7 +140,7 @@ def extract_article_tags(*sources) -> list[str]:
 
 
 def parse_num(val) -> int:
-    """Parse SMZDM counters, including '18k' and '1.2w' abbreviations."""
+    """解析 SMZDM 计数字段，包括 18k、1.2w 这类缩写。"""
     if isinstance(val, (int, float)):
         return int(val)
     if not isinstance(val, str) or not val:

@@ -216,7 +216,7 @@ def _truncate_context(text: str, max_length: int) -> str:
 
 @dataclass
 class MemoryAnalysis:
-    """LLM 分析结果。"""
+    """表示 LLM 分析结果。"""
 
     summary: str = ""
     suggested_rules: list[dict] = field(default_factory=list)

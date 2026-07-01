@@ -7,12 +7,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Callable
 
 from loguru import logger
 
 from smzdm_notice.core import config as app_config
-from smzdm_notice.core.sleep import interruptible_sleep
 from smzdm_notice.smzdm.client import (
     AD_CELL_TYPES,
     extract_article_tags,
@@ -115,16 +113,6 @@ class RankingItem:
             "tab_name": self.tab_name,
         }
 
-    def to_text(self) -> str:
-        """单行文字摘要。"""
-        tags_str = f"  [{', '.join(self.tags)}]" if self.tags else ""
-        return (
-            f"#{self.rank} [{self.brand}] {self.title}  {self.price}  "
-            f"值{self.worthy}/不值{self.unworthy}  评论{self.comments}  "
-            f"收藏{self.favorites}  来自{self.mall}{tags_str}"
-        )
-
-
 # ========== 核心功能 ==========
 
 
@@ -209,43 +197,6 @@ def _ranking_item_from_row(row: dict, config: RankingConfig, rank: int) -> Ranki
         tab_id=config.tab_id,
         tab_name=config.name,
     )
-
-
-def fetch_all_rankings(
-    configs: list[RankingConfig],
-    top_n: int = 20,
-    interval_seconds: int = 5,
-    should_stop: Callable[[], bool] | None = None,
-) -> list[RankingItem]:
-    """抓取多个榜单，每个榜单之间间隔指定秒数。
-
-    Args:
-        configs: 要抓取的榜单配置列表。
-        top_n: 每个榜单返回前 N 条。
-        interval_seconds: 两次抓取之间的间隔秒数，默认 5 秒。
-        should_stop: 可选回调，返回 True 时立即停止抓取。
-
-    Returns:
-        所有榜单的商品合并列表。
-    """
-    all_items: list[RankingItem] = []
-
-    for i, cfg in enumerate(configs):
-        if should_stop and should_stop():
-            logger.info("收到停止信号，中断榜单抓取")
-            break
-        try:
-            items = get_ranking(config=cfg, top_n=top_n)
-            all_items.extend(items)
-        except Exception as e:
-            logger.error(f"获取榜单 [{cfg.name}] 失败: {e}")
-
-        # 在两个榜单之间等待，最后一个不等
-        if i < len(configs) - 1:
-            interruptible_sleep(interval_seconds, should_stop)
-
-    logger.info(f"共获取 {len(all_items)} 条商品（来自 {len(configs)} 个榜单）")
-    return all_items
 
 
 if __name__ == "__main__":

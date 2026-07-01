@@ -1,4 +1,4 @@
-"""SMZDM good-deal notification bot package."""
+"""什么值得买好价通知机器人包。"""
 
 __all__ = ["__version__"]
 

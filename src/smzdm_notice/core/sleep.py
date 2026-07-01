@@ -1,4 +1,4 @@
-"""Sleep helpers shared by polling source fetchers."""
+"""商品来源抓取流程共用的 sleep 工具。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ def interruptible_sleep(
     should_stop: Callable[[], bool] | None = None,
     stop_message: str = "收到停止信号，中断等待",
 ) -> bool:
-    """Sleep in one-second chunks and return True when interrupted."""
+    """按一秒粒度等待；若被停止信号中断则返回 True。"""
     elapsed = 0
     while elapsed < seconds:
         if should_stop and should_stop():

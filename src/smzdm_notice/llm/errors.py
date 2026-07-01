@@ -1,4 +1,4 @@
-"""OpenAI SDK error classification helpers."""
+"""用于 OpenAI SDK 的错误分类工具。"""
 
 from __future__ import annotations
 

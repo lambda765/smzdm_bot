@@ -1,4 +1,4 @@
-"""Deterministic category handling for Deal Memory."""
+"""用于 Deal Memory 的确定性分类处理。"""
 
 from __future__ import annotations
 
@@ -24,23 +24,6 @@ PRESET_CATEGORIES = {
     "玩模乐器",
 }
 
-PRESET_CATEGORY_LIST = [
-    "电脑数码",
-    "食品生鲜",
-    "运动户外",
-    "家用电器",
-    "服饰鞋包",
-    "日用百货",
-    "母婴用品",
-    "家居家装",
-    "办公设备",
-    "个护化妆",
-    "本地生活",
-    "医疗健康",
-    "图书文娱",
-    "玩模乐器",
-]
-
 _INVALID_CATEGORY_TERMS = {
     "热卖榜",
     "热评榜",
@@ -64,10 +47,10 @@ _CUSTOM_CATEGORY_PATTERN = re.compile(r"^[A-Za-z\u4e00-\u9fff]{2,8}$")
 
 
 def sanitize_category(raw: str, item: RankingItem | None = None) -> str:
-    """Normalize and validate a category label returned by the filter LLM.
+    """归一化并校验筛选 LLM 返回的分类标签。
 
-    This is intentionally deterministic and never calls an LLM. Invalid labels
-    are treated as unknown instead of being inferred from source tab names.
+    这里刻意保持确定性，绝不再次调用 LLM。无效标签会被视为未知，
+    而不是从来源 tab 名中推断。
     """
     category = _normalize_category(raw)
     if not category:
@@ -80,7 +63,7 @@ def sanitize_category(raw: str, item: RankingItem | None = None) -> str:
 
 
 def category_from_tab_name(tab_name: str) -> str:
-    """Return a preset category encoded in a source tab name, if any."""
+    """如果来源 tab 名编码了预设分类，则返回该分类。"""
     text = str(tab_name or "").strip()
     prefix = "综合榜-"
     if not text.startswith(prefix):
@@ -92,7 +75,7 @@ def category_from_tab_name(tab_name: str) -> str:
 
 
 def candidate_calibration_categories(items: list[RankingItem]) -> set[str]:
-    """Infer only safe calibration categories from candidate source metadata."""
+    """只从候选商品来源元数据中推断安全的校准分类。"""
     categories: set[str] = set()
     for item in items:
         category = category_from_tab_name(getattr(item, "tab_name", ""))

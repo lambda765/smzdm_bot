@@ -232,7 +232,7 @@ class NotifierBindingTests(unittest.TestCase):
         self.assertNotIn("deal_not_worth", all_action_values)
         self.assertIn("deal_ignore_category", all_action_values)
 
-    def test_update_deal_feedback_card_toggles_cached_button_row(self) -> None:
+    def test_update_deal_card_feedback_state_toggles_cached_button_row(self) -> None:
         sent_cards = []
         updated_cards = []
         with (
@@ -249,7 +249,7 @@ class NotifierBindingTests(unittest.TestCase):
         ):
             item = _item()
             self.assertTrue(notifier.send_deals([(item, "LLM 推荐")]))
-            result = notifier.update_deal_feedback_card("om_deal_toggle", item.article_id, selected="deal_good")
+            result = notifier.update_deal_card_feedback_state("om_deal_toggle", item.article_id, selected="deal_good")
             self.assertIsNotNone(result)
 
         update_card.assert_called_once()
@@ -261,7 +261,7 @@ class NotifierBindingTests(unittest.TestCase):
         ]
         self.assertEqual(memory_labels, ["✅ 好价"])
 
-    def test_update_deal_feedback_card_shows_optional_not_worth_reason_input(self) -> None:
+    def test_update_deal_card_feedback_state_shows_optional_not_worth_reason_input(self) -> None:
         sent_cards = []
         updated_cards = []
         with (
@@ -278,7 +278,7 @@ class NotifierBindingTests(unittest.TestCase):
         ):
             item = _item()
             self.assertTrue(notifier.send_deals([(item, "LLM 推荐")]))
-            result = notifier.update_deal_feedback_card(
+            result = notifier.update_deal_card_feedback_state(
                 "om_deal_reason",
                 item.article_id,
                 selected="deal_not_worth",

@@ -10,17 +10,16 @@ from smzdm_notice.feishu.binding import FeishuBindingStore
 from smzdm_notice.feishu.bot import (
     MODEL_CARD_FORM_STATE_LIMIT,
     BotRuntime,
-    DraftProcessingMessage,
+    DraftProgressCard,
     FeishuInteractiveBot,
     MessageDeduper,
-    _extract_card_value,
-    _extract_message_text,
     _is_allowed_message,
     _run_model_test,
-    _strip_bot_mention,
 )
+from smzdm_notice.feishu.card_payload import extract_card_action_value, extract_message_text, strip_bot_mention
 from smzdm_notice.feishu.commands import COMMAND_SPECS, help_markdown
-from smzdm_notice.feishu.notifier import NOT_WORTH_REASON_FIELD, build_model_management_card
+from smzdm_notice.feishu.model_cards import build_model_management_card
+from smzdm_notice.feishu.notifier import NOT_WORTH_REASON_FIELD
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
 from smzdm_notice.preferences.models import ConfigDraft
 from smzdm_notice.preferences.store import DraftStore
@@ -167,18 +166,18 @@ def _routing_snapshot(agent: str = "filter", connection: str = "glm", model_id: 
 
 class FeishuBotParsingTests(unittest.TestCase):
     def test_extract_message_text_from_feishu_json(self) -> None:
-        self.assertEqual(_extract_message_text('{"text": " /status "}'), "/status")
+        self.assertEqual(extract_message_text('{"text": " /status "}'), "/status")
 
-    def test_strip_bot_mention(self) -> None:
-        self.assertEqual(_strip_bot_mention("@机器人 /run"), "/run")
+    def teststrip_bot_mention(self) -> None:
+        self.assertEqual(strip_bot_mention("@机器人 /run"), "/run")
 
-    def test_extract_card_value_from_dict(self) -> None:
-        self.assertEqual(_extract_card_value(FakeData({"action": "apply_draft"}))["action"], "apply_draft")
+    def test_extract_card_action_value_from_dict(self) -> None:
+        self.assertEqual(extract_card_action_value(FakeData({"action": "apply_draft"}))["action"], "apply_draft")
 
-    def test_extract_card_value_from_json_string(self) -> None:
-        self.assertEqual(_extract_card_value(FakeData('{"action": "cancel_draft"}'))["action"], "cancel_draft")
+    def test_extract_card_action_value_from_json_string(self) -> None:
+        self.assertEqual(extract_card_action_value(FakeData('{"action": "cancel_draft"}'))["action"], "cancel_draft")
 
-    def test_extract_card_value_merges_form_values(self) -> None:
+    def test_extract_card_action_value_merges_form_values(self) -> None:
         data = Mock()
         data.event.action.value = {"action": "model_apply_connection_model"}
         data.event.action.form_value = {
@@ -187,26 +186,26 @@ class FeishuBotParsingTests(unittest.TestCase):
             "model_id": {"value": "glm-4-flash"},
         }
 
-        value = _extract_card_value(data)
+        value = extract_card_action_value(data)
 
         self.assertEqual(value["action"], "model_apply_connection_model")
         self.assertEqual(value["form_value"]["target"]["value"], "arbiter")
         self.assertEqual(value["target"]["value"], "arbiter")
 
-    def test_extract_card_value_reads_component_callback_fields(self) -> None:
+    def test_extract_card_action_value_reads_component_callback_fields(self) -> None:
         data = Mock()
         data.event.action.value = {"field": "connection"}
         data.event.action.name = None
         data.event.action.option = "glm"
         data.event.action.tag = "select_static"
 
-        value = _extract_card_value(data)
+        value = extract_card_action_value(data)
 
         self.assertEqual(value["value"]["field"], "connection")
         self.assertEqual(value["option"], "glm")
         self.assertEqual(value["tag"], "select_static")
 
-    def test_extract_card_value_preserves_empty_input_value(self) -> None:
+    def test_extract_card_action_value_preserves_empty_input_value(self) -> None:
         data = Mock()
         data.event.action.value = {}
         data.event.action.name = "model_id"
@@ -214,7 +213,7 @@ class FeishuBotParsingTests(unittest.TestCase):
         data.event.action.input_value = ""
         data.event.action.tag = "input"
 
-        value = _extract_card_value(data)
+        value = extract_card_action_value(data)
 
         self.assertEqual(value["name"], "model_id")
         self.assertIn("input_value", value)
@@ -490,7 +489,7 @@ class FeishuBotParsingTests(unittest.TestCase):
                 patch.object(
                     bot,
                     "_start_draft_processing",
-                    return_value=DraftProcessingMessage(message_id="om_processing"),
+                    return_value=DraftProgressCard(message_id="om_processing"),
                 ),
                 patch.object(bot, "_stop_draft_processing", return_value=False),
                 patch("smzdm_notice.feishu.bot.build_message_draft", return_value=generated),
@@ -568,7 +567,7 @@ class FeishuBotParsingTests(unittest.TestCase):
                 )
             )
 
-            with patch("smzdm_notice.feishu.bot.update_deal_feedback_card", return_value=mock_card) as update_card:
+            with patch("smzdm_notice.feishu.bot.update_deal_card_feedback_state", return_value=mock_card) as update_card:
                 first = bot._handle_memory_feedback("deal_good", {"article_id": "1001"}, "om_deal")
                 second = bot._handle_memory_feedback("deal_not_worth", {"article_id": "1001"}, "om_deal")
                 third = bot._handle_memory_feedback("deal_not_worth", {"article_id": "1001"}, "om_deal")
@@ -599,7 +598,7 @@ class FeishuBotParsingTests(unittest.TestCase):
                 )
             )
 
-            with patch("smzdm_notice.feishu.bot.update_deal_feedback_card", return_value=mock_card) as update_card:
+            with patch("smzdm_notice.feishu.bot.update_deal_card_feedback_state", return_value=mock_card) as update_card:
                 result = bot._handle_memory_feedback(
                     "deal_not_worth_reason",
                     {"article_id": "1001", "form_value": {NOT_WORTH_REASON_FIELD: {"value": "价格一般"}}},
@@ -630,7 +629,7 @@ class FeishuBotParsingTests(unittest.TestCase):
                 )
             )
 
-            with patch("smzdm_notice.feishu.bot.update_deal_feedback_card", return_value=None):
+            with patch("smzdm_notice.feishu.bot.update_deal_card_feedback_state", return_value=None):
                 result = bot._handle_memory_feedback(
                     "deal_not_worth_reason",
                     {"article_id": "1001", "form_value": {NOT_WORTH_REASON_FIELD: {"value": ""}}},
@@ -875,6 +874,7 @@ class FeishuBotParsingTests(unittest.TestCase):
                 )
             )
 
+            # 为匹配 send_draft_preview 签名，这里保留 reply_to_message_id；测试替身只需要写回 message_id。
             def send_preview(draft, **_kwargs):
                 draft.preview_message_id = "om_revised"
                 return True
@@ -940,7 +940,7 @@ class FeishuBotParsingTests(unittest.TestCase):
                 patch("smzdm_notice.feishu.bot.update_draft_preview", side_effect=update_preview) as update_preview_fn,
                 patch("smzdm_notice.feishu.bot.disable_draft_card") as disable_card,
             ):
-                bot._handle_draft_revision("说得更具体一点", original, FakeMessageData(), "om_reply")
+                bot._handle_draft_revision("说得更具体一点", original, "om_reply")
 
             build_revision.assert_called_once_with("说得更具体一点", original, draft_store)
             update_preview_fn.assert_called_once_with("om_revision_processing", revised)
@@ -1091,6 +1091,7 @@ class FeishuBotParsingTests(unittest.TestCase):
                 )
             )
 
+            # 为匹配 send_draft_preview 签名，这里保留 reply_to_message_id；测试替身只需要写回 message_id。
             def send_preview(draft, **_kwargs):
                 draft.preview_message_id = "om_deal"
                 return True
@@ -1238,7 +1239,7 @@ class FeishuBotParsingTests(unittest.TestCase):
                 patch("smzdm_notice.feishu.bot.send_draft_preview", return_value=False),
                 patch("smzdm_notice.feishu.bot.send_text") as send_text,
             ):
-                bot._handle_draft_revision("再具体一点", original, FakeMessageData())
+                bot._handle_draft_revision("再具体一点", original)
 
             self.assertEqual(draft_store.get("original-draft").status, "pending")
             self.assertEqual(draft_store.get("revised-draft").status, "cancelled")
@@ -1436,7 +1437,7 @@ class FeishuBotParsingTests(unittest.TestCase):
 
 
 class FeishuModelCommandTests(unittest.TestCase):
-    def test_model_management_card_defaults_to_default_target(self) -> None:
+    def test_build_model_management_card_response_defaults_to_default_target(self) -> None:
         card = build_model_management_card(_model_card_state())
         serialized = json.dumps(card, ensure_ascii=False)
 
@@ -1446,7 +1447,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         self.assertIn("input", serialized)
         self.assertIn("切换 model_id", serialized)
         self.assertNotIn("切换 connection + model", serialized)
-        # elements: [markdown, hr, hint_markdown, select_action, input_action, ...]
+        # 元素顺序：[markdown, hr, hint_markdown, select_action, input_action, ...]
         select_actions = card["elements"][3]["actions"]
         self.assertEqual(select_actions[0]["value"], {"field": "target"})
         self.assertEqual(select_actions[1]["value"], {"field": "connection"})
@@ -1457,7 +1458,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         input_actions = card["elements"][4]["actions"]
         self.assertEqual(input_actions[0]["default_value"], "deepseek-chat")
 
-    def test_model_management_card_builds_target_options_from_agents_state(self) -> None:
+    def test_build_model_management_card_response_builds_target_options_from_agents_state(self) -> None:
         state = _model_card_state()
         state["agents"].append(
             {
@@ -1699,7 +1700,7 @@ class FeishuModelCommandTests(unittest.TestCase):
             patch("smzdm_notice.feishu.bot.llm_routing.resolve", return_value=resolved_arbiter),
             patch.dict("os.environ", {"LLM_GLM_API_KEY": "key"}),
         ):
-            # Target change returns a card (auto-populate), not None
+            # 切换 target 会返回一张自动填充后的卡片，而不是 None。
             target_result = bot._handle_card_action(component_event("target", option="arbiter"))
             self.assertIsNotNone(target_result)
             connection_result = bot._handle_card_action(component_event("connection", option="glm"))
@@ -2065,7 +2066,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         )
 
         with (
-            patch("smzdm_notice.feishu.bot._apply_model_card_action", side_effect=RuntimeError("boom")),
+            patch("smzdm_notice.feishu.bot._apply_model_route_card_action", side_effect=RuntimeError("boom")),
             patch("smzdm_notice.feishu.bot.llm_routing.model_card_state", return_value=_model_card_state()),
         ):
             result = bot._dispatch_card_action(
@@ -2239,7 +2240,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         self.assertEqual(captured["extra_body"], {"do_sample": False})
         self.assertEqual(captured["timeout"], 30)
 
-    def test_model_management_card_pre_populates_from_form_state(self) -> None:
+    def test_build_model_management_card_response_pre_populates_from_form_state(self) -> None:
         form_state = {
             "target": "filter",
             "connection": "deepseek",
@@ -2256,7 +2257,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         self.assertNotIn("仅切换模型", serialized)
         self.assertNotIn("应用全部设置", serialized)
 
-        # elements: [markdown, hr, hint_markdown, select_action, input_action, ...]
+        # 元素顺序：[markdown, hr, hint_markdown, select_action, input_action, ...]
         select_actions = card["elements"][3]["actions"]
         self.assertEqual(select_actions[0]["initial_option"], "filter")
         self.assertEqual(select_actions[1]["initial_option"], "deepseek")
@@ -2265,7 +2266,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         self.assertEqual(input_actions[0]["default_value"], "deepseek-chat")
         self.assertEqual(input_actions[1]["default_value"], "0.3")
 
-    def test_model_management_card_preserves_empty_input_defaults(self) -> None:
+    def test_build_model_management_card_response_preserves_empty_input_defaults(self) -> None:
         form_state = {
             "target": "filter",
             "connection": "deepseek",
@@ -2278,7 +2279,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         self.assertEqual(input_actions[0]["default_value"], "")
         self.assertEqual(input_actions[1]["default_value"], "")
 
-    def test_model_management_card_shows_connection_model_button_when_connection_changes(self) -> None:
+    def test_build_model_management_card_response_shows_connection_model_button_when_connection_changes(self) -> None:
         form_state = {
             "target": "filter",
             "connection": "glm",
@@ -2292,7 +2293,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         route_actions = card["elements"][5]["actions"]
         self.assertEqual(route_actions[0]["value"]["action"], "model_apply_connection_model")
 
-    def test_model_management_card_ignores_invalid_initial_option(self) -> None:
+    def test_build_model_management_card_response_ignores_invalid_initial_option(self) -> None:
         form_state = {
             "target": "filter",
             "connection": "nonexistent_connection",
@@ -2302,7 +2303,7 @@ class FeishuModelCommandTests(unittest.TestCase):
 
         select_actions = card["elements"][3]["actions"]
         self.assertEqual(select_actions[0]["initial_option"], "filter")
-        # invalid connection should be skipped
+        # 无效 connection 应被跳过。
         self.assertNotIn("initial_option", select_actions[1])
 
     def test_target_change_auto_populates_agent_fields(self) -> None:
@@ -2326,7 +2327,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         data.event.operator.open_id = "ou_real_open_id"
         data.event.context.open_message_id = "om_card"
 
-        resolved_filter = _model_test_config()  # filter agent config
+        resolved_filter = _model_test_config()  # 表示 filter agent 配置
 
         with (
             patch("smzdm_notice.feishu.bot.llm_routing.resolve", return_value=resolved_filter) as resolve,
@@ -2336,7 +2337,7 @@ class FeishuModelCommandTests(unittest.TestCase):
 
         resolve.assert_called_once_with("filter")
         self.assertIsNotNone(result)
-        # The response card should have pre-populated fields
+        # 响应卡片应带有预填充字段。
         card_data = result.card.data
         card_json = json.dumps(card_data, ensure_ascii=False)
         self.assertIn("deepseek", card_json)
@@ -2405,7 +2406,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         self.assertIsNotNone(result)
         card_data = result.card.data
         card_json = json.dumps(card_data, ensure_ascii=False)
-        # defaults from _model_card_state: connection=deepseek, model_id=deepseek-chat
+        # 默认值来自 _model_card_state：connection=deepseek，model_id=deepseek-chat。
         self.assertIn("deepseek", card_json)
 
     def test_target_change_preserves_manually_set_fields(self) -> None:
@@ -2437,18 +2438,18 @@ class FeishuModelCommandTests(unittest.TestCase):
             patch("smzdm_notice.feishu.bot.llm_routing.resolve", return_value=resolved_filter),
             patch("smzdm_notice.feishu.bot.llm_routing.model_card_state", return_value=_model_card_state()),
         ):
-            # First manually set route fields.
+            # 先手动设置路由字段。
             connection_result = bot._handle_card_action(component_event("connection", option="glm"))
             self.assertIsNotNone(connection_result)
             self.assertIsNone(bot._handle_card_action(component_event("model_id", input_value="custom-model")))
             self.assertIsNone(bot._handle_card_action(component_event("temperature", input_value="0.9")))
-            # Then change target. User-selected route fields must survive the target switch.
+            # 再切换 target。用户选择的路由字段必须在切换后保留。
             result = bot._handle_card_action(component_event("target", option="filter"))
 
         self.assertIsNotNone(result)
         card_data = result.card.data
         card_json = json.dumps(card_data, ensure_ascii=False)
-        # User's manual connection/model/temperature should be preserved.
+        # 应保留用户手动设置的 connection/model/temperature。
         self.assertIn("glm", card_json)
         self.assertIn("custom-model", card_json)
         self.assertIn("0.9", card_json)

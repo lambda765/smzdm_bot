@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Callable
 
 from loguru import logger
 
@@ -150,16 +149,3 @@ def _is_stale_search_row(row: dict, now: float) -> bool:
     except (TypeError, ValueError):
         return False
     return timestamp < now - SEARCH_STALE_SECONDS
-
-
-def fetch_all_searches(
-    keywords: list[str],
-    top_n: int = 20,
-    interval_seconds: int = 5,
-    should_stop: Callable[[], bool] | None = None,
-) -> list[RankingItem]:
-    """抓取多个关键词搜索结果。"""
-    from smzdm_notice.smzdm.sources import fetch_sources
-
-    sources = [(f"搜索-{keyword}", lambda keyword=keyword: get_search(keyword, top_n)) for keyword in keywords]
-    return fetch_sources(sources, interval_seconds=interval_seconds, should_stop=should_stop)

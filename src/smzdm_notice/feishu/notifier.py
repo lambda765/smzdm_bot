@@ -226,10 +226,6 @@ def _send_card_to_message_id(receive_id_type: str, receive_id: str, card: Card) 
         return None
 
 
-def send_card_to(receive_id_type: str, receive_id: str, card: Card) -> bool:
-    return _send_card_to_message_id(receive_id_type, receive_id, card) is not None
-
-
 def send_deals(
     items: list[tuple[RankingItem, str]],
     price_bypass_article_ids: set[str] | None = None,
@@ -242,7 +238,7 @@ def send_deals(
     message_id = _send_card_message_id(card)
     if not message_id:
         return False
-    _remember_deal_card(message_id, card)
+    _cache_deal_card_snapshot(message_id, card)
     return True
 
 
@@ -258,7 +254,7 @@ def _build_deals_card(
         {"tag": "hr"},
     ]
     for item, reason in items:
-        elements.extend(_deal_item_elements(item, reason, item.article_id in price_bypass_article_ids))
+        elements.extend(_build_deal_item_elements(item, reason, item.article_id in price_bypass_article_ids))
     return {
         "config": {"update_multi": True},
         "header": {
@@ -269,7 +265,8 @@ def _build_deals_card(
     }
 
 
-def _deal_item_elements(item: RankingItem, reason: str, is_price_bypass: bool) -> list[Card]:
+def _build_deal_item_elements(item: RankingItem, reason: str, is_price_bypass: bool) -> list[Card]:
+    """构造单个好价商品行，包含长期偏好反馈和当前偏好操作。"""
     image_key = get_feishu_image_key(item.pic) if item.pic else ""
     elements: list[Card] = [{"tag": "markdown", "content": "\n".join(_deal_markdown_lines(item, reason, image_key))}]
     if image_key:
@@ -323,8 +320,17 @@ def _memory_action_buttons_from_value(
     return buttons
 
 
-def update_deal_feedback_card(message_id: str, article_id: str, selected: str = "", reason: str = "") -> Card | None:
-    """Update a cached deal card's feedback button state. Returns the updated card or None."""
+def update_deal_card_feedback_state(
+    message_id: str,
+    article_id: str,
+    selected: str = "",
+    reason: str = "",
+) -> Card | None:
+    """用 PATCH 更新已缓存的好价卡片快照，反映用户的 Deal Memory 反馈。
+
+    该缓存刻意保持为进程内状态：它只用于 PATCH 当前进程早先发出的卡片，
+    持久反馈仍由 DealMemory 保存。
+    """
     if not message_id or not article_id:
         return None
     cached = _DEAL_CARD_CACHE.get(message_id)
@@ -332,14 +338,15 @@ def update_deal_feedback_card(message_id: str, article_id: str, selected: str = 
         return None
 
     updated = deepcopy(cached)
-    if not _set_deal_feedback_selected(updated, article_id, selected, reason=reason):
+    if not _apply_deal_feedback_state_to_card(updated, article_id, selected, reason=reason):
         return None
-    update_card_message(message_id, updated)  # best-effort PATCH
-    _remember_deal_card(message_id, updated)
+    update_card_message(message_id, updated)  # 尽力 PATCH，失败不影响已记录的反馈
+    _cache_deal_card_snapshot(message_id, updated)
     return updated
 
 
-def _set_deal_feedback_selected(card: Card, article_id: str, selected: str, reason: str = "") -> bool:
+def _apply_deal_feedback_state_to_card(card: Card, article_id: str, selected: str, reason: str = "") -> bool:
+    """原地重写匹配商品的 action 行和相邻状态文本。"""
     elements = card.get("elements", [])
     for idx, element in enumerate(elements):
         if element.get("tag") != "action":
@@ -416,7 +423,8 @@ def _memory_row_value(actions: list[Card], article_id: str) -> Card | None:
     return None
 
 
-def _remember_deal_card(message_id: str, card: Card) -> None:
+def _cache_deal_card_snapshot(message_id: str, card: Card) -> None:
+    """记住最近发送的卡片正文，便于后续反馈操作 PATCH。"""
     _DEAL_CARD_CACHE[message_id] = deepcopy(card)
     _DEAL_CARD_CACHE.move_to_end(message_id)
     while len(_DEAL_CARD_CACHE) > _DEAL_CARD_CACHE_MAX:
@@ -545,7 +553,7 @@ def send_config_warning(message: str) -> bool:
 
 
 def build_help_card(help_content: str) -> Card:
-    """Build the shortcut help card."""
+    """构造快捷命令帮助卡片。"""
     return {
         "header": {
             "title": {"tag": "plain_text", "content": "好价监控 · 快捷命令"},
@@ -555,187 +563,8 @@ def build_help_card(help_content: str) -> Card:
     }
 
 
-def build_model_management_card(state: Mapping[str, Any], form_state: Mapping[str, str] | None = None) -> Card:
-    """Build the interactive LLM routing management card."""
-    form_state = form_state or default_model_form_state(state)
-    target_options = _model_target_options(state)
-    connection_options = [
-        _select_option(
-            f"{conn.get('name')} ({conn.get('label')}, {'key ok' if conn.get('key_configured') else 'key missing'})",
-            str(conn.get("name") or ""),
-        )
-        for conn in state.get("connections", [])
-    ]
-    target_initial = _valid_initial_option(form_state, "target", target_options)
-    connection_initial = _valid_initial_option(form_state, "connection", connection_options)
-    primary_route_button = _model_primary_route_button(state, form_state)
-    return {
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "LLM 模型路由"},
-            "template": "blue",
-        },
-        "elements": [
-            {"tag": "markdown", "content": _model_management_markdown(state)},
-            {"tag": "hr"},
-            {
-                "tag": "markdown",
-                "content": "💡 先选择「作用范围」，再填写参数，最后点击按钮执行操作。",
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    _select_static("target", "选择作用范围", target_options, {"field": "target"}, initial_option=target_initial),
-                    _select_static("connection", "选择连接", connection_options, {"field": "connection"}, initial_option=connection_initial),
-                ],
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    _input("model_id", "model_id，例如 deepseek-chat", default_value=form_state.get("model_id")),
-                    _input("temperature", "temperature，0 到 5", default_value=form_state.get("temperature")),
-                ],
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    primary_route_button,
-                    _card_button("设置温度", "model_set_temperature", "default"),
-                ],
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    _card_button(
-                        "恢复默认",
-                        "model_reset_agent",
-                        "danger",
-                        confirm={
-                            "title": {"tag": "plain_text", "content": "确认恢复默认？"},
-                            "content": {"tag": "plain_text", "content": "将清除该 agent 的自定义设置，恢复为继承默认配置。"},
-                        },
-                    ),
-                    _card_button("发送测试", "model_test", "default"),
-                    _card_button("刷新状态", "model_refresh", "default"),
-                ],
-            },
-        ],
-    }
-
-
-def _model_primary_route_button(state: Mapping[str, Any], form_state: Mapping[str, str]) -> dict:
-    current_connection = _current_model_connection(state, form_state)
-    selected_connection = str(form_state.get("connection") or _default_model_connection(state)).strip()
-    if selected_connection and selected_connection != current_connection:
-        return _card_button("切换 connection + model", "model_apply_connection_model", "primary")
-    return _card_button("切换 model_id", "model_apply_model", "primary")
-
-
-def _model_target_options(state: Mapping[str, Any]) -> list[dict]:
-    options = [_select_option("默认配置", "default")]
-    for agent in state.get("agents", []):
-        if not isinstance(agent, Mapping):
-            continue
-        name = str(agent.get("name") or "").strip()
-        if name:
-            options.append(_select_option(name, name))
-    return options
-
-
-def default_model_form_state(state: Mapping[str, Any]) -> dict[str, str]:
-    defaults = state.get("defaults", {})
-    if not isinstance(defaults, Mapping):
-        return {"target": "default"}
-    result = {
-        "target": "default",
-        "connection": str(defaults.get("connection") or ""),
-        "model_id": str(defaults.get("model_id") or ""),
-    }
-    temperature = defaults.get("temperature")
-    if temperature is not None and temperature != "":
-        result["temperature"] = str(temperature)
-    return result
-
-
-def _current_model_connection(state: Mapping[str, Any], form_state: Mapping[str, str]) -> str:
-    target = str(form_state.get("target") or "default").strip()
-    if target == "default":
-        return _default_model_connection(state)
-    for agent in state.get("agents", []):
-        if isinstance(agent, Mapping) and agent.get("name") == target:
-            return str(agent.get("connection") or "").strip()
-    return _default_model_connection(state)
-
-
-def _default_model_connection(state: Mapping[str, Any]) -> str:
-    defaults = state.get("defaults", {})
-    if not isinstance(defaults, Mapping):
-        return ""
-    return str(defaults.get("connection") or "").strip()
-
-
-def _model_management_markdown(state: Mapping[str, Any]) -> str:
-    defaults = state.get("defaults", {})
-    if not isinstance(defaults, Mapping):
-        defaults = {}
-    lines = [
-        f"**默认配置**：`{defaults.get('connection')}/{defaults.get('model_id')}`"
-        + _temperature_text(defaults.get("temperature")),
-        "",
-        "**Agents**",
-    ]
-    for agent in state.get("agents", []):
-        if not isinstance(agent, Mapping):
-            continue
-        inherited = []
-        if agent.get("inherits_connection"):
-            inherited.append("connection")
-        if agent.get("inherits_model"):
-            inherited.append("model")
-        suffix = f"（继承 {'/'.join(inherited)}）" if inherited else ""
-        lines.append(
-            f"- `{agent.get('name')}`: `{agent.get('connection')}/{agent.get('model_id')}`"
-            f"{_temperature_text(agent.get('temperature'))} {suffix}".rstrip()
-        )
-    lines.extend(["", "**Connections**"])
-    for conn in state.get("connections", []):
-        if not isinstance(conn, Mapping):
-            continue
-        key_status = "ok" if conn.get("key_configured") else "missing key"
-        lines.append(
-            f"- `{conn.get('name')}`: {conn.get('label')}，{conn.get('provider')}，{conn.get('base_url_host')}，{key_status}"
-        )
-    return "\n".join(lines)
-
-
-def _temperature_text(value: Any) -> str:
-    if value is None or value == "":
-        return ""
-    return f"，temperature `{value}`"
-
-
 def _plain_text(content: str) -> dict:
     return {"tag": "plain_text", "content": content}
-
-
-def _select_option(label: str, value: str) -> dict:
-    return {"text": _plain_text(label), "value": value}
-
-
-def _select_static(
-    name: str, placeholder: str, options: list[dict], value: dict | None = None, initial_option: str | None = None,
-) -> dict:
-    payload: dict = {
-        "tag": "select_static",
-        "name": name,
-        "placeholder": _plain_text(placeholder),
-        "options": options,
-    }
-    if value:
-        payload["value"] = value
-    if initial_option:
-        payload["initial_option"] = initial_option
-    return payload
 
 
 def _input(name: str, placeholder: str, default_value: str | None = None) -> dict:
@@ -747,15 +576,6 @@ def _input(name: str, placeholder: str, default_value: str | None = None) -> dic
     if default_value is not None:
         payload["default_value"] = default_value
     return payload
-
-
-def _valid_initial_option(form_state: Mapping[str, str], key: str, options: list[dict]) -> str | None:
-    """Return the form_state value for *key* only if it matches an existing option value."""
-    value = form_state.get(key)
-    if not value:
-        return None
-    valid_values = {opt.get("value") for opt in options}
-    return value if value in valid_values else None
 
 
 def _card_button(label: str, action: str, button_type: str, confirm: dict | None = None) -> dict:
@@ -771,7 +591,7 @@ def _card_button(label: str, action: str, button_type: str, confirm: dict | None
 
 
 def send_help(help_content: str, reply_to_message_id: str = "") -> bool:
-    """Send shortcut help as a card."""
+    """以卡片形式发送快捷命令帮助。"""
     card = build_help_card(help_content)
     if reply_to_message_id:
         msg_id = reply_card(reply_to_message_id, card)

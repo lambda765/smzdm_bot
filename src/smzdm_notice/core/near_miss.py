@@ -1,4 +1,4 @@
-"""Near-miss 商品存储模块。
+"""用于 near-miss 商品的存储模块。
 
 存储 LLM 认为是好价但因用户偏好而跳过的商品，
 供夜间汇总推送。
@@ -12,6 +12,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from smzdm_notice.core.json_store import read_json_file, write_json_file
 from smzdm_notice.smzdm.ranking import RankingItem
 
 _STORE_META_KEY = "__meta__"
@@ -39,7 +40,7 @@ def _serialize_item(item: RankingItem, skip_reason: str, timestamp: float) -> di
 
 
 class NearMissManager:
-    """Near-miss 商品管理器。"""
+    """管理 near-miss 商品。"""
 
     def __init__(self, filepath: str, expire_hours: int = 24) -> None:
         self._filepath = Path(filepath)
@@ -51,8 +52,7 @@ class NearMissManager:
         """从文件加载。"""
         if self._filepath.exists():
             try:
-                with open(self._filepath, encoding="utf-8") as f:
-                    self._store = json.load(f)
+                self._store = read_json_file(self._filepath)
                 # 分离元数据
                 self._meta = self._store.pop(_STORE_META_KEY, {})
                 logger.debug(f"加载 near-miss 缓存: {len(self._store)} 条记录")
@@ -66,10 +66,8 @@ class NearMissManager:
 
     def _save(self) -> None:
         """保存到文件。"""
-        self._filepath.parent.mkdir(parents=True, exist_ok=True)
         data = {**self._store, _STORE_META_KEY: self._meta}
-        with open(self._filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        write_json_file(self._filepath, data)
 
     def _cleanup(self) -> None:
         """清理过期记录。"""
@@ -124,11 +122,6 @@ class NearMissManager:
     def get_last_digest_date(self) -> str:
         """获取上次发送汇总的日期。"""
         return self._meta.get("last_digest_date", "")
-
-    def set_last_digest_date(self, date_str: str) -> None:
-        """设置上次发送汇总的日期。"""
-        self._meta["last_digest_date"] = date_str
-        self._save()
 
     def clear_and_set_digest_date(self, date_str: str) -> None:
         """清空所有条目并记录汇总日期，只写入一次文件。"""

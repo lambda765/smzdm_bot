@@ -1,4 +1,4 @@
-"""Module execution entrypoint."""
+"""模块执行入口。"""
 
 from __future__ import annotations
 

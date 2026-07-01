@@ -1,4 +1,4 @@
-"""LLM 商品筛选与仲裁数据模型。"""
+"""商品筛选与仲裁使用的 LLM 数据模型。"""
 
 from __future__ import annotations
 
@@ -6,20 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from loguru import logger
-from pydantic import BaseModel, Field
-
-try:
-    from pydantic import field_validator as _pydantic_field_validator
-except ImportError:  # pragma: no cover - exercised only with Pydantic v1.
-    from pydantic import validator as _pydantic_validator
-
-    def _field_validator(*fields: str, mode: str = "after"):
-        return _pydantic_validator(*fields, pre=mode == "before")
-
-else:
-
-    def _field_validator(*fields: str, mode: str = "after"):
-        return _pydantic_field_validator(*fields, mode=mode)
+from pydantic import BaseModel, Field, field_validator
 
 from smzdm_notice.smzdm.ranking import RankingItem
 
@@ -33,7 +20,7 @@ class DecisionContext(BaseModel):
     threshold_adjustment: str = ""
     context_summary: str = ""
 
-    @_field_validator("need_state", "inventory_basis", "threshold_adjustment", "context_summary", mode="before")
+    @field_validator("need_state", "inventory_basis", "threshold_adjustment", "context_summary", mode="before")
     def _normalize_text_field(cls, value: object) -> str:
         if isinstance(value, str):
             return value
@@ -41,7 +28,7 @@ class DecisionContext(BaseModel):
             logger.warning(f"LLM 推荐 decision_context 文本字段类型异常，已降级为空: {type(value).__name__}")
         return ""
 
-    @_field_validator("preference_basis", mode="before")
+    @field_validator("preference_basis", mode="before")
     def _normalize_preference_basis(cls, value: object) -> object:
         if isinstance(value, str):
             return [value]
@@ -58,7 +45,7 @@ class Recommendation(BaseModel):
     category: str = ""
     decision_context: DecisionContext = Field(default_factory=DecisionContext)
 
-    @_field_validator("category", mode="before")
+    @field_validator("category", mode="before")
     def _normalize_category(cls, value: object) -> str:
         if isinstance(value, str):
             return value
@@ -66,7 +53,7 @@ class Recommendation(BaseModel):
             logger.warning(f"LLM 推荐 category 类型异常，已降级为未分类: {type(value).__name__}")
         return ""
 
-    @_field_validator("decision_context", mode="before")
+    @field_validator("decision_context", mode="before")
     def _normalize_decision_context(cls, value: object) -> object:
         if value is None or isinstance(value, (dict, DecisionContext)):
             return value
@@ -82,7 +69,7 @@ class NearMiss(BaseModel):
 
 
 class FilterResult(BaseModel):
-    """LLM 筛选结果。"""
+    """表示 LLM 筛选结果。"""
 
     recommendations: list[Recommendation] = []
     near_misses: list[NearMiss] = []
@@ -102,14 +89,10 @@ class LLMCallOutcome:
     result: LLMCallResult | None = None
     error_summary: str = ""
 
-    @property
-    def succeeded(self) -> bool:
-        return self.result is not None
-
 
 @dataclass
 class FilterDiagnostics:
-    """LLM 筛选诊断信息。"""
+    """表示 LLM 筛选诊断信息。"""
 
     llm_failed: bool = False
     error_summary: str | None = None
@@ -137,4 +120,4 @@ class ArbiterInfo(BaseModel):
     result_a: FilterResult
     result_b: FilterResult
     items: dict[str, dict] = Field(default_factory=dict)
-    config_change_draft: Optional[dict] = None  # noqa: UP045 - Pydantic needs this on Python 3.9.
+    config_change_draft: Optional[dict] = None  # noqa: UP045 - 在 Python 3.9 下 Pydantic 需要这种写法。

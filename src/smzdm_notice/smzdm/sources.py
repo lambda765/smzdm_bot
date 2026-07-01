@@ -1,4 +1,4 @@
-"""Unified SMZDM item source aggregation."""
+"""什么值得买商品来源统一聚合。"""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def fetch_sources(
     interval_seconds: int = 5,
     should_stop: Callable[[], bool] | None = None,
 ) -> list[RankingItem]:
-    """Fetch item lists from named sources with interruptible spacing."""
+    """按来源名抓取商品列表，并在来源之间支持可中断等待。"""
     all_items: list[RankingItem] = []
     for i, (name, fetcher) in enumerate(sources):
         if should_stop and should_stop():
@@ -47,7 +47,7 @@ def fetch_all_sources(
     interval_seconds: int = 5,
     should_stop: Callable[[], bool] | None = None,
 ) -> list[RankingItem]:
-    """Fetch configured ranking and keyword-search sources."""
+    """抓取已配置的榜单来源和关键词搜索来源。"""
     if search_rules is None:
         search_rules = [SearchKeywordRule(keyword) for keyword in (search_keywords or [])]
     sources: list[tuple[str, ItemFetcher]] = [

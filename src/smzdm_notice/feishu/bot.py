@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from dataclasses import dataclass
@@ -12,7 +11,21 @@ from loguru import logger
 
 from smzdm_notice.core import config
 from smzdm_notice.feishu.binding import FeishuBindingStore
+from smzdm_notice.feishu.card_payload import (
+    apply_model_form_cache_patch,
+    build_model_card_form_patch,
+    extract_card_action_value,
+    extract_message_text,
+    model_card_field_from_callback,
+    model_card_form_cache_key,
+    optional_card_field_value,
+    optional_model_card_field_value,
+    replace_model_form_cache_values,
+    strip_bot_mention,
+    trim_model_card_form_cache,
+)
 from smzdm_notice.feishu.commands import find_command_spec, help_markdown
+from smzdm_notice.feishu.model_cards import build_model_management_card, default_model_form_state
 from smzdm_notice.feishu.notifier import (
     ARBITRATION_CARD_KIND,
     ARBITRATION_CARD_METADATA_KEY,
@@ -21,8 +34,6 @@ from smzdm_notice.feishu.notifier import (
     build_disabled_draft_card,
     build_draft_failure_card,
     build_draft_processing_card,
-    build_model_management_card,
-    default_model_form_state,
     disable_draft_card,
     reply_card,
     reply_text,
@@ -32,7 +43,7 @@ from smzdm_notice.feishu.notifier import (
     send_text,
     send_text_to,
     update_card_message,
-    update_deal_feedback_card,
+    update_deal_card_feedback_state,
     update_draft_preview,
 )
 from smzdm_notice.feishu.sdk import (
@@ -40,6 +51,13 @@ from smzdm_notice.feishu.sdk import (
     get_lark_client,
     get_lark_module,
     get_message_reaction_models,
+)
+from smzdm_notice.feishu.search_actions import (
+    handle_search_card_action,
+    handle_search_command,
+)
+from smzdm_notice.feishu.search_actions import (
+    search_usage_text as _search_usage_text,
 )
 from smzdm_notice.llm import routing as llm_routing
 from smzdm_notice.llm.clients import get_client_for_config
@@ -49,11 +67,15 @@ from smzdm_notice.llm.errors import (
     RETRYABLE_OPENAI_ERRORS,
     error_summary,
 )
-from smzdm_notice.llm.routing import AGENTS, LLMRoutingError, ResolvedLLMConfig, build_chat_completion_kwargs
+from smzdm_notice.llm.routing import (
+    AGENTS,
+    LLMRoutingError,
+    ResolvedLLMConfig,
+    build_chat_completion_kwargs,
+)
 from smzdm_notice.preferences.builder import build_deal_action_draft, build_message_draft, build_revision_draft
 from smzdm_notice.preferences.models import ConfigDraft
 from smzdm_notice.preferences.store import DraftStore
-from smzdm_notice.smzdm import keywords as search_keywords
 
 DRAFT_PROGRESS_INTERVAL_SECONDS = 15
 INTERNAL_ERROR_MESSAGE = "处理消息时遇到内部错误，请稍后重试。"
@@ -99,19 +121,25 @@ class BotRuntime:
 
 
 @dataclass
-class CardActionResult:
+class CardActionDispatchResult:
+    """卡片 action 分发结果，稍后会包装成 Feishu callback 响应。"""
+
     message: str
     response_card: dict | None = None
 
 
 @dataclass
-class ModelCardUpdateResult:
+class ModelRouteUpdateResult:
+    """模型卡片修改路由后的快照和 toast 文案。"""
+
     snapshot: llm_routing.RoutingSnapshot
     message: str
 
 
 @dataclass
-class DraftProcessingMessage:
+class DraftProgressCard:
+    """草案生成期间临时使用的处理中卡片及其刷新线程。"""
+
     message_id: str = ""
     stop_event: threading.Event | None = None
     thread: threading.Thread | None = None
@@ -156,10 +184,11 @@ class FeishuInteractiveBot:
             logger.error(f"飞书长连接机器人异常退出: {e}", exc_info=True)
 
     def _handle_message(self, data) -> None:
+        """接收 Feishu 消息事件，并把耗时工作交给后台线程。"""
         message_id = ""
         try:
             message = data.event.message
-            text = _extract_message_text(getattr(message, "content", ""))
+            text = extract_message_text(getattr(message, "content", ""))
             if not text:
                 return
             message_id = str(getattr(message, "message_id", "") or "")
@@ -229,7 +258,7 @@ class FeishuInteractiveBot:
             logger.warning(f"飞书消息 Get 表情回复异常: {e}")
 
     def _handle_text_command(self, text: str, data, parent_id: str = "", reply_to_message_id: str = "") -> None:
-        clean = _strip_bot_mention(text)
+        clean = strip_bot_mention(text)
         if _is_bind_command(clean):
             self._bind_current_conversation(data, reply_to_message_id)
             return
@@ -259,7 +288,7 @@ class FeishuInteractiveBot:
                         )
                     self._reply_text(reply_to_message_id, "该预览已超过 24 小时自动失效，请发新消息重新生成。")
                     return
-                self._handle_draft_revision(clean, original_draft, data, reply_to_message_id)
+                self._handle_draft_revision(clean, original_draft, reply_to_message_id)
                 return
             if not clean.startswith("/"):
                 self._reply_text(reply_to_message_id, "该回复引用的预览不存在或已失效，请发新消息重新生成。")
@@ -273,7 +302,7 @@ class FeishuInteractiveBot:
             processing_stopped = self._stop_draft_processing(processing)
             logger.error(f"配置草案生成失败: {e}", exc_info=True)
             self._finish_draft_processing_failure(
-                processing if processing_stopped else DraftProcessingMessage(),
+                processing if processing_stopped else DraftProgressCard(),
                 "处理消息失败，没能生成配置修改预览。",
                 reply_to_message_id,
                 INTERNAL_ERROR_MESSAGE,
@@ -282,7 +311,7 @@ class FeishuInteractiveBot:
         processing_stopped = self._stop_draft_processing(processing)
         if not draft:
             self._finish_draft_processing_failure(
-                processing if processing_stopped else DraftProcessingMessage(),
+                processing if processing_stopped else DraftProgressCard(),
                 "草案生成失败：没能理解这次偏好/库存修改。",
                 reply_to_message_id,
                 "草案生成失败：没能理解这次偏好/库存修改，请换一种更明确的说法重试。",
@@ -295,7 +324,6 @@ class FeishuInteractiveBot:
         self,
         text: str,
         original_draft: ConfigDraft,
-        data,
         reply_to_message_id: str = "",
     ) -> None:
         processing = self._start_draft_processing(reply_to_message_id, "正在根据修改意见生成新预览")
@@ -305,7 +333,7 @@ class FeishuInteractiveBot:
             processing_stopped = self._stop_draft_processing(processing)
             logger.error(f"配置草案修订失败: {e}", exc_info=True)
             self._finish_draft_processing_failure(
-                processing if processing_stopped else DraftProcessingMessage(),
+                processing if processing_stopped else DraftProgressCard(),
                 "处理修改意见失败，没能生成新的配置修改预览。",
                 reply_to_message_id,
                 INTERNAL_ERROR_MESSAGE,
@@ -314,7 +342,7 @@ class FeishuInteractiveBot:
         processing_stopped = self._stop_draft_processing(processing)
         if not revised:
             self._finish_draft_processing_failure(
-                processing if processing_stopped else DraftProcessingMessage(),
+                processing if processing_stopped else DraftProgressCard(),
                 "没能理解修改意见。",
                 reply_to_message_id,
                 "没能理解修改意见，请换一种说法重试，或发新消息重新生成。",
@@ -348,12 +376,13 @@ class FeishuInteractiveBot:
             self.runtime.draft_store.update(draft)
         return True
 
-    def _start_draft_processing(self, reply_to_message_id: str, stage: str) -> DraftProcessingMessage:
+    def _start_draft_processing(self, reply_to_message_id: str, stage: str) -> DraftProgressCard:
+        """可以回复消息时发送进度卡片，并启动刷新线程。"""
         if not reply_to_message_id:
-            return DraftProcessingMessage()
+            return DraftProgressCard()
         message_id = send_draft_processing(stage, reply_to_message_id=reply_to_message_id)
         if not message_id:
-            return DraftProcessingMessage()
+            return DraftProgressCard()
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._run_draft_processing_progress,
@@ -362,7 +391,7 @@ class FeishuInteractiveBot:
             daemon=True,
         )
         thread.start()
-        return DraftProcessingMessage(message_id, stop_event, thread)
+        return DraftProgressCard(message_id, stop_event, thread)
 
     def _run_draft_processing_progress(
         self,
@@ -371,11 +400,13 @@ class FeishuInteractiveBot:
         started_at: float,
         stop_event: threading.Event,
     ) -> None:
+        """在草案生成结束前持续刷新处理中卡片。"""
         while not stop_event.wait(DRAFT_PROGRESS_INTERVAL_SECONDS):
             elapsed_seconds = int(time.monotonic() - started_at)
             update_card_message(message_id, build_draft_processing_card(stage, elapsed_seconds))
 
-    def _stop_draft_processing(self, processing: DraftProcessingMessage) -> bool:
+    def _stop_draft_processing(self, processing: DraftProgressCard) -> bool:
+        """停止进度刷新线程；返回 False 表示线程可能仍会更新卡片。"""
         if processing.stop_event:
             processing.stop_event.set()
         if processing.thread:
@@ -385,7 +416,7 @@ class FeishuInteractiveBot:
 
     def _finish_draft_processing_failure(
         self,
-        processing: DraftProcessingMessage,
+        processing: DraftProgressCard,
         card_reason: str,
         reply_to_message_id: str,
         fallback_text: str,
@@ -449,15 +480,20 @@ class FeishuInteractiveBot:
             self._send_to_sender(data, "请先发送 /bind 完成绑定，后续通知会发到这个私聊。", reply_to_message_id)
 
     def _handle_card_action(self, data) -> object | None:
+        """鉴权并分发一次 Feishu 卡片 callback。
+
+        模型表单组件可能发出不含 action 的 callback；这类 callback 只更新
+        或重绘进程内表单缓存。
+        """
         reply_to_message_id = _card_open_message_id(data)
         try:
-            value = _extract_card_value(data)
+            value = extract_card_action_value(data)
             action = str(value.get("action") or "")
             operator = _extract_operator(data)
             card_token = str(getattr(getattr(data.event, "action", None), "token", "") or "")
             logger.info(f"收到飞书卡片操作: action={action}, operator={operator}, card_token={card_token}")
             if not action:
-                field = _model_card_field_from_callback(value)
+                field = model_card_field_from_callback(value)
                 if field in {"target", "connection", "model_id", "temperature"}:
                     if not self.runtime.binding_store.is_bound_operator(operator):
                         logger.debug(f"忽略未授权模型卡片表单变更: operator={operator}, field={field}")
@@ -483,7 +519,7 @@ class FeishuInteractiveBot:
             message = INTERNAL_ERROR_MESSAGE
             logger.error(f"处理卡片操作失败: {e}", exc_info=True)
             self._reply_text(reply_to_message_id, message)
-            result = CardActionResult(message)
+            result = CardActionDispatchResult(message)
         return _card_response(result.message, result.response_card)
 
     def _dispatch_card_action(
@@ -492,38 +528,35 @@ class FeishuInteractiveBot:
         value: dict,
         operator: str,
         reply_to_message_id: str,
-    ) -> CardActionResult:
+    ) -> CardActionDispatchResult:
+        """将归一化后的卡片 action 路由到对应功能处理器。"""
         if action == "apply_draft":
             return self._apply_draft_card_action(value, operator, reply_to_message_id)
         if action == "cancel_draft":
             return self._cancel_draft_card_action(value, operator, reply_to_message_id)
-        if action == "adopt_arbitration":
-            message = "这是旧版仲裁卡片，请等待下一次仲裁后直接在卡片中采纳配置修改。"
-            self._reply_text(reply_to_message_id, message)
-            return CardActionResult(message, build_disabled_arbitration_card("旧版卡片已失效"))
         if action == "ignore_arbitration":
             return self._ignore_arbitration_card_action(value, operator, reply_to_message_id)
         if action in {"deal_good", "deal_not_worth", "deal_not_worth_reason"}:
             return self._handle_memory_feedback(action, value, reply_to_message_id)
         if action in {"deal_ignore_category", "deal_stock_enough", "deal_follow"}:
             self._start_deal_action_worker(action, dict(value), reply_to_message_id)
-            return CardActionResult("正在生成配置修改预览，请稍候。")
+            return CardActionDispatchResult("正在生成配置修改预览，请稍候。")
         if action in {"search_remove_keyword", "search_clear_price"}:
             message = self._handle_search_card_action(action, value)
             self._reply_text(reply_to_message_id, message)
-            return CardActionResult(message)
+            return CardActionDispatchResult(message)
         if action.startswith("model_"):
             return self._handle_model_card_action(action, value)
         message = f"未知操作：{action}"
         self._reply_text(reply_to_message_id, message)
-        return CardActionResult(message)
+        return CardActionDispatchResult(message)
 
     def _apply_draft_card_action(
         self,
         value: dict,
         operator: str,
         reply_to_message_id: str,
-    ) -> CardActionResult:
+    ) -> CardActionDispatchResult:
         draft_id = str(value.get("draft_id") or "")
         draft = self.runtime.draft_store.get(draft_id)
         ok, message = self.runtime.draft_store.apply(draft_id, operator=operator)
@@ -532,15 +565,15 @@ class FeishuInteractiveBot:
         self._reply_text(reply_to_message_id, ("✅ " if ok else "⚠️ ") + message)
         if ok or _is_stale_draft(draft):
             reason = "已确认应用" if ok else "预览已失效"
-            return CardActionResult(message, _build_disabled_card_for_action(reason, draft, value))
-        return CardActionResult(message)
+            return CardActionDispatchResult(message, _build_disabled_card_for_action(reason, draft, value))
+        return CardActionDispatchResult(message)
 
     def _cancel_draft_card_action(
         self,
         value: dict,
         operator: str,
         reply_to_message_id: str,
-    ) -> CardActionResult:
+    ) -> CardActionDispatchResult:
         draft_id = str(value.get("draft_id") or "")
         draft = self.runtime.draft_store.get(draft_id)
         if draft and draft.status == "pending":
@@ -551,14 +584,14 @@ class FeishuInteractiveBot:
             message = "该预览已失效，请发新消息重新生成。"
             reason = "预览已失效"
         self._reply_text(reply_to_message_id, message)
-        return CardActionResult(message, _build_disabled_card_for_action(reason, draft, value))
+        return CardActionDispatchResult(message, _build_disabled_card_for_action(reason, draft, value))
 
     def _ignore_arbitration_card_action(
         self,
         value: dict,
         operator: str,
         reply_to_message_id: str,
-    ) -> CardActionResult:
+    ) -> CardActionDispatchResult:
         draft_id = str(value.get("draft_id") or "")
         draft = self.runtime.draft_store.get(draft_id) if draft_id else None
         if draft and draft.status == "pending":
@@ -569,23 +602,23 @@ class FeishuInteractiveBot:
             message = "该预览已失效，请发新消息重新生成。"
             reason = "预览已失效"
         self._reply_text(reply_to_message_id, message)
-        return CardActionResult(message, _build_disabled_card_for_action(reason, draft, value))
+        return CardActionDispatchResult(message, _build_disabled_card_for_action(reason, draft, value))
 
     def _handle_memory_feedback(
         self,
         action: str,
         value: dict,
         reply_to_message_id: str,
-    ) -> CardActionResult:
+    ) -> CardActionDispatchResult:
         """处理好价/不值反馈，记录到 DealMemory。"""
         article_id = str(value.get("article_id") or "")
         if not article_id:
             message = "无法识别商品信息"
             self._reply_text(reply_to_message_id, message)
-            return CardActionResult(message)
+            return CardActionDispatchResult(message)
 
         feedback_action = "deal_not_worth" if action == "deal_not_worth_reason" else action
-        reason = _card_field_optional(value, NOT_WORTH_REASON_FIELD) if action == "deal_not_worth_reason" else None
+        reason = optional_card_field_value(value, NOT_WORTH_REASON_FIELD) if action == "deal_not_worth_reason" else None
         if self.runtime.record_memory_feedback is not None:
             if reason is None:
                 result = self.runtime.record_memory_feedback(article_id, feedback_action)
@@ -598,7 +631,7 @@ class FeishuInteractiveBot:
         updated_card = None
         if result == "recorded":
             message = f"已标记为{label}，偏好将用于后续推荐"
-            updated_card = update_deal_feedback_card(
+            updated_card = update_deal_card_feedback_state(
                 reply_to_message_id,
                 article_id,
                 selected=feedback_action,
@@ -606,7 +639,7 @@ class FeishuInteractiveBot:
             )
         elif result == "updated":
             message = f"已更新为{label}，偏好将用于后续推荐"
-            updated_card = update_deal_feedback_card(
+            updated_card = update_deal_card_feedback_state(
                 reply_to_message_id,
                 article_id,
                 selected=feedback_action,
@@ -614,7 +647,7 @@ class FeishuInteractiveBot:
             )
         elif result == "reason_updated":
             message = "已保存不值理由" if reason else "已清空不值理由"
-            updated_card = update_deal_feedback_card(
+            updated_card = update_deal_card_feedback_state(
                 reply_to_message_id,
                 article_id,
                 selected="deal_not_worth",
@@ -622,13 +655,13 @@ class FeishuInteractiveBot:
             )
         elif result == "cancelled":
             message = "已取消反馈"
-            updated_card = update_deal_feedback_card(reply_to_message_id, article_id, selected="")
+            updated_card = update_deal_card_feedback_state(reply_to_message_id, article_id, selected="")
         elif result == "invalid_action":
             message = "未知反馈操作"
         else:
             message = "反馈记录失败，该商品可能已过期或记忆功能未启用。"
 
-        return CardActionResult(message, updated_card)
+        return CardActionDispatchResult(message, updated_card)
 
     def _start_deal_action_worker(self, action: str, value: dict, reply_to_message_id: str = "") -> None:
         thread = threading.Thread(
@@ -640,7 +673,7 @@ class FeishuInteractiveBot:
         thread.start()
 
     def _run_deal_action(self, action: str, value: dict, reply_to_message_id: str = "") -> None:
-        processing = DraftProcessingMessage()
+        processing = DraftProgressCard()
         try:
             processing = self._start_draft_processing(reply_to_message_id, "正在生成商品快捷操作预览")
             try:
@@ -649,7 +682,7 @@ class FeishuInteractiveBot:
                 processing_stopped = self._stop_draft_processing(processing)
             if not draft:
                 self._finish_draft_processing_failure(
-                    processing if processing_stopped else DraftProcessingMessage(),
+                    processing if processing_stopped else DraftProgressCard(),
                     "无法生成配置修改预览。",
                     reply_to_message_id,
                     "无法生成配置修改预览，请直接回复说明想怎么改。",
@@ -704,46 +737,20 @@ class FeishuInteractiveBot:
             self._handle_search_command(text, command, reply_to_message_id)
             return True
         if command.startswith("/model"):
-            self._handle_model_command(text, command, reply_to_message_id)
+            self._handle_model_command(command, reply_to_message_id)
             return True
         return False
 
     def _handle_search_command(self, text: str, command: str, reply_to_message_id: str = "") -> None:
         try:
-            if command in {"/search", "/search list"}:
-                self._reply_text(reply_to_message_id, _format_search_keywords(search_keywords.list_keyword_rules()))
-                return
-            if command == "/search add":
-                result = search_keywords.add_keyword(_search_command_argument(text, "/search add"))
-                self._reply_text(reply_to_message_id, _format_keyword_result(result))
-                return
-            if command == "/search remove":
-                result = search_keywords.remove_keyword(_search_command_argument(text, "/search remove"))
-                self._reply_text(reply_to_message_id, _format_keyword_result(result))
-                return
-            if command == "/search price":
-                result = search_keywords.set_keyword_price(_search_command_argument(text, "/search price"))
-                self._reply_text(reply_to_message_id, _format_keyword_result(result))
-                return
-            if command == "/search clear":
-                result = search_keywords.clear_keywords(_search_command_argument(text, "/search clear"))
-                self._reply_text(reply_to_message_id, _format_keyword_result(result))
-                return
-            self._reply_text(reply_to_message_id, _search_usage_text())
+            self._reply_text(reply_to_message_id, handle_search_command(text, command))
         except ValueError as e:
             self._reply_text(reply_to_message_id, f"搜索关键词配置读取失败：{e}")
 
     def _handle_search_card_action(self, action: str, value: dict) -> str:
-        keyword = str(value.get("search_keyword") or "").strip()
-        if not keyword:
-            return "搜索关键词信息缺失，无法处理。"
-        if action == "search_remove_keyword":
-            result = search_keywords.remove_keyword(keyword)
-        else:
-            result = search_keywords.set_keyword_price(f"{keyword} clear")
-        return _format_keyword_result(result)
+        return handle_search_card_action(action, value)
 
-    def _handle_model_command(self, text: str, command: str, reply_to_message_id: str = "") -> None:
+    def _handle_model_command(self, command: str, reply_to_message_id: str = "") -> None:
         try:
             if command == "/model status":
                 self._reply_text(reply_to_message_id, llm_routing.format_status())
@@ -766,49 +773,64 @@ class FeishuInteractiveBot:
         )
         return False
 
-    def _handle_model_card_action(self, action: str, value: dict) -> CardActionResult:
+    def _handle_model_card_action(self, action: str, value: dict) -> CardActionDispatchResult:
+        """应用模型路由卡片操作，并重绘管理卡片。"""
         try:
             if action == "model_refresh":
-                return CardActionResult("已刷新 LLM 路由", _model_management_card())
+                return CardActionDispatchResult("已刷新 LLM 路由", _build_model_management_card_response())
             if action == "model_test":
-                message = _run_model_test(_model_test_config_from_card(value))
-                return CardActionResult(message, _model_management_card(form_state=_extract_form_state(value)))
-            result = _apply_model_card_action(action, value)
+                message = _run_model_test(_resolve_model_test_config_from_card_value(value))
+                return CardActionDispatchResult(
+                    message,
+                    _build_model_management_card_response(form_state=_extract_form_state(value)),
+                )
+            result = _apply_model_route_card_action(action, value)
             logger.info(
                 "LLM 路由卡片操作成功: "
-                f"action={action}, target={_model_card_optional(value, 'target') or 'default'}, "
-                f"connection={_model_card_optional(value, 'connection')}, "
-                f"model_id={_model_card_optional(value, 'model_id')}"
+                f"action={action}, target={optional_model_card_field_value(value, 'target') or 'default'}, "
+                f"connection={optional_model_card_field_value(value, 'connection')}, "
+                f"model_id={optional_model_card_field_value(value, 'model_id')}"
             )
             form_state = (
                 _model_form_state_from_snapshot(result.snapshot, _model_card_target(value))
                 if action == "model_reset_agent"
                 else _extract_form_state(value)
             )
-            return CardActionResult(result.message, _model_management_card(result.snapshot, form_state=form_state))
+            return CardActionDispatchResult(
+                result.message,
+                _build_model_management_card_response(result.snapshot, form_state=form_state),
+            )
         except (LLMRoutingError, ValueError) as e:
-            return CardActionResult(f"WARN: {e}", _model_management_card(form_state=_extract_form_state(value)))
+            return CardActionDispatchResult(
+                f"WARN: {e}",
+                _build_model_management_card_response(form_state=_extract_form_state(value)),
+            )
         except Exception as e:
             logger.error(f"模型卡片操作失败: {e}", exc_info=True)
-            return CardActionResult(INTERNAL_ERROR_MESSAGE, _model_management_card(form_state=_extract_form_state(value)))
+            return CardActionDispatchResult(
+                INTERNAL_ERROR_MESSAGE,
+                _build_model_management_card_response(form_state=_extract_form_state(value)),
+            )
 
     def _remember_model_card_form_value(self, message_id: str, operator: str, value: dict) -> None:
-        key = _model_card_form_state_key(message_id, operator)
+        """缓存 Feishu 后续 callback 可能不会携带的模型表单局部编辑。"""
+        key = model_card_form_cache_key(message_id, operator)
         if not key:
             return
-        patch = _model_card_form_patch(value)
+        patch = build_model_card_form_patch(value)
         if not patch:
             return
         with self._model_card_form_lock:
             state = self._model_card_form_state.pop(key, {})
             self._model_card_form_state[key] = state
-            _apply_model_form_patch(state, patch)
-            _trim_model_card_form_state(self._model_card_form_state)
+            apply_model_form_cache_patch(state, patch)
+            trim_model_card_form_cache(self._model_card_form_state, MODEL_CARD_FORM_STATE_LIMIT)
             cached_keys = sorted(state.keys())
         logger.debug(f"缓存模型卡片表单值: operator={operator}, cached_keys={cached_keys}")
 
     def _merge_model_card_form_state(self, message_id: str, operator: str, value: dict) -> dict:
-        key = _model_card_form_state_key(message_id, operator)
+        """执行 action 前，把缓存的表单编辑合并进 payload。"""
+        key = model_card_form_cache_key(message_id, operator)
         if not key:
             return value
         with self._model_card_form_lock:
@@ -818,7 +840,8 @@ class FeishuInteractiveBot:
         return merged
 
     def _forget_model_card_form_state(self, message_id: str, operator: str) -> None:
-        key = _model_card_form_state_key(message_id, operator)
+        """刷新、重置或状态不再有用时丢弃模型表单缓存。"""
+        key = model_card_form_cache_key(message_id, operator)
         if not key:
             return
         with self._model_card_form_lock:
@@ -829,8 +852,11 @@ class FeishuInteractiveBot:
         message_id: str,
         operator: str,
     ) -> object | None:
-        """Redraw model card when target/connection dropdown changes."""
-        cache_key = _model_card_form_state_key(message_id, operator)
+        """当 target/connection 下拉框变化时重绘模型卡片。
+
+        自动填充值跟随选中的 target，但保留操作者在当前卡片上手动改过的字段。
+        """
+        cache_key = model_card_form_cache_key(message_id, operator)
         with self._model_card_form_lock:
             cached = dict(self._model_card_form_state.get(cache_key, {}))
             target = str(cached.get("target") or "default").strip()
@@ -838,7 +864,7 @@ class FeishuInteractiveBot:
                 return None
             final_form = self._model_form_for_target(target, cached)
             state = self._model_card_form_state.setdefault(cache_key, {})
-            _replace_model_form_state_values(state, final_form)
+            replace_model_form_cache_values(state, final_form)
 
         card = build_model_management_card(
             llm_routing.model_card_state(),
@@ -865,9 +891,9 @@ class FeishuInteractiveBot:
 
         final_form: dict[str, str] = {"target": target}
         for field_key in ("connection", "model_id", "temperature"):
-            # Preserve all user-edited route fields across target changes.
-            # Users often choose connection/model_id first and then switch the agent;
-            # auto-filling the new target here would silently discard their intended route.
+            # 切换 target 时保留用户手动编辑过的路由字段。
+            # 用户常先选 connection/model_id 再切换 agent；如果此处直接自动填充，
+            # 会静默丢失用户想应用的路由。
             if cached.get(f"{field_key}_manual"):
                 final_form[field_key] = str(cached.get(field_key) or "")
             else:
@@ -906,79 +932,6 @@ def start_bot_thread(runtime: BotRuntime) -> threading.Thread | None:
     return thread
 
 
-def _extract_message_text(content: str) -> str:
-    try:
-        data = json.loads(content)
-        if isinstance(data, dict):
-            return str(data.get("text") or "").strip()
-    except (TypeError, json.JSONDecodeError):
-        pass
-    return str(content or "").strip()
-
-
-def _strip_bot_mention(text: str) -> str:
-    clean = text.strip()
-    while clean.startswith("@"):
-        parts = clean.split(maxsplit=1)
-        if len(parts) == 1:
-            return ""
-        clean = parts[1].strip()
-    return clean
-
-
-def _extract_card_value(data) -> dict:
-    action = getattr(data.event, "action", None)
-    result = _parse_card_dict(getattr(action, "value", None))
-    if result.get("field"):
-        result["value"] = dict(result)
-    name = _clean_card_scalar(getattr(action, "name", None))
-    option = _clean_card_scalar(getattr(action, "option", None))
-    raw_input_value = getattr(action, "input_value", None)
-    input_value = _clean_card_scalar(raw_input_value)
-    tag = _clean_card_scalar(getattr(action, "tag", None))
-    if name:
-        result["name"] = name
-    if option:
-        result["option"] = option
-    if _is_card_scalar(raw_input_value):
-        result["input_value"] = input_value
-    if tag:
-        result["tag"] = tag
-    for attr in ("form_value", "form_values", "form", "input_values"):
-        form_value = _parse_card_dict(getattr(action, attr, None))
-        if not form_value:
-            continue
-        result[attr] = form_value
-        for key, value in form_value.items():
-            result.setdefault(key, value)
-    return result
-
-
-def _parse_card_dict(value) -> dict:
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            return {}
-    return {}
-
-
-def _clean_card_scalar(value) -> str:
-    if value is None:
-        return ""
-    if not _is_card_scalar(value):
-        return ""
-    return str(value).strip()
-
-
-def _is_card_scalar(value) -> bool:
-    return isinstance(value, (str, int, float, bool))
-
-
 def _extract_operator(data) -> str:
     operator = getattr(data.event, "operator", None)
     for attr in ("open_id", "user_id", "union_id"):
@@ -993,59 +946,6 @@ def _card_open_message_id(data) -> str:
     if not isinstance(context, (str, int)):
         return ""
     return str(context or "")
-
-
-def _model_card_form_state_key(message_id: str, operator: str) -> str:
-    if not message_id or not operator:
-        return ""
-    return f"{message_id}:{operator}"
-
-
-def _trim_model_card_form_state(state: dict[str, dict[str, Any]]) -> None:
-    while len(state) > MODEL_CARD_FORM_STATE_LIMIT:
-        oldest = next(iter(state), None)
-        if oldest is None:
-            return
-        state.pop(oldest, None)
-
-
-def _replace_model_form_state_values(state: dict[str, Any], form_state: dict[str, str]) -> None:
-    for key in ("target", "connection", "model_id", "temperature"):
-        state.pop(key, None)
-        if key not in form_state:
-            state.pop(f"{key}_manual", None)
-    for key, value in form_state.items():
-        state[key] = value
-
-
-def _apply_model_form_patch(state: dict[str, Any], patch: dict[str, Any]) -> None:
-    for key, value in patch.items():
-        if key.endswith("_manual") and value is False:
-            state.pop(key, None)
-        else:
-            state[key] = value
-
-
-def _model_card_form_patch(value: dict) -> dict[str, Any]:
-    field = _model_card_field_from_callback(value)
-    if field not in {"target", "connection", "model_id", "temperature"}:
-        return {}
-    if "option" in value:
-        option = str(value.get("option") or "").strip()
-        return {field: option, f"{field}_manual": bool(option)}
-    if "input_value" in value:
-        input_value = str(value.get("input_value") or "").strip()
-        return {field: input_value, f"{field}_manual": bool(input_value)}
-    return {}
-
-
-def _model_card_field_from_callback(value: dict) -> str:
-    raw_value = value.get("value")
-    if isinstance(raw_value, dict):
-        field = str(raw_value.get("field") or "").strip()
-        if field:
-            return field
-    return str(value.get("name") or "").strip()
 
 
 def _extract_sender_open_id(data) -> str:
@@ -1149,60 +1049,24 @@ def _command_key(text: str) -> str:
     return "/search unknown"
 
 
-def _search_command_argument(text: str, prefix: str) -> str:
-    return text.strip()[len(prefix) :].strip()
-
-
-def _format_keyword_result(result: search_keywords.KeywordOperationResult) -> str:
-    prefix = "OK" if result.success else "WARN"
-    return f"{prefix}: {result.message}\n\n{_format_search_keywords(result.rules or result.keywords)}"
-
-
-def _format_search_keywords(keywords: list) -> str:
-    if not keywords:
-        return "Search keywords: none"
-    lines = ["Search keywords:"]
-    lines.extend(f"{i}. {_format_search_keyword_entry(keyword)}" for i, keyword in enumerate(keywords, 1))
-    return "\n".join(lines)
-
-
-def _format_search_keyword_entry(keyword) -> str:
-    if hasattr(keyword, "keyword"):
-        max_price = getattr(keyword, "max_price", None)
-        if max_price is not None:
-            return f"{keyword.keyword} (max_price: {max_price:g})"
-        return keyword.keyword
-    return str(keyword)
-
-
-def _search_usage_text() -> str:
-    return (
-        "Search keyword commands:\n"
-        "- /search\n"
-        "- /search list\n"
-        "- /search add <keyword> [-price <price>]\n"
-        "- /search remove <keyword>\n"
-        "- /search price <keyword> <price|clear>\n"
-        "- /search clear confirm"
-    )
-
-
-def _model_management_card(snapshot=None, form_state: dict | None = None) -> dict:
+def _build_model_management_card_response(snapshot=None, form_state: dict | None = None) -> dict:
+    """根据路由状态和可选表单值构造新的模型管理卡片。"""
     state = llm_routing.model_card_state(snapshot)
     return build_model_management_card(state, form_state=form_state or default_model_form_state(state))
 
 
 def _extract_form_state(value: dict) -> dict[str, str]:
-    """Extract form field values suitable for pre-populating a new card."""
+    """提取可用于预填充新卡片的表单字段值。"""
     result: dict[str, str] = {}
     for key in ("target", "connection", "model_id", "temperature"):
-        v = _model_card_optional(value, key)
+        v = optional_model_card_field_value(value, key)
         if v:
             result[key] = v
     return result
 
 
 def _model_form_state_from_snapshot(snapshot: llm_routing.RoutingSnapshot, target: str) -> dict[str, str]:
+    """把已提交的路由快照转换回模型卡片表单默认值。"""
     if target == "default":
         return default_model_form_state(llm_routing.model_card_state(snapshot))
     resolved = snapshot.resolve(target)
@@ -1216,11 +1080,12 @@ def _model_form_state_from_snapshot(snapshot: llm_routing.RoutingSnapshot, targe
     return result
 
 
-def _apply_model_card_action(action: str, value: dict) -> ModelCardUpdateResult:
+def _apply_model_route_card_action(action: str, value: dict) -> ModelRouteUpdateResult:
+    """持久化一次模型管理卡片路由操作。"""
     target = _model_card_target(value)
     if action == "model_apply_connection_model":
-        connection = _model_card_optional(value, "connection")
-        model_id = _model_card_optional(value, "model_id")
+        connection = optional_model_card_field_value(value, "connection")
+        model_id = optional_model_card_field_value(value, "model_id")
         if not connection:
             raise ValueError("请选择 connection 后再应用")
         if not model_id:
@@ -1229,26 +1094,26 @@ def _apply_model_card_action(action: str, value: dict) -> ModelCardUpdateResult:
             snapshot = llm_routing.use_default_connection_model(connection, model_id)
         else:
             snapshot = llm_routing.use_agent_model(target, model_id, connection=connection)
-        return ModelCardUpdateResult(snapshot, f"已更新 {_model_route_label(snapshot, target)}，下一次 LLM 调用生效。")
+        return ModelRouteUpdateResult(snapshot, f"已更新 {_model_route_label(snapshot, target)}，下一次 LLM 调用生效。")
     if action == "model_apply_model":
         model_id = _model_card_required(value, "model_id", "请输入 model_id 后再应用")
         if target == "default":
             snapshot = llm_routing.use_default_model(model_id)
         else:
             snapshot = llm_routing.use_agent_model(target, model_id)
-        return ModelCardUpdateResult(snapshot, f"已更新 {_model_route_label(snapshot, target)}，下一次 LLM 调用生效。")
+        return ModelRouteUpdateResult(snapshot, f"已更新 {_model_route_label(snapshot, target)}，下一次 LLM 调用生效。")
     if action == "model_set_temperature":
         temperature = _model_card_temperature(value)
         if target == "default":
             snapshot = llm_routing.set_default_temperature(temperature)
         else:
             snapshot = llm_routing.set_agent_temperature(target, temperature)
-        return ModelCardUpdateResult(snapshot, f"已更新 {_model_temperature_label(target, temperature)}，下一次 LLM 调用生效。")
+        return ModelRouteUpdateResult(snapshot, f"已更新 {_model_temperature_label(target, temperature)}，下一次 LLM 调用生效。")
     if action == "model_reset_agent":
         if target == "default":
             raise ValueError("默认配置不能 reset，请直接应用新的 connection/model_id")
         snapshot = llm_routing.reset_agent(target)
-        return ModelCardUpdateResult(snapshot, f"已重置 {_model_route_label(snapshot, target)}，下一次 LLM 调用生效。")
+        return ModelRouteUpdateResult(snapshot, f"已重置 {_model_route_label(snapshot, target)}，下一次 LLM 调用生效。")
     raise ValueError(f"未知操作：{action}")
 
 
@@ -1266,9 +1131,10 @@ def _model_temperature_label(target: str, temperature: float) -> str:
     return f"{target} temperature={temperature:g}"
 
 
-def _model_test_config_from_card(value: dict) -> ResolvedLLMConfig:
-    connection = _model_card_optional(value, "connection")
-    model_id = _model_card_optional(value, "model_id")
+def _resolve_model_test_config_from_card_value(value: dict) -> ResolvedLLMConfig:
+    """从卡片字段解析模型测试目标，不修改路由配置。"""
+    connection = optional_model_card_field_value(value, "connection")
+    model_id = optional_model_card_field_value(value, "model_id")
     if connection and model_id:
         return llm_routing.test_config_for_connection(connection, model_id)
     target = _model_card_target(value)
@@ -1282,7 +1148,7 @@ def _model_test_config_from_card(value: dict) -> ResolvedLLMConfig:
 
 
 def _model_card_target(value: dict) -> str:
-    target = _model_card_optional(value, "target") or "default"
+    target = optional_model_card_field_value(value, "target") or "default"
     if target == "default" or target in AGENTS:
         return target
     raise ValueError("作用范围必须是 default/filter/arbiter/draft")
@@ -1297,50 +1163,10 @@ def _model_card_temperature(value: dict) -> float:
 
 
 def _model_card_required(value: dict, key: str, message: str) -> str:
-    clean = _model_card_optional(value, key)
+    clean = optional_model_card_field_value(value, key)
     if not clean:
         raise ValueError(message)
     return clean
-
-
-def _card_field_optional(value: dict, key: str) -> str:
-    raw = _model_card_raw_value(value, key)
-    if raw is None:
-        return ""
-    return str(raw).strip()
-
-
-def _model_card_optional(value: dict, key: str) -> str:
-    raw = _model_card_raw_value(value, key)
-    if raw is None:
-        return ""
-    return str(raw).strip()
-
-
-def _model_card_raw_value(value: dict, key: str):
-    if key in value:
-        return _normalize_card_form_value(value.get(key))
-    for group_key in ("form_values", "form_value", "form", "input_values"):
-        group = value.get(group_key)
-        if isinstance(group, dict) and key in group:
-            return _normalize_card_form_value(group.get(key))
-    return None
-
-
-def _normalize_card_form_value(raw):
-    if isinstance(raw, dict):
-        for key in ("value", "text", "content"):
-            if raw.get(key) not in (None, ""):
-                return raw.get(key)
-        if raw.get("option") is not None:
-            return _normalize_card_form_value(raw.get("option"))
-        if any(key in raw for key in ("value", "text", "content")):
-            return ""
-    if isinstance(raw, list):
-        if not raw:
-            return ""
-        return _normalize_card_form_value(raw[0])
-    return raw
 
 
 def _run_model_test(llm_config: ResolvedLLMConfig) -> str:

@@ -1,4 +1,4 @@
-"""LLM 商品筛选主流程。"""
+"""商品 LLM 筛选主流程。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime
+from typing import Protocol, cast
 
 from loguru import logger
 from openai import OpenAI
@@ -35,6 +36,8 @@ from smzdm_notice.smzdm.ranking import RankingItem
 
 @dataclass
 class FilterPromptContext:
+    """筛选调用和可选仲裁共用的 prompt payload 与 ID 映射。"""
+
     user_message: str
     item_map: dict[str, RankingItem]
     items_summary: list[dict]
@@ -330,10 +333,18 @@ _SUMMARY_MAX_LENGTH = 80
 _PREFERENCE_BASIS_MAX_ITEMS = 3
 
 
+class _ModelDumpable(Protocol):
+    def model_dump(self) -> dict[str, object]: ...
+
+
 def sanitize_decision_context(raw: object) -> dict:
-    """Normalize the LLM's per-item decision context into a small stable schema."""
+    """将 LLM 返回的单商品决策上下文归一化为小而稳定的 schema。
+
+    原始模型响应可能包含嵌套 Pydantic model、任意列表或过长文本；
+    Deal Memory 只存储有长度边界的证据字段。
+    """
     if hasattr(raw, "model_dump"):
-        raw = raw.model_dump()
+        raw = cast(_ModelDumpable, raw).model_dump()
     if not isinstance(raw, dict):
         raw = {}
     return {

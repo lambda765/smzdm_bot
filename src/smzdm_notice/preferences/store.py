@@ -140,7 +140,7 @@ class DraftStore:
 
     def compact(self, retention_seconds: int = TERMINAL_DRAFT_RETENTION_SECONDS) -> list[ConfigDraft]:
         """移除已结束且超过保留期的草案，返回被移除的列表。"""
-        # pending_config_changes.json 只保留还有交互价值的草案；
+        # 文件 pending_config_changes.json 只保留还有交互价值的草案；
         # 长期历史依赖 audit 日志，避免 pending 文件持续膨胀。
         now = time.time()
         removed = []
@@ -222,7 +222,7 @@ class DraftStore:
             return original, f"在 {draft.target_file} 中未找到目标文本，请检查后重试"
         count = original.count(search)
         if count > 1:
-            # LLM 有时会给出 1-3 行短 search_text。若短文本多处出现，
+            # 模型有时会给出 1-3 行短 search_text。若短文本多处出现，
             # 尝试带上相邻行后再唯一匹配；仍不唯一就拒绝，防止误改。
             expanded = _expand_search_context(original, search)
             if expanded and original.count(expanded) == 1:
@@ -238,7 +238,7 @@ class DraftStore:
             return original, f"在 {draft.target_file} 中未找到目标文本，请检查后重试"
         count = original.count(search)
         if count > 1:
-            # delete 和 replace 使用同一套唯一定位策略，宁可让用户补充说明，
+            # 操作 delete 和 replace 使用同一套唯一定位策略，宁可让用户补充说明，
             # 也不在多处匹配时猜测删除哪一段。
             expanded = _expand_search_context(original, search)
             if expanded and original.count(expanded) == 1:
@@ -285,7 +285,7 @@ class DraftStore:
             "backup": str(backup_path) if backup_path else "",
             "metadata": draft.metadata,
         }
-        # source/operator/backup 等审计信息只进 audit，不写回 preference.md/inventory.md，
+        # 字段 source/operator/backup 等审计信息只进 audit，不写回 preference.md/inventory.md，
         # 配置文件保持为纯偏好和库存正文。
         with self.audit_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")

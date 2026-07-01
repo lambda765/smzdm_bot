@@ -47,7 +47,7 @@ def _build_llm_draft_from_message(
 ) -> ConfigDraft | None:
     """复用同一条 LLM 草案生成管线构造 ConfigDraft。"""
     # 用户直接对话、商品快捷操作都走这里：入口只负责表达意图，
-    # append/replace/delete 的落点由 LLM 根据当前配置文件上下文决定。
+    # 操作 append/replace/delete 的落点由 LLM 根据当前配置文件上下文决定。
     root = store.root if store else None
     data = _draft_with_llm(message, root=root)
     if not isinstance(data, dict) or not _is_valid_draft_data(data):
@@ -166,8 +166,8 @@ def _draft_with_llm(message: str, root: Path | None = None) -> dict | None:
 
 def build_revision_draft(message: str, original: ConfigDraft, store: DraftStore | None = None) -> ConfigDraft | None:
     """根据用户对预览草案的修改意见，重新生成草案。支持多轮修改。"""
-    # revision_history 描述的是“待确认草案”的演化，不代表文件已经被写入；
-    # prompt 和校验都要基于这个前提，避免把未执行草案误当成真实文件去 delete。
+    # 字段 revision_history 描述的是“待确认草案”的演化，不代表文件已经被写入；
+    # 构造 prompt 和校验都要基于这个前提，避免把未执行草案误当成真实文件去 delete。
     history = list(original.revision_history)
     history.append({"role": "draft", "content": _draft_summary(original)})
     history.append({"role": "user", "content": message.strip()})
@@ -242,7 +242,7 @@ def _validate_revision_data(
     if mode in ("replace", "delete"):
         search_text = str(data.get("search_text") or "").strip()
         actual_content = read_target_content(str(data.get("target_file")), root)
-        # replace/delete 必须命中当前真实文件；如果只命中原草案内容，
+        # 操作 replace/delete 必须命中当前真实文件；如果只命中原草案内容，
         # 说明用户是在调整预览方案，应让模型重新生成完整草案。
         if search_text not in actual_content:
             return False, "replace/delete 的 search_text 不存在于当前真实文件，可能误用了未执行草案文本"
@@ -281,7 +281,7 @@ def _build_draft(data: dict, source: str) -> ConfigDraft:
         raise ValueError(f"{edit_mode} 模式下 search_text 不能为空")
 
     if edit_mode == "replace":
-        # append_text 在 replace/delete 草案中仅作为预览摘要内容使用；
+        # 字段 append_text 在 replace/delete 草案中仅作为预览摘要内容使用；
         # 真正写入仍由 edit_mode + search_text/replace_text 决定。
         append_text = append_text or replace_text
     elif edit_mode == "delete":

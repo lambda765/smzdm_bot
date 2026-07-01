@@ -44,7 +44,7 @@ class _StreamClient:
     def __exit__(self, exc_type, exc, tb):
         return None
 
-    def stream(self, method: str, url: str):
+    def stream(self, _method: str, url: str):
         response = self.responses.popleft()
         response.url = url
         return response

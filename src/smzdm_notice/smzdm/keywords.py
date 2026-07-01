@@ -1,6 +1,6 @@
-"""Search keyword JSON file management.
+"""搜索关键词 JSON 文件管理。
 
-The persisted file only supports object entries:
+持久化文件只支持对象条目：
 {"keywords": [{"keyword": "...", "max_price": null}]}
 """
 
@@ -15,7 +15,7 @@ from smzdm_notice.preferences.store import CONFIG_FILE_LOCK
 
 ADD_KEYWORD_USAGE = "Usage: /search add <keyword> [-price <price>]"
 PRICE_OPTION_NAME = "price"
-# Device input methods may emit visually similar single dash characters.
+# 设备输入法可能产生视觉上相近的单个短横线字符。
 OPTION_DASH_CHARS = frozenset("-‐‑‒–—―−－")
 
 
@@ -34,7 +34,7 @@ class KeywordOperationResult:
 
 
 def resolve_keywords_path() -> Path:
-    """Resolve the keyword JSON path relative to the configured project root."""
+    """基于项目根目录解析关键词 JSON 路径。"""
     path = Path(config.SEARCH_KEYWORDS_FILE)
     if not path.is_absolute():
         path = config.PROJECT_ROOT / path
@@ -42,19 +42,19 @@ def resolve_keywords_path() -> Path:
 
 
 def list_keywords() -> list[str]:
-    """Return configured keyword text values only."""
+    """只返回已配置的关键词文本。"""
     with CONFIG_FILE_LOCK:
         return [rule.keyword for rule in _read_keyword_rules(resolve_keywords_path())]
 
 
 def list_keyword_rules() -> list[SearchKeywordRule]:
-    """Return configured keyword rules including optional max_price thresholds."""
+    """返回已配置的关键词规则，包括可选 max_price 阈值。"""
     with CONFIG_FILE_LOCK:
         return _read_keyword_rules(resolve_keywords_path())
 
 
 def add_keyword(keyword: str) -> KeywordOperationResult:
-    """Add one exact keyword, optionally with a trailing single-dash price option."""
+    """添加一个精确关键词，可在末尾携带单短横线价格选项。"""
     try:
         clean, max_price = _parse_add_argument(keyword)
     except ValueError as e:
@@ -75,7 +75,7 @@ def add_keyword(keyword: str) -> KeywordOperationResult:
 
 
 def remove_keyword(keyword: str) -> KeywordOperationResult:
-    """Remove one keyword by exact text match."""
+    """按文本精确匹配删除一个关键词。"""
     clean = keyword.strip()
     if not clean:
         rules = list_keyword_rules()
@@ -91,7 +91,7 @@ def remove_keyword(keyword: str) -> KeywordOperationResult:
 
 
 def set_keyword_price(keyword_and_price: str) -> KeywordOperationResult:
-    """Set or clear max_price for an existing keyword rule."""
+    """为已有关键词规则设置或清除 max_price。"""
     keyword, price_text = _split_price_command(keyword_and_price)
     if not keyword or not price_text:
         rules = list_keyword_rules()
@@ -117,7 +117,7 @@ def set_keyword_price(keyword_and_price: str) -> KeywordOperationResult:
 
 
 def clear_keywords(confirm: str) -> KeywordOperationResult:
-    """Clear all keyword rules when the user supplies the confirm token."""
+    """用户提供 confirm token 时清空全部关键词规则。"""
     path = resolve_keywords_path()
     with CONFIG_FILE_LOCK:
         rules = _read_keyword_rules(path)
