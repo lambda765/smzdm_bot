@@ -230,6 +230,74 @@ class MainMemoryAnalysisDigestTests(unittest.TestCase):
             near_miss_mgr.clear_and_set_digest_date.assert_not_called()
 
 
+class MainMemoryRuleDraftTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        main._draft_store = None
+
+    def _new_draft_store(self, root: Path) -> DraftStore:
+        return DraftStore(
+            draft_file=root / "drafts.json",
+            backup_dir=root / "backups",
+            audit_file=root / "audit.jsonl",
+            root=root,
+        )
+
+    def _new_memory_rule_draft(self) -> ConfigDraft:
+        return ConfigDraft(
+            draft_id="memory-rule-draft",
+            target_file="preference.md",
+            title="Deal Memory 偏好建议",
+            summary="测试",
+            append_text="- 咖啡器具可优先推荐。",
+            source="Deal Memory",
+        )
+
+    def test_memory_rule_draft_persists_preview_message_id_after_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main._draft_store = self._new_draft_store(root)
+            draft = main._draft_store.create(self._new_memory_rule_draft())
+
+            def send_preview(sent_draft):
+                sent_draft.preview_message_id = "om_memory_rule"
+                return True
+
+            with (
+                patch("smzdm_notice.preferences.builder.build_message_draft", return_value=draft),
+                patch("smzdm_notice.feishu.notifier.send_draft_preview", side_effect=send_preview),
+            ):
+                main._suggest_memory_rule(
+                    {"rule": "咖啡器具可优先推荐", "reason": "好价 5，不值 0"},
+                    "咖啡器具反馈稳定",
+                )
+
+            reloaded_store = self._new_draft_store(root)
+            stored = reloaded_store.get_any_by_preview_message_id("om_memory_rule")
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.draft_id, draft.draft_id)
+
+    def test_memory_rule_draft_send_failure_does_not_persist_preview_message_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main._draft_store = self._new_draft_store(root)
+            draft = main._draft_store.create(self._new_memory_rule_draft())
+
+            with (
+                patch("smzdm_notice.preferences.builder.build_message_draft", return_value=draft),
+                patch("smzdm_notice.feishu.notifier.send_draft_preview", return_value=False),
+                patch("smzdm_notice.runtime.logger.warning") as warning,
+            ):
+                main._suggest_memory_rule(
+                    {"rule": "咖啡器具可优先推荐", "reason": "好价 5，不值 0"},
+                    "咖啡器具反馈稳定",
+                )
+
+            reloaded_store = self._new_draft_store(root)
+            self.assertEqual(reloaded_store.get(draft.draft_id).preview_message_id, "")
+            self.assertIsNone(reloaded_store.get_any_by_preview_message_id("om_memory_rule"))
+            warning.assert_called_once()
+
+
 class MainConfigParsingTests(unittest.TestCase):
     def test_get_bool_parses_common_values_and_falls_back(self) -> None:
         with patch.dict(

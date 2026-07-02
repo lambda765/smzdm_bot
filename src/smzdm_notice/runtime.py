@@ -768,7 +768,11 @@ def _suggest_memory_rule(rule: dict, analysis_summary: str) -> None:
         if draft:
             from smzdm_notice.feishu.notifier import send_draft_preview
 
-            send_draft_preview(draft)
+            if not send_draft_preview(draft):
+                logger.warning(f"Deal Memory: 偏好草案推送失败: {draft.title}")
+                return
+            if draft.preview_message_id:
+                _draft_store.update(draft)
             logger.info(f"Deal Memory: 偏好草案已推送: {draft.title}")
     except Exception as e:
         logger.warning(f"Deal Memory: 偏好草案生成失败: {e}")
