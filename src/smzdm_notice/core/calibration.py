@@ -156,6 +156,9 @@ def _render_record_case(index: int, record: dict) -> str:
     decision_context = _render_decision_context(record)
     if decision_context:
         signal_line += f" | 上下文：{decision_context}"
+    feedback_reason = str((record.get("feedback") or {}).get("reason") or "").strip()
+    if feedback_reason:
+        signal_line += f" | 用户反馈理由：{_truncate_context(feedback_reason, 60)}"
     acted_at = str((record.get("feedback") or {}).get("acted_at") or "").strip()
     if acted_at:
         signal_line += f" | 反馈时间：{acted_at}"

@@ -146,6 +146,7 @@ class DraftProgressCard:
 
 
 MODEL_CARD_FORM_STATE_LIMIT = 64
+DEAL_REASON_FORM_STATE_LIMIT = 256
 
 
 class FeishuInteractiveBot:
@@ -156,6 +157,8 @@ class FeishuInteractiveBot:
         self.deduper = deduper or MessageDeduper()
         self._model_card_form_state: dict[str, dict[str, Any]] = {}
         self._model_card_form_lock = threading.RLock()
+        self._deal_reason_form_state: dict[str, str] = {}
+        self._deal_reason_form_lock = threading.RLock()
 
     def start_blocking(self) -> None:
         if not (config.FEISHU_APP_ID and config.FEISHU_APP_SECRET):
@@ -494,6 +497,12 @@ class FeishuInteractiveBot:
             logger.info(f"收到飞书卡片操作: action={action}, operator={operator}, card_token={card_token}")
             if not action:
                 field = model_card_field_from_callback(value)
+                if field == NOT_WORTH_REASON_FIELD:
+                    if not self.runtime.binding_store.is_bound_operator(operator):
+                        logger.debug(f"忽略未授权不值理由输入变更: operator={operator}")
+                        return None
+                    self._remember_deal_reason_form_value(reply_to_message_id, operator, value)
+                    return None
                 if field in {"target", "connection", "model_id", "temperature"}:
                     if not self.runtime.binding_store.is_bound_operator(operator):
                         logger.debug(f"忽略未授权模型卡片表单变更: operator={operator}, field={field}")
@@ -537,7 +546,7 @@ class FeishuInteractiveBot:
         if action == "ignore_arbitration":
             return self._ignore_arbitration_card_action(value, operator, reply_to_message_id)
         if action in {"deal_good", "deal_not_worth", "deal_not_worth_reason"}:
-            return self._handle_memory_feedback(action, value, reply_to_message_id)
+            return self._handle_memory_feedback(action, value, reply_to_message_id, operator)
         if action in {"deal_ignore_category", "deal_stock_enough", "deal_follow"}:
             self._start_deal_action_worker(action, dict(value), reply_to_message_id)
             return CardActionDispatchResult("正在生成配置修改预览，请稍候。")
@@ -609,6 +618,7 @@ class FeishuInteractiveBot:
         action: str,
         value: dict,
         reply_to_message_id: str,
+        operator: str = "",
     ) -> CardActionDispatchResult:
         """处理好价/不值反馈，记录到 DealMemory。"""
         article_id = str(value.get("article_id") or "")
@@ -618,7 +628,12 @@ class FeishuInteractiveBot:
             return CardActionDispatchResult(message)
 
         feedback_action = "deal_not_worth" if action == "deal_not_worth_reason" else action
-        reason = optional_card_field_value(value, NOT_WORTH_REASON_FIELD) if action == "deal_not_worth_reason" else None
+        reason: str | None = None
+        if action == "deal_not_worth_reason":
+            reason = self._resolve_deal_reason_form_value(reply_to_message_id, operator, article_id, value)
+            if not reason:
+                message = "未填写不值理由，已保留不值反馈"
+                return CardActionDispatchResult(message)
         if self.runtime.record_memory_feedback is not None:
             if reason is None:
                 result = self.runtime.record_memory_feedback(article_id, feedback_action)
@@ -646,22 +661,68 @@ class FeishuInteractiveBot:
                 reason=reason or "",
             )
         elif result == "reason_updated":
-            message = "已保存不值理由" if reason else "已清空不值理由"
+            message = "已保存不值理由"
             updated_card = update_deal_card_feedback_state(
                 reply_to_message_id,
                 article_id,
                 selected="deal_not_worth",
                 reason=reason or "",
             )
+            self._forget_deal_reason_form_value(reply_to_message_id, operator, article_id)
         elif result == "cancelled":
             message = "已取消反馈"
             updated_card = update_deal_card_feedback_state(reply_to_message_id, article_id, selected="")
+            self._forget_deal_reason_form_value(reply_to_message_id, operator, article_id)
         elif result == "invalid_action":
             message = "未知反馈操作"
         else:
             message = "反馈记录失败，该商品可能已过期或记忆功能未启用。"
 
         return CardActionDispatchResult(message, updated_card)
+
+    def _remember_deal_reason_form_value(self, message_id: str, operator: str, value: dict) -> None:
+        article_id = str(value.get("article_id") or "").strip()
+        if not article_id:
+            logger.debug("忽略缺少 article_id 的不值理由输入变更")
+            return
+        found, reason = _deal_reason_from_card_value(value)
+        if not found:
+            return
+        key = _deal_reason_form_state_key(message_id, operator, article_id)
+        if not key:
+            return
+        with self._deal_reason_form_lock:
+            self._deal_reason_form_state.pop(key, None)
+            if reason:
+                self._deal_reason_form_state[key] = reason
+                _trim_deal_reason_form_state(self._deal_reason_form_state)
+        logger.debug(
+            f"缓存不值理由输入: operator={operator}, article_id={article_id}, "
+            f"has_reason={bool(reason)}"
+        )
+
+    def _resolve_deal_reason_form_value(
+        self,
+        message_id: str,
+        operator: str,
+        article_id: str,
+        value: dict,
+    ) -> str:
+        found, reason = _deal_reason_from_card_value(value)
+        if found:
+            return reason
+        key = _deal_reason_form_state_key(message_id, operator, article_id)
+        if not key:
+            return ""
+        with self._deal_reason_form_lock:
+            return self._deal_reason_form_state.get(key, "")
+
+    def _forget_deal_reason_form_value(self, message_id: str, operator: str, article_id: str) -> None:
+        key = _deal_reason_form_state_key(message_id, operator, article_id)
+        if not key:
+            return
+        with self._deal_reason_form_lock:
+            self._deal_reason_form_state.pop(key, None)
 
     def _start_deal_action_worker(self, action: str, value: dict, reply_to_message_id: str = "") -> None:
         thread = threading.Thread(
@@ -1063,6 +1124,33 @@ def _extract_form_state(value: dict) -> dict[str, str]:
         if v:
             result[key] = v
     return result
+
+
+def _deal_reason_from_card_value(value: dict) -> tuple[bool, str]:
+    """读取不值理由输入；bool 表示 payload 是否明确包含该字段。"""
+    if str(value.get("name") or "").strip() == NOT_WORTH_REASON_FIELD and "input_value" in value:
+        return True, str(value.get("input_value") or "").strip()
+    if NOT_WORTH_REASON_FIELD in value:
+        return True, optional_card_field_value(value, NOT_WORTH_REASON_FIELD)
+    for group_key in ("form_values", "form_value", "form", "input_values"):
+        group = value.get(group_key)
+        if isinstance(group, dict) and NOT_WORTH_REASON_FIELD in group:
+            return True, optional_card_field_value(value, NOT_WORTH_REASON_FIELD)
+    return False, ""
+
+
+def _deal_reason_form_state_key(message_id: str, operator: str, article_id: str) -> str:
+    if not message_id or not operator or not article_id:
+        return ""
+    return f"{message_id}:{operator}:{article_id}"
+
+
+def _trim_deal_reason_form_state(state: dict[str, str]) -> None:
+    while len(state) > DEAL_REASON_FORM_STATE_LIMIT:
+        oldest = next(iter(state), None)
+        if oldest is None:
+            return
+        state.pop(oldest, None)
 
 
 def _model_form_state_from_snapshot(snapshot: llm_routing.RoutingSnapshot, target: str) -> dict[str, str]:

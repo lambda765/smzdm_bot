@@ -615,7 +615,36 @@ class FeishuBotParsingTests(unittest.TestCase):
             reason="价格一般",
         )
 
-    def test_memory_feedback_reason_allows_empty_reason(self) -> None:
+    def test_not_worth_reason_input_change_is_cached_without_dispatch(self) -> None:
+        binding_store = Mock()
+        binding_store.is_bound_operator.return_value = True
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=binding_store,
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        data = Mock()
+        data.event.action.value = {"article_id": "1001"}
+        data.event.action.name = NOT_WORTH_REASON_FIELD
+        data.event.action.option = None
+        data.event.action.input_value = "价格一般"
+        data.event.action.tag = "input"
+        data.event.operator.open_id = "ou_real_open_id"
+        data.event.context.open_message_id = "om_deal"
+
+        with patch.object(bot, "_dispatch_card_action") as dispatch:
+            result = bot._handle_card_action(data)
+
+        self.assertIsNone(result)
+        dispatch.assert_not_called()
+        binding_store.is_bound_operator.assert_called_once_with("ou_real_open_id")
+        self.assertEqual(bot._deal_reason_form_state["om_deal:ou_real_open_id:1001"], "价格一般")
+
+    def test_memory_feedback_reason_uses_cached_input_when_button_payload_omits_it(self) -> None:
+        mock_card = {"config": {}, "header": {}, "elements": []}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             callback = Mock(return_value="reason_updated")
@@ -628,16 +657,51 @@ class FeishuBotParsingTests(unittest.TestCase):
                     record_memory_feedback=callback,
                 )
             )
+            bot._deal_reason_form_state["om_deal:ou_real_open_id:1001"] = "价格一般"
 
-            with patch("smzdm_notice.feishu.bot.update_deal_card_feedback_state", return_value=None):
+            with patch("smzdm_notice.feishu.bot.update_deal_card_feedback_state", return_value=mock_card) as update_card:
                 result = bot._handle_memory_feedback(
                     "deal_not_worth_reason",
-                    {"article_id": "1001", "form_value": {NOT_WORTH_REASON_FIELD: {"value": ""}}},
+                    {"article_id": "1001"},
+                    "om_deal",
+                    "ou_real_open_id",
+                )
+
+        self.assertEqual(result.message, "已保存不值理由")
+        self.assertEqual(result.response_card, mock_card)
+        callback.assert_called_once_with("1001", "deal_not_worth", "价格一般")
+        update_card.assert_called_once_with(
+            "om_deal",
+            "1001",
+            selected="deal_not_worth",
+            reason="价格一般",
+        )
+        self.assertEqual(bot._deal_reason_form_state, {})
+
+    def test_memory_feedback_reason_without_input_does_not_clear_existing_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            callback = Mock()
+            bot = FeishuInteractiveBot(
+                BotRuntime(
+                    draft_store=DraftStore(root / "drafts.json", root / "backups", root / "audit.jsonl", root=root),
+                    binding_store=FeishuBindingStore(root / "binding.json"),
+                    status_provider=lambda: "status",
+                    run_once=Mock(return_value=True),
+                    record_memory_feedback=callback,
+                )
+            )
+
+            with patch("smzdm_notice.feishu.bot.update_deal_card_feedback_state") as update_card:
+                result = bot._handle_memory_feedback(
+                    "deal_not_worth_reason",
+                    {"article_id": "1001"},
                     "om_deal",
                 )
 
-        self.assertEqual(result.message, "已清空不值理由")
-        callback.assert_called_once_with("1001", "deal_not_worth", "")
+        self.assertEqual(result.message, "未填写不值理由，已保留不值反馈")
+        callback.assert_not_called()
+        update_card.assert_not_called()
 
     def test_help_content_includes_every_registered_command(self) -> None:
         content = help_markdown()

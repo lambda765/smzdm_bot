@@ -288,7 +288,10 @@ class NotifierBindingTests(unittest.TestCase):
 
         action_rows = [element for element in updated_cards[0]["elements"] if element.get("tag") == "action"]
         memory_actions = action_rows[0]["actions"]
-        self.assertTrue(any(action.get("name") == notifier.NOT_WORTH_REASON_FIELD for action in memory_actions))
+        reason_inputs = [action for action in memory_actions if action.get("name") == notifier.NOT_WORTH_REASON_FIELD]
+        self.assertEqual(len(reason_inputs), 1)
+        self.assertEqual(reason_inputs[0]["default_value"], "价格一般 非刚需")
+        self.assertEqual(reason_inputs[0]["value"]["article_id"], item.article_id)
         self.assertTrue(
             any(action.get("value", {}).get("action") == "deal_not_worth_reason" for action in memory_actions)
         )

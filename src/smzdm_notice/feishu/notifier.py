@@ -302,7 +302,14 @@ def _memory_action_buttons_from_value(
             buttons.append(_button_from_value("✅ 好价", "deal_good", base_value, "primary"))
         elif selected == "deal_not_worth":
             buttons.append(_button_from_value("❌ 不值", "deal_not_worth", base_value, "danger"))
-            buttons.append(_input(NOT_WORTH_REASON_FIELD, NOT_WORTH_REASON_PLACEHOLDER, default_value=reason))
+            buttons.append(
+                _input(
+                    NOT_WORTH_REASON_FIELD,
+                    NOT_WORTH_REASON_PLACEHOLDER,
+                    default_value=reason,
+                    value=base_value,
+                )
+            )
             buttons.append(_button_from_value("保存理由", "deal_not_worth_reason", base_value, "default"))
         else:
             buttons.append(_button_from_value("好价👍", "deal_good", base_value, "primary"))
@@ -567,7 +574,7 @@ def _plain_text(content: str) -> dict:
     return {"tag": "plain_text", "content": content}
 
 
-def _input(name: str, placeholder: str, default_value: str | None = None) -> dict:
+def _input(name: str, placeholder: str, default_value: str | None = None, value: dict | None = None) -> dict:
     payload: dict = {
         "tag": "input",
         "name": name,
@@ -575,6 +582,8 @@ def _input(name: str, placeholder: str, default_value: str | None = None) -> dic
     }
     if default_value is not None:
         payload["default_value"] = default_value
+    if value:
+        payload["value"] = value
     return payload
 
 

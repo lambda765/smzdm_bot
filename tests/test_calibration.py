@@ -23,7 +23,11 @@ def _make_record(article_id: str, action: str, category: str = "厨房小家电"
                  title: str = "测试商品", price: str = "99.9",
                  worthy: int = 100, unworthy: int = 5, comments: int = 200,
                  tags: list | None = None, search_keyword: str = "",
-                 decision_context: dict | None = None) -> dict:
+                 decision_context: dict | None = None,
+                 feedback_reason: str = "") -> dict:
+    feedback = {"action": action, "acted_at": "2026-06-01T10:30:00"}
+    if feedback_reason:
+        feedback["reason"] = feedback_reason
     return {
         "article_id": article_id, "title": title, "price": price,
         "mall": "京东", "brand": "测试品牌",
@@ -37,7 +41,7 @@ def _make_record(article_id: str, action: str, category: str = "厨房小家电"
             "snapshot_time": "2026-06-01T10:00:00",
             "decision_context": decision_context or {},
         },
-        "feedback": {"action": action, "acted_at": "2026-06-01T10:30:00"},
+        "feedback": feedback,
     }
 
 
@@ -157,6 +161,38 @@ class CalibrationGeneratorTests(unittest.TestCase):
             self.assertIn("急缺补货", text)
             self.assertIn("咖啡豆库存不足", text)
             self.assertIn("标准放宽", text)
+
+    def test_includes_feedback_reason_in_calibration_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = str(Path(tmp) / "memory.json")
+            store = DealMemoryStore(filepath)
+            gen = CalibrationGenerator(store, max_examples=5, min_category_records=2)
+            store._records["1"] = _make_record(
+                "1",
+                "deal_not_worth",
+                category="食品生鲜",
+                title="京鲜生 陕西大荔冬枣",
+                feedback_reason="水果类，值数不够高",
+            )
+            store._records["2"] = _make_record("2", "deal_not_worth", category="食品生鲜")
+
+            text = gen.build_section([_ranking_item("综合榜-食品生鲜")])
+
+            self.assertIn("用户反馈理由：水果类，值数不够高", text)
+
+    def test_omits_empty_feedback_reason_in_calibration_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = str(Path(tmp) / "memory.json")
+            store = DealMemoryStore(filepath)
+            gen = CalibrationGenerator(store, max_examples=5, min_category_records=2)
+            store._records["1"] = _make_record("1", "deal_not_worth", category="食品生鲜")
+            store._records["2"] = _make_record("2", "deal_not_worth", category="食品生鲜")
+
+            text = gen.build_section([_ranking_item("综合榜-食品生鲜")])
+
+            self.assertIn("不值案例", text)
+            self.assertNotIn("用户反馈理由： |", text)
+            self.assertNotIn("用户反馈理由：反馈时间", text)
 
     def test_respects_max_examples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
