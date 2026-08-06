@@ -73,10 +73,6 @@ class DealSendResult:
     def __bool__(self) -> bool:
         return bool(self.delivered_article_ids)
 
-    @property
-    def complete(self) -> bool:
-        return bool(self.delivered_article_ids) and not self.failed_article_ids
-
 
 def _current_binding() -> FeishuBinding | None:
     binding = _BINDING_STORE.get()
@@ -162,22 +158,32 @@ def update_card_message(message_id: str, card: Card) -> bool:
         return False
 
 
-def send_text_to(receive_id_type: str, receive_id: str, text: str) -> bool:
-    try:
-        CreateMessageRequest, CreateMessageRequestBody = get_message_models()
-        request = (
-            CreateMessageRequest.builder()
-            .receive_id_type(receive_id_type)
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(receive_id)
-                .msg_type("text")
-                .content(json.dumps({"text": text}, ensure_ascii=False))
-                .build()
-            )
+def _create_message(receive_id_type: str, receive_id: str, msg_type: str, content: str):
+    """统一构造并发送飞书消息，调用方负责解释不同消息类型的返回语义。"""
+    CreateMessageRequest, CreateMessageRequestBody = get_message_models()
+    request = (
+        CreateMessageRequest.builder()
+        .receive_id_type(receive_id_type)
+        .request_body(
+            CreateMessageRequestBody.builder()
+            .receive_id(receive_id)
+            .msg_type(msg_type)
+            .content(content)
             .build()
         )
-        response = get_lark_client().im.v1.message.create(request)
+        .build()
+    )
+    return get_lark_client().im.v1.message.create(request)
+
+
+def send_text_to(receive_id_type: str, receive_id: str, text: str) -> bool:
+    try:
+        response = _create_message(
+            receive_id_type,
+            receive_id,
+            "text",
+            json.dumps({"text": text}, ensure_ascii=False),
+        )
         if response.success():
             return True
         logger.error(f"飞书文本消息发送失败: code={response.code}, msg={response.msg}")
@@ -210,20 +216,12 @@ def _upload_file(file_name: str, content: bytes, file_type: str = "stream") -> s
 
 def _send_file_to(receive_id_type: str, receive_id: str, file_key: str) -> bool:
     try:
-        CreateMessageRequest, CreateMessageRequestBody = get_message_models()
-        request = (
-            CreateMessageRequest.builder()
-            .receive_id_type(receive_id_type)
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(receive_id)
-                .msg_type("file")
-                .content(json.dumps({"file_key": file_key}, ensure_ascii=False))
-                .build()
-            )
-            .build()
+        response = _create_message(
+            receive_id_type,
+            receive_id,
+            "file",
+            json.dumps({"file_key": file_key}, ensure_ascii=False),
         )
-        response = get_lark_client().im.v1.message.create(request)
         if response.success():
             logger.info(f"飞书文件消息发送成功: {getattr(response.data, 'message_id', '')}")
             return True
@@ -237,20 +235,12 @@ def _send_file_to(receive_id_type: str, receive_id: str, file_key: str) -> bool:
 def _send_card_to_message_id(receive_id_type: str, receive_id: str, card: Card) -> MessageId | None:
     """底层发送卡片消息，成功返回 message_id，失败返回 None。"""
     try:
-        CreateMessageRequest, CreateMessageRequestBody = get_message_models()
-        request = (
-            CreateMessageRequest.builder()
-            .receive_id_type(receive_id_type)
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(receive_id)
-                .msg_type("interactive")
-                .content(json.dumps(card, ensure_ascii=False))
-                .build()
-            )
-            .build()
+        response = _create_message(
+            receive_id_type,
+            receive_id,
+            "interactive",
+            json.dumps(card, ensure_ascii=False),
         )
-        response = get_lark_client().im.v1.message.create(request)
         if response.success():
             msg_id = str(getattr(response.data, "message_id", "") or "")
             logger.info(f"飞书应用消息发送成功: {msg_id}")
@@ -294,16 +284,6 @@ def send_deals(
     if failed:
         logger.warning(f"好价卡片部分发送失败: delivered={len(delivered)}, failed={len(failed)}")
     return DealSendResult(tuple(delivered), tuple(failed))
-
-
-def _build_deals_card(
-    items: list[tuple[RankingItem, str]],
-    price_bypass_article_ids: set[str],
-    notification_names_by_article_id: dict[str, str] | None = None,
-) -> Card:
-    notification_names_by_article_id = notification_names_by_article_id or {}
-    prepared = _prepare_deal_items(items, price_bypass_article_ids)
-    return _build_prepared_deals_card(prepared, notification_names_by_article_id)
 
 
 def _prepare_deal_items(

@@ -25,6 +25,11 @@ from smzdm_notice.feishu.card_payload import (
     trim_model_card_form_cache,
 )
 from smzdm_notice.feishu.commands import find_command_spec, help_markdown
+from smzdm_notice.feishu.model_actions import (
+    apply_model_route_card_action,
+    model_card_target,
+    resolve_model_test_config,
+)
 from smzdm_notice.feishu.model_cards import build_model_management_card, default_model_form_state
 from smzdm_notice.feishu.notifier import (
     ARBITRATION_CARD_KIND,
@@ -129,14 +134,6 @@ class CardActionDispatchResult:
 
     message: str
     response_card: dict | None = None
-
-
-@dataclass
-class ModelRouteUpdateResult:
-    """模型卡片修改路由后的快照和 toast 文案。"""
-
-    snapshot: llm_routing.RoutingSnapshot
-    message: str
 
 
 @dataclass
@@ -273,45 +270,62 @@ class FeishuInteractiveBot:
 
     def _handle_text_command(self, text: str, data, parent_id: str = "", reply_to_message_id: str = "") -> None:
         clean = strip_bot_mention(text)
-        if _is_bind_command(clean):
-            self._bind_current_conversation(data, reply_to_message_id)
+        if self._handle_binding_state(clean, data, reply_to_message_id):
             return
-        if not self.runtime.binding_store.get() and not _is_group_message(data):
-            self._bind_current_conversation(data, reply_to_message_id)
+        if self._handle_parent_draft(clean, parent_id, reply_to_message_id):
             return
-        if _is_unbind_command(clean):
-            self._unbind_current_operator(data, reply_to_message_id)
-            return
-        if not _is_allowed_message(data, self.runtime.binding_store):
-            self._maybe_prompt_bind(data, reply_to_message_id)
-            return
-        if parent_id:
-            original_draft = self.runtime.draft_store.get_any_by_preview_message_id(parent_id)
-            if original_draft:
-                if original_draft.status != "pending":
-                    disable_draft_card(parent_id, "该预览已失效，请以最新预览为准", original_draft)
-                    self._reply_text(reply_to_message_id, "该预览已失效，请以最新预览为准。")
-                    return
-                if original_draft.is_expired:
-                    self.runtime.draft_store.cancel(original_draft.draft_id)
-                    if original_draft.preview_message_id:
-                        disable_draft_card(
-                            original_draft.preview_message_id,
-                            "草案已超过 24 小时自动失效",
-                            original_draft,
-                        )
-                    self._reply_text(reply_to_message_id, "该预览已超过 24 小时自动失效，请发新消息重新生成。")
-                    return
-                self._handle_draft_revision(clean, original_draft, reply_to_message_id)
-                return
-            if not clean.startswith("/"):
-                self._reply_text(reply_to_message_id, "该回复引用的预览不存在或已失效，请发新消息重新生成。")
-                return
         if self._handle_slash_command(clean, reply_to_message_id):
             return
+        self._handle_new_draft(clean, reply_to_message_id)
+
+    def _handle_binding_state(self, text: str, data, reply_to_message_id: str) -> bool:
+        command = text.lower()
+        if command == "/bind":
+            self._bind_current_conversation(data, reply_to_message_id)
+            return True
+        # 私聊首次消息沿用自动绑定行为，消息本身不再继续生成草案。
+        if not self.runtime.binding_store.get() and not _is_group_message(data):
+            self._bind_current_conversation(data, reply_to_message_id)
+            return True
+        if command == "/unbind":
+            self._unbind_current_operator(data, reply_to_message_id)
+            return True
+        if not _is_allowed_message(data, self.runtime.binding_store):
+            self._maybe_prompt_bind(data, reply_to_message_id)
+            return True
+        return False
+
+    def _handle_parent_draft(self, text: str, parent_id: str, reply_to_message_id: str) -> bool:
+        if not parent_id:
+            return False
+        original_draft = self.runtime.draft_store.get_any_by_preview_message_id(parent_id)
+        if not original_draft:
+            # 未知草案上的斜杠命令仍按普通命令执行。
+            if text.startswith("/"):
+                return False
+            self._reply_text(reply_to_message_id, "该回复引用的预览不存在或已失效，请发新消息重新生成。")
+            return True
+        if original_draft.status != "pending":
+            disable_draft_card(parent_id, "该预览已失效，请以最新预览为准", original_draft)
+            self._reply_text(reply_to_message_id, "该预览已失效，请以最新预览为准。")
+            return True
+        if original_draft.is_expired:
+            self.runtime.draft_store.cancel(original_draft.draft_id)
+            if original_draft.preview_message_id:
+                disable_draft_card(
+                    original_draft.preview_message_id,
+                    "草案已超过 24 小时自动失效",
+                    original_draft,
+                )
+            self._reply_text(reply_to_message_id, "该预览已超过 24 小时自动失效，请发新消息重新生成。")
+            return True
+        self._handle_draft_revision(text, original_draft, reply_to_message_id)
+        return True
+
+    def _handle_new_draft(self, text: str, reply_to_message_id: str) -> None:
         processing = self._start_draft_processing(reply_to_message_id, "正在理解偏好/库存修改")
         try:
-            draft = build_message_draft(clean, self.runtime.draft_store)
+            draft = build_message_draft(text, self.runtime.draft_store)
         except Exception as e:
             self._stop_draft_processing(processing)
             logger.error(f"配置草案生成失败: {e}", exc_info=True)
@@ -379,38 +393,58 @@ class FeishuInteractiveBot:
         processing: DraftProgressCard | None = None,
     ) -> bool:
         processing = processing or DraftProgressCard()
-        preview_sent = False
-        final_card: dict | None = None
-        if processing.message_id and processing.streaming:
-            final_card = build_draft_preview_card(draft)
-            finish_result = self._finish_streaming_card(
-                processing,
-                final_card,
-                lock_timeout=DRAFT_STREAMING_FINALIZE_LOCK_TIMEOUT_SECONDS,
-            )
-            preview_sent = finish_result is True
-            if preview_sent and hasattr(draft, "preview_message_id"):
-                draft.preview_message_id = processing.message_id
-        elif processing.message_id:
-            preview_sent = update_draft_preview(processing.message_id, draft)
-            if not preview_sent:
-                logger.warning(f"处理中卡片更新为预览失败，回退为发送新预览: {processing.message_id}")
+        preview_sent = self._replace_processing_card_with_preview(draft, processing)
         fallback_preview_sent = False
         if not preview_sent:
             fallback_preview_sent = send_draft_preview(draft, reply_to_message_id=reply_to_message_id)
             preview_sent = fallback_preview_sent
         if fallback_preview_sent and processing.streaming:
             self._schedule_streaming_cleanup(processing, build_draft_handoff_card())
-        elif not preview_sent and processing.streaming and final_card is not None:
-            preview_sent = self._finish_streaming_card(processing, final_card) is True
-            if preview_sent and hasattr(draft, "preview_message_id"):
-                draft.preview_message_id = processing.message_id
+        elif not preview_sent and processing.streaming:
+            preview_sent = self._finish_streaming_preview(draft, processing)
         if not preview_sent:
             self.runtime.draft_store.cancel(draft.draft_id)
             return False
         if draft.preview_message_id:
             self.runtime.draft_store.update(draft)
         return True
+
+    def _replace_processing_card_with_preview(
+        self,
+        draft: ConfigDraft,
+        processing: DraftProgressCard,
+    ) -> bool:
+        if not processing.message_id:
+            return False
+        if processing.streaming:
+            return self._finish_streaming_preview(
+                draft,
+                processing,
+                lock_timeout=DRAFT_STREAMING_FINALIZE_LOCK_TIMEOUT_SECONDS,
+            )
+        preview_sent = update_draft_preview(processing.message_id, draft)
+        if not preview_sent:
+            logger.warning(f"处理中卡片更新为预览失败，回退为发送新预览: {processing.message_id}")
+        return preview_sent
+
+    def _finish_streaming_preview(
+        self,
+        draft: ConfigDraft,
+        processing: DraftProgressCard,
+        *,
+        lock_timeout: float | None = None,
+    ) -> bool:
+        preview_sent = (
+            self._finish_streaming_card(
+                processing,
+                build_draft_preview_card(draft),
+                lock_timeout=lock_timeout,
+            )
+            is True
+        )
+        if preview_sent:
+            draft.preview_message_id = processing.message_id
+        return preview_sent
 
     def _start_draft_processing(self, reply_to_message_id: str, stage: str) -> DraftProgressCard:
         """优先发送流式进度卡；失败时发送不定时刷新的普通进度卡。"""
@@ -607,22 +641,7 @@ class FeishuInteractiveBot:
             card_token = str(getattr(getattr(data.event, "action", None), "token", "") or "")
             logger.info(f"收到飞书卡片操作: action={action}, operator={operator}, card_token={card_token}")
             if not action:
-                field = model_card_field_from_callback(value)
-                if field == NOT_WORTH_REASON_FIELD:
-                    if not self.runtime.binding_store.is_bound_operator(operator):
-                        logger.debug(f"忽略未授权不值理由输入变更: operator={operator}")
-                        return None
-                    self._remember_deal_reason_form_value(reply_to_message_id, operator, value)
-                    return None
-                if field in {"target", "connection", "model_id", "temperature"}:
-                    if not self.runtime.binding_store.is_bound_operator(operator):
-                        logger.debug(f"忽略未授权模型卡片表单变更: operator={operator}, field={field}")
-                        return None
-                    self._remember_model_card_form_value(reply_to_message_id, operator, value)
-                if field in {"target", "connection"}:
-                    return self._handle_model_form_change(reply_to_message_id, operator)
-                logger.debug(f"忽略飞书卡片表单变更回调: operator={operator}, keys={sorted(value.keys())}")
-                return None
+                return self._handle_card_form_callback(value, operator, reply_to_message_id)
             if not self.runtime.binding_store.is_bound_operator(operator):
                 message = "只有当前绑定用户可以操作卡片"
                 self._reply_text(reply_to_message_id, message)
@@ -641,6 +660,26 @@ class FeishuInteractiveBot:
             self._reply_text(reply_to_message_id, message)
             result = CardActionDispatchResult(message)
         return _card_response(result.message, result.response_card)
+
+    def _handle_card_form_callback(self, value: dict, operator: str, message_id: str) -> object | None:
+        field = model_card_field_from_callback(value)
+        if field == NOT_WORTH_REASON_FIELD:
+            if not self.runtime.binding_store.is_bound_operator(operator):
+                logger.debug(f"忽略未授权不值理由输入变更: operator={operator}")
+                return None
+            self._remember_deal_reason_form_value(message_id, operator, value)
+            return None
+        if field not in {"target", "connection", "model_id", "temperature"}:
+            logger.debug(f"忽略飞书卡片表单变更回调: operator={operator}, keys={sorted(value.keys())}")
+            return None
+        if not self.runtime.binding_store.is_bound_operator(operator):
+            logger.debug(f"忽略未授权模型卡片表单变更: operator={operator}, field={field}")
+            return None
+        self._remember_model_card_form_value(message_id, operator, value)
+        if field in {"target", "connection"}:
+            return self._handle_model_form_change(message_id, operator)
+        logger.debug(f"已缓存飞书模型卡片表单变更: operator={operator}, field={field}")
+        return None
 
     def _dispatch_card_action(
         self,
@@ -745,50 +784,58 @@ class FeishuInteractiveBot:
             if not reason:
                 message = "未填写不值理由，已保留不值反馈"
                 return CardActionDispatchResult(message)
-        if self.runtime.record_memory_feedback is not None:
-            if reason is None:
-                result = self.runtime.record_memory_feedback(article_id, feedback_action)
-            else:
-                result = self.runtime.record_memory_feedback(article_id, feedback_action, reason)
-        else:
-            result = "not_found"
+        result = self._record_memory_feedback(article_id, feedback_action, reason)
+        return self._memory_feedback_result(
+            result,
+            article_id,
+            feedback_action,
+            reason,
+            reply_to_message_id,
+            operator,
+        )
 
+    def _record_memory_feedback(self, article_id: str, action: str, reason: str | None) -> str:
+        recorder = self.runtime.record_memory_feedback
+        if recorder is None:
+            return "not_found"
+        if reason is None:
+            return recorder(article_id, action)
+        return recorder(article_id, action, reason)
+
+    def _memory_feedback_result(
+        self,
+        result: str,
+        article_id: str,
+        feedback_action: str,
+        reason: str | None,
+        message_id: str,
+        operator: str,
+    ) -> CardActionDispatchResult:
         label = "好价" if feedback_action == "deal_good" else "不值"
-        updated_card = None
-        if result == "recorded":
-            message = f"已标记为{label}，偏好将用于后续推荐"
-            updated_card = update_deal_card_feedback_state(
-                reply_to_message_id,
-                article_id,
-                selected=feedback_action,
-                reason=reason or "",
-            )
-        elif result == "updated":
-            message = f"已更新为{label}，偏好将用于后续推荐"
-            updated_card = update_deal_card_feedback_state(
-                reply_to_message_id,
-                article_id,
-                selected=feedback_action,
-                reason=reason or "",
-            )
-        elif result == "reason_updated":
-            message = "已保存不值理由"
-            updated_card = update_deal_card_feedback_state(
-                reply_to_message_id,
-                article_id,
-                selected="deal_not_worth",
-                reason=reason or "",
-            )
-            self._forget_deal_reason_form_value(reply_to_message_id, operator, article_id)
-        elif result == "cancelled":
-            message = "已取消反馈"
-            updated_card = update_deal_card_feedback_state(reply_to_message_id, article_id, selected="")
-            self._forget_deal_reason_form_value(reply_to_message_id, operator, article_id)
-        elif result == "invalid_action":
-            message = "未知反馈操作"
-        else:
-            message = "反馈记录失败，该商品可能已过期或记忆功能未启用。"
-
+        messages = {
+            "recorded": f"已标记为{label}，偏好将用于后续推荐",
+            "updated": f"已更新为{label}，偏好将用于后续推荐",
+            "reason_updated": "已保存不值理由",
+            "cancelled": "已取消反馈",
+            "invalid_action": "未知反馈操作",
+        }
+        message = messages.get(result, "反馈记录失败，该商品可能已过期或记忆功能未启用。")
+        selected_by_result = {
+            "recorded": feedback_action,
+            "updated": feedback_action,
+            "reason_updated": "deal_not_worth",
+            "cancelled": "",
+        }
+        if result not in selected_by_result:
+            return CardActionDispatchResult(message)
+        updated_card = update_deal_card_feedback_state(
+            message_id,
+            article_id,
+            selected=selected_by_result[result],
+            reason=reason or "",
+        )
+        if result in {"reason_updated", "cancelled"}:
+            self._forget_deal_reason_form_value(message_id, operator, article_id)
         return CardActionDispatchResult(message, updated_card)
 
     def _remember_deal_reason_form_value(self, message_id: str, operator: str, value: dict) -> None:
@@ -881,14 +928,27 @@ class FeishuInteractiveBot:
             return False
         command = _command_key(text)
         if not find_command_spec(command):
-            if command.startswith("/search"):
-                self._reply_text(reply_to_message_id, _search_usage_text())
-                return True
-            if command.startswith("/model"):
-                self._reply_text(reply_to_message_id, _model_usage_text())
-                return True
-            return False
+            return self._handle_unknown_slash_command(command, reply_to_message_id)
+        if self._handle_simple_slash_command(command, reply_to_message_id):
+            return True
+        if command.startswith("/search"):
+            self._handle_search_command(text, command, reply_to_message_id)
+            return True
+        if command.startswith("/model"):
+            self._handle_model_command(command, reply_to_message_id)
+            return True
+        return False
 
+    def _handle_unknown_slash_command(self, command: str, reply_to_message_id: str) -> bool:
+        if command.startswith("/search"):
+            self._reply_text(reply_to_message_id, _search_usage_text())
+            return True
+        if command.startswith("/model"):
+            self._reply_text(reply_to_message_id, _model_usage_text())
+            return True
+        return False
+
+    def _handle_simple_slash_command(self, command: str, reply_to_message_id: str) -> bool:
         if command == "/help":
             content = help_markdown()
             if not send_help(content, reply_to_message_id=reply_to_message_id):
@@ -907,12 +967,6 @@ class FeishuInteractiveBot:
                 return True
             started = self.runtime.restart()
             self._reply_text(reply_to_message_id, "正在重启程序..." if started else "已在重启中，请稍候")
-            return True
-        if command.startswith("/search"):
-            self._handle_search_command(text, command, reply_to_message_id)
-            return True
-        if command.startswith("/model"):
-            self._handle_model_command(command, reply_to_message_id)
             return True
         return False
 
@@ -954,12 +1008,12 @@ class FeishuInteractiveBot:
             if action == "model_refresh":
                 return CardActionDispatchResult("已刷新 LLM 路由", _build_model_management_card_response())
             if action == "model_test":
-                message = _run_model_test(_resolve_model_test_config_from_card_value(value))
+                message = _run_model_test(resolve_model_test_config(value))
                 return CardActionDispatchResult(
                     message,
                     _build_model_management_card_response(form_state=_extract_form_state(value)),
                 )
-            result = _apply_model_route_card_action(action, value)
+            result = apply_model_route_card_action(action, value)
             logger.info(
                 "LLM 路由卡片操作成功: "
                 f"action={action}, target={optional_model_card_field_value(value, 'target') or 'default'}, "
@@ -967,7 +1021,7 @@ class FeishuInteractiveBot:
                 f"model_id={optional_model_card_field_value(value, 'model_id')}"
             )
             form_state = (
-                _model_form_state_from_snapshot(result.snapshot, _model_card_target(value))
+                _model_form_state_from_snapshot(result.snapshot, model_card_target(value))
                 if action == "model_reset_agent"
                 else _extract_form_state(value)
             )
@@ -1094,7 +1148,8 @@ class FeishuInteractiveBot:
     def _send_to_sender(self, data, text: str, reply_to_message_id: str = "") -> bool:
         if reply_to_message_id and reply_text(reply_to_message_id, text):
             return True
-        return _send_to_sender(data, text)
+        open_id = _extract_sender_open_id(data)
+        return bool(open_id) and send_text_to("open_id", open_id, text)
 
 
 def start_bot_thread(runtime: BotRuntime) -> threading.Thread | None:
@@ -1179,26 +1234,6 @@ def _is_allowed_message(data, binding_store: FeishuBindingStore) -> bool:
     if binding.receive_id_type == "chat_id":
         return _message_chat_id(data) == binding.receive_id
     return binding.receive_id == operator_open_id
-
-
-def _maybe_prompt_bind(data) -> None:
-    if not _is_group_message(data):
-        _send_to_sender(data, "请先发送 /bind 完成绑定，后续通知会发到这个私聊。")
-
-
-def _send_to_sender(data, text: str) -> bool:
-    open_id = _extract_sender_open_id(data)
-    if not open_id:
-        return False
-    return send_text_to("open_id", open_id, text)
-
-
-def _is_bind_command(text: str) -> bool:
-    return text.strip().lower() == "/bind"
-
-
-def _is_unbind_command(text: str) -> bool:
-    return text.strip().lower() == "/unbind"
 
 
 def _command_key(text: str) -> str:
@@ -1286,95 +1321,6 @@ def _model_form_state_from_snapshot(snapshot: llm_routing.RoutingSnapshot, targe
     if resolved.temperature is not None:
         result["temperature"] = str(resolved.temperature)
     return result
-
-
-def _apply_model_route_card_action(action: str, value: dict) -> ModelRouteUpdateResult:
-    """持久化一次模型管理卡片路由操作。"""
-    target = _model_card_target(value)
-    if action == "model_apply_connection_model":
-        connection = optional_model_card_field_value(value, "connection")
-        model_id = optional_model_card_field_value(value, "model_id")
-        if not connection:
-            raise ValueError("请选择 connection 后再应用")
-        if not model_id:
-            raise ValueError("请输入 model_id 后再应用")
-        if target == "default":
-            snapshot = llm_routing.use_default_connection_model(connection, model_id)
-        else:
-            snapshot = llm_routing.use_agent_model(target, model_id, connection=connection)
-        return ModelRouteUpdateResult(snapshot, f"已更新 {_model_route_label(snapshot, target)}，下一次 LLM 调用生效。")
-    if action == "model_apply_model":
-        model_id = _model_card_required(value, "model_id", "请输入 model_id 后再应用")
-        if target == "default":
-            snapshot = llm_routing.use_default_model(model_id)
-        else:
-            snapshot = llm_routing.use_agent_model(target, model_id)
-        return ModelRouteUpdateResult(snapshot, f"已更新 {_model_route_label(snapshot, target)}，下一次 LLM 调用生效。")
-    if action == "model_set_temperature":
-        temperature = _model_card_temperature(value)
-        if target == "default":
-            snapshot = llm_routing.set_default_temperature(temperature)
-        else:
-            snapshot = llm_routing.set_agent_temperature(target, temperature)
-        return ModelRouteUpdateResult(snapshot, f"已更新 {_model_temperature_label(target, temperature)}，下一次 LLM 调用生效。")
-    if action == "model_reset_agent":
-        if target == "default":
-            raise ValueError("默认配置不能 reset，请直接应用新的 connection/model_id")
-        snapshot = llm_routing.reset_agent(target)
-        return ModelRouteUpdateResult(snapshot, f"已重置 {_model_route_label(snapshot, target)}，下一次 LLM 调用生效。")
-    raise ValueError(f"未知操作：{action}")
-
-
-def _model_route_label(snapshot: llm_routing.RoutingSnapshot, target: str) -> str:
-    if target == "default":
-        defaults = snapshot.raw.get("defaults", {})
-        if not isinstance(defaults, dict):
-            return "default"
-        return f"default: {defaults.get('connection')}/{defaults.get('model_id')}"
-    resolved = snapshot.resolve(target)
-    return f"{target}: {resolved.connection}/{resolved.model_id}"
-
-
-def _model_temperature_label(target: str, temperature: float) -> str:
-    return f"{target} temperature={temperature:g}"
-
-
-def _resolve_model_test_config_from_card_value(value: dict) -> ResolvedLLMConfig:
-    """从卡片字段解析模型测试目标，不修改路由配置。"""
-    connection = optional_model_card_field_value(value, "connection")
-    model_id = optional_model_card_field_value(value, "model_id")
-    if connection and model_id:
-        return llm_routing.test_config_for_connection(connection, model_id)
-    target = _model_card_target(value)
-    if target != "default":
-        return llm_routing.test_config_for_agent(target)
-    state = llm_routing.model_card_state()
-    defaults = state.get("defaults", {})
-    if not isinstance(defaults, dict):
-        raise ValueError("默认 LLM 配置不可用")
-    return llm_routing.test_config_for_connection(str(defaults.get("connection") or ""), str(defaults.get("model_id") or ""))
-
-
-def _model_card_target(value: dict) -> str:
-    target = optional_model_card_field_value(value, "target") or "default"
-    if target == "default" or target in AGENTS:
-        return target
-    raise ValueError("作用范围必须是 default/filter/arbiter/draft")
-
-
-def _model_card_temperature(value: dict) -> float:
-    raw = _model_card_required(value, "temperature", "请输入 temperature")
-    try:
-        return float(raw)
-    except ValueError as e:
-        raise ValueError("temperature 必须是数字") from e
-
-
-def _model_card_required(value: dict, key: str, message: str) -> str:
-    clean = optional_model_card_field_value(value, key)
-    if not clean:
-        raise ValueError(message)
-    return clean
 
 
 def _run_model_test(llm_config: ResolvedLLMConfig) -> str:

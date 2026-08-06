@@ -386,6 +386,15 @@ def _resolve_agent(
 def _validate_raw(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> None:
     _object(raw, "llm routing")
     connections = _object(raw.get("connections"), "connections")
+    _validate_connections(connections)
+    _validate_defaults(_object(raw.get("defaults"), "defaults"))
+    agents = _object(raw.get("agents", {}), "agents")
+    _validate_agent_names(agents)
+    for agent in AGENTS:
+        _validate_resolved_agent(_resolve_agent(raw, agent, env=env))
+
+
+def _validate_connections(connections: dict[str, Any]) -> None:
     if not connections:
         raise LLMRoutingError("connections 至少需要一个连接")
     for name, value in connections.items():
@@ -399,27 +408,29 @@ def _validate_raw(raw: dict[str, Any], env: Mapping[str, str] | None = None) -> 
             if not str(conn.get(key) or "").strip():
                 raise LLMRoutingError(f"connections.{name}.{key} 未配置")
 
-    defaults = _object(raw.get("defaults"), "defaults")
+
+def _validate_defaults(defaults: dict[str, Any]) -> None:
     if not str(defaults.get("connection") or "").strip():
         raise LLMRoutingError("defaults.connection 未配置")
     if not str(defaults.get("model_id") or "").strip():
         raise LLMRoutingError("defaults.model_id 未配置")
 
-    agents = _object(raw.get("agents", {}), "agents")
+
+def _validate_agent_names(agents: dict[str, Any]) -> None:
     unknown_agents = sorted(set(agents) - set(AGENTS))
     if unknown_agents:
         raise LLMRoutingError("未知 LLM agent: " + ", ".join(unknown_agents))
 
-    for agent in AGENTS:
-        resolved = _resolve_agent(raw, agent, env=env)
-        if not resolved.api_key:
-            raise LLMRoutingError(f"{agent} 使用的密钥环境变量未配置: {resolved.api_key_env}")
-        if not resolved.base_url:
-            raise LLMRoutingError(f"{agent} 使用的 base_url 未配置")
-        if resolved.provider != "openai_compatible":
-            raise LLMRoutingError(f"{agent} provider 不支持: {resolved.provider}")
-        if resolved.temperature is not None:
-            _validate_temperature(resolved.temperature)
+
+def _validate_resolved_agent(resolved: ResolvedLLMConfig) -> None:
+    if not resolved.api_key:
+        raise LLMRoutingError(f"{resolved.agent} 使用的密钥环境变量未配置: {resolved.api_key_env}")
+    if not resolved.base_url:
+        raise LLMRoutingError(f"{resolved.agent} 使用的 base_url 未配置")
+    if resolved.provider != "openai_compatible":
+        raise LLMRoutingError(f"{resolved.agent} provider 不支持: {resolved.provider}")
+    if resolved.temperature is not None:
+        _validate_temperature(resolved.temperature)
 
 
 def _merge_request(default_request: Any, agent_request: Any) -> dict[str, Any]:

@@ -47,6 +47,30 @@ def _actions(card: dict) -> list[dict]:
     return [_callback_value(component) for component in _components(card) if _callback_value(component).get("action")]
 
 
+def _send_single_deals_card(
+    items: list[tuple[RankingItem, str]],
+    price_bypass_article_ids: set[str] | None = None,
+    notification_names_by_article_id: dict[str, str] | None = None,
+) -> dict:
+    """通过真实发送入口捕获单张商品卡，避免为测试保留生产构造包装器。"""
+    sent_cards: list[dict] = []
+    with (
+        patch("smzdm_notice.feishu.notifier.get_feishu_image_key", return_value=""),
+        patch(
+            "smzdm_notice.feishu.notifier._send_card_message_id",
+            side_effect=lambda card: sent_cards.append(card) or "om_deal",
+        ),
+    ):
+        result = notifier.send_deals(
+            items,
+            price_bypass_article_ids=price_bypass_article_ids,
+            notification_names_by_article_id=notification_names_by_article_id,
+        )
+    if len(sent_cards) != 1 or result.failed_article_ids:
+        raise AssertionError("测试商品应生成且成功发送一张卡片")
+    return sent_cards[0]
+
+
 def _item(pic: str = "https://img.example.com/a.jpg") -> RankingItem:
     return RankingItem(
         rank=1,
@@ -209,10 +233,9 @@ class NotifierBindingTests(unittest.TestCase):
         second.article_id = "2"
         third.article_id = "3"
 
-        card = notifier._build_deals_card(
+        card = _send_single_deals_card(
             [(first, "A"), (second, "B"), (third, "C")],
-            set(),
-            {"1": "纸尿裤", "2": "纸尿裤", "3": "蓝莓"},
+            notification_names_by_article_id={"1": "纸尿裤", "2": "纸尿裤", "3": "蓝莓"},
         )
 
         self.assertEqual(card["config"]["summary"]["content"], "好价：纸尿裤×2、蓝莓")
@@ -227,10 +250,9 @@ class NotifierBindingTests(unittest.TestCase):
         second.article_id, second.title = "2", "缺名商品正文一"
         third.article_id, third.title = "3", "缺名商品正文二"
 
-        card = notifier._build_deals_card(
+        card = _send_single_deals_card(
             [(first, "A"), (second, "B"), (third, "C")],
-            set(),
-            {"1": "蓝莓"},
+            notification_names_by_article_id={"1": "蓝莓"},
         )
 
         self.assertEqual(card["config"]["summary"]["content"], "好价：蓝莓等 3 件")
@@ -244,7 +266,7 @@ class NotifierBindingTests(unittest.TestCase):
         items[0][0].article_id = "1"
         items[1][0].article_id = "2"
 
-        card = notifier._build_deals_card(items, set(), {})
+        card = _send_single_deals_card(items)
 
         self.assertEqual(card["config"]["summary"]["content"], "推荐了 2 个商品")
 
@@ -262,8 +284,7 @@ class NotifierBindingTests(unittest.TestCase):
         items.insert(0, (search_item, "bypass"))
         names[search_item.article_id] = search_item.search_keyword
 
-        card = notifier._build_deals_card(items, {"search"}, names)
-        summary = card["config"]["summary"]["content"]
+        summary = notifier._build_deals_summary(items, names)
 
         self.assertTrue(summary.startswith("好价：AirPods Pro 2"))
         self.assertTrue(summary.endswith("等 9 件"))
@@ -284,7 +305,7 @@ class NotifierBindingTests(unittest.TestCase):
             "connections": [{"name": "test", "label": "Test", "key_configured": True}],
         }
         cards = [
-            notifier._build_deals_card([(_item(pic=""), "reason")], set()),
+            _send_single_deals_card([(_item(pic=""), "reason")]),
             notifier.build_help_card("help"),
             notifier.build_draft_preview_card(draft),
             notifier.build_draft_processing_card(),
@@ -459,7 +480,8 @@ class NotifierBindingTests(unittest.TestCase):
         ):
             result = notifier.send_deals(items)
 
-        self.assertTrue(result.complete)
+        self.assertEqual(result.delivered_article_ids, tuple(str(index) for index in range(20)))
+        self.assertFalse(result.failed_article_ids)
         self.assertGreater(len(sent_cards), 1)
         self.assertEqual(get_image_key.call_count, len(items))
         sent_order = [

@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
 
 from dotenv import load_dotenv
 
@@ -64,29 +63,6 @@ def _get_float(key: str, default: float = 0.0) -> float:
 
 def _get_fallback(key: str, fallback: str) -> str:
     return _get(key) or fallback
-
-
-def _get_float_fallback(key: str, fallback: float) -> float:
-    val = _get(key)
-    if not val:
-        return fallback
-    try:
-        return float(val)
-    except ValueError:
-        return fallback
-
-
-def _get_json_object(key: str) -> dict[str, Any]:
-    raw = _get(key)
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return data
 
 
 def _clamp_rate(value: float) -> float:

@@ -165,21 +165,10 @@ class DraftStore:
 
     def apply(self, draft_id: str, operator: str = "") -> tuple[bool, str]:
         with self._lock:
-            draft = self._drafts.get(draft_id)
-            if not draft:
-                return False, "草案不存在或已过期"
-            if draft.status == "applied":
-                return True, "草案已应用过"
-            if draft.status != "pending":
-                return False, f"草案状态不是 pending: {draft.status}"
-            if draft.is_expired:
-                draft.status = "cancelled"
-                self._save()
-                return False, "草案已超过 24 小时自动失效"
-            if self._is_signature_applied(draft.signature):
-                draft.status = "applied"
-                self._save()
-                return True, "相同修改已采纳过，已标记为完成"
+            draft, early_result = self._prepare_draft_for_apply(draft_id)
+            if early_result is not None:
+                return early_result
+            assert draft is not None
 
             target_path = self._target_path(draft.target_file)
             if not target_path.exists():
@@ -188,25 +177,47 @@ class DraftStore:
             original = target_path.read_text(encoding="utf-8")
             backup_path = self._backup(target_path)
 
-            mode = draft.edit_mode or "append"
-            if mode == "append":
-                new_content = self._apply_append(original, draft)
-            elif mode == "replace":
-                new_content, err = self._apply_replace(original, draft)
-                if err:
-                    return False, err
-            elif mode == "delete":
-                new_content, err = self._apply_delete(original, draft)
-                if err:
-                    return False, err
-            else:
-                return False, f"未知的 edit_mode: {mode}"
+            new_content, error = self._apply_edit(original, draft)
+            if error:
+                return False, error
 
             target_path.write_text(new_content, encoding="utf-8")
             draft.status = "applied"
             self._save()
             self._append_audit(draft, "applied", operator, backup_path)
             return True, f"已写入 {draft.target_file}，备份：{backup_path.name}"
+
+    def _prepare_draft_for_apply(
+        self,
+        draft_id: str,
+    ) -> tuple[ConfigDraft | None, tuple[bool, str] | None]:
+        """在持锁状态下检查草案状态，并完成幂等状态更新。"""
+        draft = self._drafts.get(draft_id)
+        if not draft:
+            return None, (False, "草案不存在或已过期")
+        if draft.status == "applied":
+            return draft, (True, "草案已应用过")
+        if draft.status != "pending":
+            return draft, (False, f"草案状态不是 pending: {draft.status}")
+        if draft.is_expired:
+            draft.status = "cancelled"
+            self._save()
+            return draft, (False, "草案已超过 24 小时自动失效")
+        if self._is_signature_applied(draft.signature):
+            draft.status = "applied"
+            self._save()
+            return draft, (True, "相同修改已采纳过，已标记为完成")
+        return draft, None
+
+    def _apply_edit(self, original: str, draft: ConfigDraft) -> tuple[str, str | None]:
+        mode = draft.edit_mode or "append"
+        if mode == "append":
+            return self._apply_append(original, draft), None
+        if mode == "replace":
+            return self._apply_replace(original, draft)
+        if mode == "delete":
+            return self._apply_delete(original, draft)
+        return original, f"未知的 edit_mode: {mode}"
 
     def _apply_append(self, original: str, draft: ConfigDraft) -> str:
         append_text = draft.append_text.strip()

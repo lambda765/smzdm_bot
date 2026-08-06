@@ -25,7 +25,6 @@ from smzdm_notice.core.near_miss import NearMissManager
 from smzdm_notice.feishu.binding import FeishuBindingStore
 from smzdm_notice.feishu.bot import BotRuntime, start_bot_thread
 from smzdm_notice.feishu.notifier import (
-    DealSendResult,
     disable_draft_card,
     send_arbitration,
     send_config_warning,
@@ -603,7 +602,8 @@ def _send_matches_and_persist_runtime_state(
         price_bypass_article_ids=price_bypass_article_ids,
         notification_names_by_article_id=notification_names_by_article_id,
     )
-    delivered = _delivered_matches(send_result, matched)
+    delivered_ids = set(send_result.delivered_article_ids)
+    delivered = [(item, reason) for item, reason in matched if item.article_id in delivered_ids]
     if delivered:
         global _last_push_time
         _last_push_time = time.time()
@@ -632,17 +632,6 @@ def _send_matches_and_persist_runtime_state(
     else:
         logger.error("推送失败")
     return bool(delivered)
-
-
-def _delivered_matches(
-    send_result: DealSendResult | bool,
-    matched: list[tuple[RankingItem, str]],
-) -> list[tuple[RankingItem, str]]:
-    """兼容旧布尔替身，并从真实拆卡结果中筛出已送达商品。"""
-    if isinstance(send_result, DealSendResult):
-        delivered_ids = set(send_result.delivered_article_ids)
-        return [(item, reason) for item, reason in matched if item.article_id in delivered_ids]
-    return matched if send_result else []
 
 
 def _split_price_bypass_items(items: list[RankingItem]) -> tuple[list[tuple[RankingItem, str]], list[RankingItem]]:

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import smzdm_notice.runtime as main
 from smzdm_notice.core.calibration import MemoryAnalysis
 from smzdm_notice.core.memory import DealMemoryStore
+from smzdm_notice.feishu.notifier import DealSendResult
 from smzdm_notice.llm.models import ArbiterInfo, FilterDiagnostics, FilterItemsResult, FilterResult
 from smzdm_notice.preferences.models import ConfigDraft
 from smzdm_notice.preferences.store import DraftStore
@@ -328,39 +329,6 @@ class MainConfigParsingTests(unittest.TestCase):
             self.assertEqual(main.config._get_fallback("VALUE", "fallback"), "configured")
             self.assertEqual(main.config._get_fallback("EMPTY", "fallback"), "fallback")
             self.assertEqual(main.config._get_fallback("MISSING", "fallback"), "fallback")
-
-    def test_get_float_fallback_parses_values_and_falls_back(self) -> None:
-        with patch.dict(os.environ, {"TIMEOUT": "123.5", "EMPTY_TIMEOUT": "", "BAD_TIMEOUT": "bad"}, clear=False):
-            self.assertEqual(main.config._get_float_fallback("TIMEOUT", 300.0), 123.5)
-            self.assertEqual(main.config._get_float_fallback("EMPTY_TIMEOUT", 300.0), 300.0)
-            self.assertEqual(main.config._get_float_fallback("BAD_TIMEOUT", 300.0), 300.0)
-            self.assertEqual(main.config._get_float_fallback("MISSING_TIMEOUT", 300.0), 300.0)
-
-    def test_get_json_object_parses_object_values(self) -> None:
-        with patch.dict(
-            os.environ,
-            {"EXTRA_BODY": '{"custom_flag": false, "nested": {"mode": "strict"}, "number": 0.8}'},
-            clear=False,
-        ):
-            self.assertEqual(
-                main.config._get_json_object("EXTRA_BODY"),
-                {"custom_flag": False, "nested": {"mode": "strict"}, "number": 0.8},
-            )
-
-    def test_get_json_object_rejects_empty_invalid_and_non_object_values(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                "EMPTY_JSON": "",
-                "BAD_JSON": "{bad",
-                "ARRAY_JSON": '["not", "object"]',
-            },
-            clear=False,
-        ):
-            self.assertEqual(main.config._get_json_object("EMPTY_JSON"), {})
-            self.assertEqual(main.config._get_json_object("BAD_JSON"), {})
-            self.assertEqual(main.config._get_json_object("ARRAY_JSON"), {})
-            self.assertEqual(main.config._get_json_object("MISSING_JSON"), {})
 
     def test_clamp_rate_limits_to_zero_one_range(self) -> None:
         self.assertEqual(main.config._clamp_rate(-0.1), 0.0)
@@ -697,7 +665,12 @@ class MainSearchPriceBypassTests(unittest.TestCase):
                     ),
                 )
             )
-            send_deals = stack.enter_context(patch("smzdm_notice.runtime.send_deals", return_value=True))
+            send_deals = stack.enter_context(
+                patch(
+                    "smzdm_notice.runtime.send_deals",
+                    return_value=DealSendResult(("bypass", "llm")),
+                )
+            )
             stack.enter_context(patch("smzdm_notice.runtime._maybe_send_daily_digest"))
             stack.enter_context(patch("smzdm_notice.runtime._check_heartbeat"))
 
@@ -746,7 +719,12 @@ class MainSearchPriceBypassTests(unittest.TestCase):
                         ),
                     )
                 )
-                stack.enter_context(patch("smzdm_notice.runtime.send_deals", return_value=True))
+                stack.enter_context(
+                    patch(
+                        "smzdm_notice.runtime.send_deals",
+                        return_value=DealSendResult(("bypass", "llm")),
+                    )
+                )
                 stack.enter_context(patch("smzdm_notice.runtime._maybe_send_daily_digest"))
                 stack.enter_context(patch("smzdm_notice.runtime._check_heartbeat"))
 
@@ -773,7 +751,12 @@ class MainSearchPriceBypassTests(unittest.TestCase):
                 stack.enter_context(patch("smzdm_notice.runtime.fetch_all_sources", return_value=[bypass]))
                 stack.enter_context(patch("smzdm_notice.runtime._refresh_runtime_config", return_value=("pref", "inv")))
                 filter_items = stack.enter_context(patch("smzdm_notice.runtime.filter_items"))
-                stack.enter_context(patch("smzdm_notice.runtime.send_deals", return_value=True))
+                stack.enter_context(
+                    patch(
+                        "smzdm_notice.runtime.send_deals",
+                        return_value=DealSendResult(("bypass",)),
+                    )
+                )
                 stack.enter_context(patch("smzdm_notice.runtime._maybe_send_daily_digest"))
                 stack.enter_context(patch("smzdm_notice.runtime._check_heartbeat"))
 
@@ -793,7 +776,7 @@ class MainSearchPriceBypassTests(unittest.TestCase):
 
         with patch(
             "smzdm_notice.runtime.send_deals",
-            return_value=main.DealSendResult(("delivered",), ("failed",)),
+            return_value=DealSendResult(("delivered",), ("failed",)),
         ):
             success = main._send_matches_and_persist_runtime_state(
                 [(delivered_item, "推荐 A"), (failed_item, "推荐 B")],

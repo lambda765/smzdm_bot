@@ -2418,7 +2418,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         )
 
         with (
-            patch("smzdm_notice.feishu.bot._apply_model_route_card_action", side_effect=RuntimeError("boom")),
+            patch("smzdm_notice.feishu.bot.apply_model_route_card_action", side_effect=RuntimeError("boom")),
             patch("smzdm_notice.feishu.bot.llm_routing.model_card_state", return_value=_model_card_state()),
         ):
             result = bot._dispatch_card_action(
