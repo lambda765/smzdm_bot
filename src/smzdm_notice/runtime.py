@@ -46,23 +46,6 @@ from smzdm_notice.smzdm.keywords import SearchKeywordRule
 from smzdm_notice.smzdm.ranking import RANKINGS, RankingItem
 from smzdm_notice.smzdm.sources import fetch_all_sources
 
-# ========== 日志配置 ==========
-
-config.ensure_workspace_dirs()
-logger.remove()
-logger.add(
-    sys.stderr,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
-    level="INFO",
-)
-logger.add(
-    config.LOG_FILE_PATTERN,
-    rotation="00:00",
-    retention="7 days",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
-    level="DEBUG",
-)
-
 # ========== 全局状态 ==========
 
 _stop_event = threading.Event()
@@ -895,8 +878,28 @@ def _maintain_config_drafts(reason: str = "草案清理") -> None:
 # ========== 主入口 ==========
 
 
-def main() -> None:
+def configure_logging() -> None:
+    """显式配置运行时日志，避免模块导入和测试写入真实日志文件。"""
+    config.ensure_workspace_dirs()
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
+        level="INFO",
+    )
+    logger.add(
+        config.LOG_FILE_PATTERN,
+        rotation="00:00",
+        retention="7 days",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
+        level="DEBUG",
+    )
+
+
+def main(*, configure_logs: bool = True) -> None:
     """主函数。"""
+    if configure_logs:
+        configure_logging()
     logger.info("🚀 SMZDM 好价提醒机器人启动")
     _ensure_startup_ready()
     dedup, near_miss_mgr, binding_store = _initialize_runtime()

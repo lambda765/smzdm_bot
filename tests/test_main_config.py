@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -424,6 +426,30 @@ class MainRestartTests(unittest.TestCase):
 
 
 class MainLifecycleTests(unittest.TestCase):
+    def test_importing_runtime_does_not_create_log_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_file = root / "import.log"
+            env = os.environ.copy()
+            source_root = Path(__file__).resolve().parents[1] / "src"
+            env["PYTHONPATH"] = os.pathsep.join(
+                value for value in (str(source_root), env.get("PYTHONPATH", "")) if value
+            )
+            env["SMZDM_NOTICE_HOME"] = str(root)
+            env["LOG_FILE_PATTERN"] = str(log_file)
+
+            result = subprocess.run(
+                [sys.executable, "-c", "import smzdm_notice.runtime"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            log_created = log_file.exists()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(log_created)
+
     def test_main_closes_smzdm_client_before_shutdown_notification(self) -> None:
         dedup = MagicMock()
         near_miss_mgr = MagicMock()
@@ -431,6 +457,9 @@ class MainLifecycleTests(unittest.TestCase):
         calls = []
 
         with ExitStack() as stack:
+            stack.enter_context(
+                patch("smzdm_notice.runtime.configure_logging", side_effect=lambda: calls.append("configure"))
+            )
             stack.enter_context(patch("smzdm_notice.runtime._ensure_startup_ready"))
             stack.enter_context(
                 patch("smzdm_notice.runtime._initialize_runtime", return_value=(dedup, near_miss_mgr, binding_store))
@@ -446,7 +475,7 @@ class MainLifecycleTests(unittest.TestCase):
 
             main.main()
 
-        self.assertEqual(calls, ["poll", "close", "notify"])
+        self.assertEqual(calls, ["configure", "poll", "close", "notify"])
         notify.assert_called_once_with()
 
     def test_main_closes_smzdm_client_when_poll_loop_raises(self) -> None:
@@ -456,6 +485,7 @@ class MainLifecycleTests(unittest.TestCase):
         error = RuntimeError("poll failed")
 
         with ExitStack() as stack:
+            configure_logging = stack.enter_context(patch("smzdm_notice.runtime.configure_logging"))
             stack.enter_context(patch("smzdm_notice.runtime._ensure_startup_ready"))
             stack.enter_context(
                 patch("smzdm_notice.runtime._initialize_runtime", return_value=(dedup, near_miss_mgr, binding_store))
@@ -466,8 +496,9 @@ class MainLifecycleTests(unittest.TestCase):
             notify = stack.enter_context(patch("smzdm_notice.runtime._notify_shutdown_or_restart"))
 
             with self.assertRaises(RuntimeError):
-                main.main()
+                main.main(configure_logs=False)
 
+        configure_logging.assert_not_called()
         close.assert_called_once_with()
         notify.assert_not_called()
 
