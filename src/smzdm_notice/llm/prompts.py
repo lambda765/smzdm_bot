@@ -73,6 +73,11 @@ reason 示例：
 <output_format>
 严格输出 JSON。无匹配商品时 recommendations 返回空列表。id 使用商品列表中的 id 字段。
 
+- recommendations 和 near_misses 必须始终是 JSON 数组。数组元素只能是符合下述结构的 JSON 对象，禁止输出 null、字符串、数字、注释或占位项
+- 没有合法条目时直接返回空数组，不得返回 [null]，也不得在数组末尾追加 null
+- recommendations 每项必须包含字符串 id、reason、notification_name；near_misses 每项必须包含字符串 id、reason
+- 不要输出尾逗号。空结果必须严格写为：{"recommendations":[],"near_misses":[]}
+
 - recommendations.reason：30 字以内，说明推荐依据（符合了哪项偏好、价格或票数有何优势）
 - recommendations.notification_name：2-16 字的通知栏精简名称，优先使用“品牌 + 核心品类”，品牌不重要时只写核心品类，例如“帮宝适纸尿裤”“蓝莓”。去除 88VIP、今日必买、淘金币、价格、件数、容量和其他数量规格，不要写推荐理由
 - recommendations.category：优先从以下预设中选择：电脑数码、食品生鲜、运动户外、家用电器、服饰鞋包、日用百货、母婴用品、家居家装、办公设备、个护化妆、本地生活、医疗健康、图书文娱、玩模乐器。若都不合适，可生成 2-8 字自定义品类，如"厨房小家电""咖啡器具""宠物用品"；不得包含品牌、商城、型号、容量、价格、促销词、榜单词
@@ -100,6 +105,12 @@ reason 示例：
   }],
   "near_misses": [{"id": "174000001", "reason": "跳过原因：真实近因"}]
 }
+
+输出前必须自检：
+1. recommendations 和 near_misses 两个数组都存在
+2. 两个数组均不包含 null 或非对象元素
+3. 所有必填字段均存在且为字符串
+4. JSON 没有注释、占位项或尾逗号
 </output_format>
 """
 

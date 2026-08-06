@@ -401,6 +401,15 @@ class LlmExtraBodyTests(unittest.TestCase):
 
 
 class LlmPromptTests(unittest.TestCase):
+    def test_system_prompt_requires_clean_json_array_elements(self) -> None:
+        self.assertIn("recommendations 和 near_misses 必须始终是 JSON 数组", SYSTEM_PROMPT)
+        self.assertIn("禁止输出 null", SYSTEM_PROMPT)
+        self.assertIn("不得返回 [null]", SYSTEM_PROMPT)
+        self.assertIn('{"recommendations":[],"near_misses":[]}', SYSTEM_PROMPT)
+        self.assertIn("输出前必须自检", SYSTEM_PROMPT)
+        self.assertIn("所有必填字段均存在且为字符串", SYSTEM_PROMPT)
+        self.assertIn("JSON 没有注释、占位项或尾逗号", SYSTEM_PROMPT)
+
     def test_system_prompt_keeps_generic_examples_without_user_specific_categories(self) -> None:
         self.assertIn("本系统 Prompt 只定义稳定筛选方法", SYSTEM_PROMPT)
         self.assertIn("运行时补充说明", SYSTEM_PROMPT)
