@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -142,7 +143,7 @@ def _filter_with_single_call(
                 error_summary=call_outcome.error_summary,
             )
         )
-    matched, near_misses, categories_by_article_id, contexts_by_article_id = _match_result(
+    matched, near_misses, categories_by_article_id, contexts_by_article_id, notification_names = _match_result(
         call_outcome.result.result,
         prompt_context.item_map,
     )
@@ -152,6 +153,7 @@ def _filter_with_single_call(
         near_misses=near_misses,
         categories_by_article_id=categories_by_article_id,
         contexts_by_article_id=contexts_by_article_id,
+        notification_names_by_article_id=notification_names,
     )
 
 
@@ -181,7 +183,7 @@ def _filter_with_dual_calls(
         routing_snapshot=routing_snapshot,
     )
 
-    matched, near_misses, categories_by_article_id, contexts_by_article_id = _match_result(
+    matched, near_misses, categories_by_article_id, contexts_by_article_id, notification_names = _match_result(
         final_result,
         prompt_context.item_map,
     )
@@ -192,6 +194,7 @@ def _filter_with_dual_calls(
         near_misses=near_misses,
         categories_by_article_id=categories_by_article_id,
         contexts_by_article_id=contexts_by_article_id,
+        notification_names_by_article_id=notification_names,
         arbiter_info=arbiter_info,
         diagnostics=FilterDiagnostics(
             llm_failed=llm_failed,
@@ -302,17 +305,27 @@ def _join_error_summaries(*summaries: str) -> str | None:
 def _match_result(
     result: FilterResult,
     item_map: dict[str, RankingItem],
-) -> tuple[list[tuple[RankingItem, str]], list[tuple[RankingItem, str]], dict[str, str], dict[str, dict]]:
+) -> tuple[
+    list[tuple[RankingItem, str]],
+    list[tuple[RankingItem, str]],
+    dict[str, str],
+    dict[str, dict],
+    dict[str, str],
+]:
     """将 FilterResult 中的 ID 匹配回原始商品。"""
     matched: list[tuple[RankingItem, str]] = []
     categories_by_article_id: dict[str, str] = {}
     contexts_by_article_id: dict[str, dict] = {}
+    notification_names_by_article_id: dict[str, str] = {}
     for rec in result.recommendations:
         if rec.id in item_map:
             item = item_map[rec.id]
             matched.append((item, rec.reason))
             categories_by_article_id[rec.id] = sanitize_category(rec.category, item)
             contexts_by_article_id[rec.id] = sanitize_decision_context(rec.decision_context)
+            notification_name = sanitize_notification_name(rec.notification_name)
+            if notification_name:
+                notification_names_by_article_id[rec.id] = notification_name
         else:
             logger.warning(f"LLM 返回了无效推荐 ID: {rec.id}")
 
@@ -323,7 +336,17 @@ def _match_result(
         else:
             logger.warning(f"LLM 返回了无效 near_miss ID: {nm.id}")
 
-    return matched, near_misses, categories_by_article_id, contexts_by_article_id
+    return matched, near_misses, categories_by_article_id, contexts_by_article_id, notification_names_by_article_id
+
+
+_NOTIFICATION_NAME_MAX_LENGTH = 16
+
+
+def sanitize_notification_name(value: object) -> str:
+    """归一化通知栏商品名；异常时返回空值但不影响推荐结果。"""
+    text = value if isinstance(value, str) else ""
+    text = re.sub(r"\s+", " ", text).strip(" 、，,|-")
+    return text if 2 <= len(text) <= _NOTIFICATION_NAME_MAX_LENGTH else ""
 
 
 _NEED_STATES = {"urgent", "normal", "unknown"}

@@ -25,6 +25,7 @@ from smzdm_notice.core.near_miss import NearMissManager
 from smzdm_notice.feishu.binding import FeishuBindingStore
 from smzdm_notice.feishu.bot import BotRuntime, start_bot_thread
 from smzdm_notice.feishu.notifier import (
+    DealSendResult,
     disable_draft_card,
     send_arbitration,
     send_config_warning,
@@ -353,6 +354,7 @@ class MatchEvaluation:
     near_misses: list[tuple[RankingItem, str]]
     categories_by_article_id: dict[str, str] = field(default_factory=dict)
     contexts_by_article_id: dict[str, dict] = field(default_factory=dict)
+    notification_names_by_article_id: dict[str, str] = field(default_factory=dict)
     arbiter_info: ArbiterInfo | None = None
 
 
@@ -418,6 +420,7 @@ def _run_poll_pipeline_unlocked(
         evaluation.arbiter_info,
         evaluation.categories_by_article_id,
         evaluation.contexts_by_article_id,
+        evaluation.notification_names_by_article_id,
     )
     _maybe_send_daily_digest(near_miss_mgr)
     if not evaluation.matched:
@@ -480,7 +483,11 @@ def _evaluate_poll_matches(
 ) -> MatchEvaluation | PollOutcome:
     """合并价格阈值直推商品和 LLM 候选商品，得到本轮筛选结果。"""
     if not llm_candidates:
-        return MatchEvaluation(matched=bypass_matches, near_misses=[])
+        return MatchEvaluation(
+            matched=bypass_matches,
+            near_misses=[],
+            notification_names_by_article_id=_price_bypass_notification_names(bypass_matches),
+        )
 
     user_prompt, inventory_data = _refresh_runtime_config()
     if _stop_event.is_set():
@@ -504,6 +511,7 @@ def _evaluate_poll_matches(
                 dedup,
                 near_miss_mgr,
                 price_bypass_article_ids={item.article_id for item, _ in bypass_matches},
+                notification_names_by_article_id=_price_bypass_notification_names(bypass_matches),
             )
         return PollOutcome.failure("llm_failed", filter_result.diagnostics.error_summary)
 
@@ -512,6 +520,10 @@ def _evaluate_poll_matches(
         near_misses=filter_result.near_misses,
         categories_by_article_id=filter_result.categories_by_article_id,
         contexts_by_article_id=filter_result.contexts_by_article_id,
+        notification_names_by_article_id={
+            **_price_bypass_notification_names(bypass_matches),
+            **filter_result.notification_names_by_article_id,
+        },
         arbiter_info=filter_result.arbiter_info,
     )
 
@@ -553,6 +565,7 @@ def _deliver_poll_matches_or_log_empty(
     arbiter_info: ArbiterInfo | None = None,
     categories_by_article_id: dict[str, str] | None = None,
     contexts_by_article_id: dict[str, dict] | None = None,
+    notification_names_by_article_id: dict[str, str] | None = None,
 ) -> None:
     """有匹配商品时发送通知；无匹配时留下明确轮询日志。"""
     if matched:
@@ -564,6 +577,7 @@ def _deliver_poll_matches_or_log_empty(
             arbiter_info=arbiter_info,
             categories_by_article_id=categories_by_article_id,
             contexts_by_article_id=contexts_by_article_id,
+            notification_names_by_article_id=notification_names_by_article_id,
         )
     else:
         logger.info("LLM 判断无匹配商品")
@@ -577,20 +591,30 @@ def _send_matches_and_persist_runtime_state(
     arbiter_info: ArbiterInfo | None = None,
     categories_by_article_id: dict[str, str] | None = None,
     contexts_by_article_id: dict[str, dict] | None = None,
+    notification_names_by_article_id: dict[str, str] | None = None,
 ) -> bool:
     """先发送好价卡片，仅在发送成功后持久化去重、near-miss 和记忆状态。"""
     logger.info(f"发现 {len(matched)} 件匹配商品，推送飞书...")
     price_bypass_article_ids = price_bypass_article_ids or set()
     categories_by_article_id = categories_by_article_id or {}
     contexts_by_article_id = contexts_by_article_id or {}
-    success = send_deals(matched, price_bypass_article_ids=price_bypass_article_ids)
-    if success:
+    send_result = send_deals(
+        matched,
+        price_bypass_article_ids=price_bypass_article_ids,
+        notification_names_by_article_id=notification_names_by_article_id,
+    )
+    delivered = _delivered_matches(send_result, matched)
+    if delivered:
         global _last_push_time
         _last_push_time = time.time()
-        dedup.mark_batch([item.link for item, _ in matched])
-        near_miss_mgr.remove_batch([item.article_id for item, _ in matched])
+        dedup.mark_batch([item.link for item, _ in delivered])
+        near_miss_mgr.remove_batch([item.article_id for item, _ in delivered])
         # 推送成功后，Deal Memory 只缓存非价格直推商品的轻量推荐上下文。
-        memory_items = [(item, reason) for item, reason in matched if item.article_id not in price_bypass_article_ids]
+        memory_items = [
+            (item, reason)
+            for item, reason in delivered
+            if item.article_id not in price_bypass_article_ids
+        ]
         if _deal_memory is not None and memory_items:
             try:
                 _deal_memory.record_to_pending(
@@ -601,10 +625,24 @@ def _send_matches_and_persist_runtime_state(
                 )
             except Exception as e:
                 logger.warning(f"Deal Memory 写入 pending 失败: {e}")
-        logger.info("推送成功，已更新去重缓存")
+        if len(delivered) == len(matched):
+            logger.info("推送成功，已更新去重缓存")
+        else:
+            logger.warning(f"部分推送成功，已持久化 {len(delivered)}/{len(matched)} 件商品")
     else:
         logger.error("推送失败")
-    return success
+    return bool(delivered)
+
+
+def _delivered_matches(
+    send_result: DealSendResult | bool,
+    matched: list[tuple[RankingItem, str]],
+) -> list[tuple[RankingItem, str]]:
+    """兼容旧布尔替身，并从真实拆卡结果中筛出已送达商品。"""
+    if isinstance(send_result, DealSendResult):
+        delivered_ids = set(send_result.delivered_article_ids)
+        return [(item, reason) for item, reason in matched if item.article_id in delivered_ids]
+    return matched if send_result else []
 
 
 def _split_price_bypass_items(items: list[RankingItem]) -> tuple[list[tuple[RankingItem, str]], list[RankingItem]]:
@@ -618,6 +656,13 @@ def _split_price_bypass_items(items: list[RankingItem]) -> tuple[list[tuple[Rank
         else:
             llm_candidates.append(item)
     return bypass_matches, llm_candidates
+
+
+def _price_bypass_notification_names(matches: list[tuple[RankingItem, str]]) -> dict[str, str]:
+    return {
+        item.article_id: str(getattr(item, "search_keyword", "") or item.title).strip()
+        for item, _ in matches
+    }
 
 
 def _price_bypass_reason(item) -> str:

@@ -11,11 +11,17 @@ import httpx
 from openai import APITimeoutError, BadRequestError, RateLimitError
 
 from smzdm_notice.llm import clients as llm_clients
-from smzdm_notice.llm.arbitration import ArbitrationRequest, arbitrate
+from smzdm_notice.llm.arbitration import ArbitrationRequest, arbitrate, resolve_dual_result
 from smzdm_notice.llm.categories import UNCATEGORIZED_CATEGORY, sanitize_category
 from smzdm_notice.llm.clients import _clear_client_cache, get_client_for_config
-from smzdm_notice.llm.filter import _build_prompt_context, _parse_response, _single_llm_call, filter_items
-from smzdm_notice.llm.models import FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
+from smzdm_notice.llm.filter import (
+    _build_prompt_context,
+    _match_result,
+    _parse_response,
+    _single_llm_call,
+    filter_items,
+)
+from smzdm_notice.llm.models import ArbiterInfo, FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
 from smzdm_notice.llm.prompts import ARBITER_SYSTEM_PROMPT, SYSTEM_PROMPT
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
 from smzdm_notice.smzdm.ranking import RankingItem
@@ -131,6 +137,73 @@ def _filter_items_with_mocked_call(*outcomes: LLMCallOutcome, dual_filter: bool 
             inventory_data="库存",
             routing_snapshot=_routing_snapshot(),
         )
+
+
+class RecommendationOrderingTests(unittest.TestCase):
+    def test_match_result_preserves_model_order_and_skips_only_invalid_ids(self) -> None:
+        items = {article_id: _item(article_id) for article_id in ("1", "2", "3", "4", "5", "6")}
+        result = FilterResult(
+            recommendations=[
+                Recommendation(id="3", reason="third", notification_name="蓝莓"),
+                Recommendation(id="missing", reason="invalid"),
+                Recommendation(id="1", reason="first", notification_name=None),
+                Recommendation(id="2", reason="second", notification_name="过长的通知商品名称不应进入通知摘要"),
+                Recommendation(id="4", reason="short", notification_name="果"),
+                Recommendation(id="5", reason="blank", notification_name="   "),
+                Recommendation(id="6", reason="wrong type", notification_name={"name": "蓝莓"}),
+            ]
+        )
+
+        matched, _, _, _, notification_names = _match_result(result, items)
+
+        self.assertEqual([item.article_id for item, _ in matched], ["3", "1", "2", "4", "5", "6"])
+        self.assertEqual(notification_names, {"3": "蓝莓"})
+
+    def test_dual_result_uses_arbiter_selected_order(self) -> None:
+        result_a = FilterResult(recommendations=[Recommendation(id="1", reason="A1"), Recommendation(id="2", reason="A2")])
+        result_b = FilterResult(recommendations=[Recommendation(id="2", reason="B2"), Recommendation(id="1", reason="B1")])
+        arbiter_info = ArbiterInfo(
+            chosen="B",
+            reason="B order",
+            analysis="",
+            suggestion="",
+            result_a=result_a,
+            result_b=result_b,
+        )
+
+        with patch("smzdm_notice.llm.arbitration._run_arbiter", return_value=arbiter_info):
+            final, _ = resolve_dual_result(
+                LLMCallResult(result=result_a),
+                LLMCallResult(result=result_b),
+                [],
+                {},
+                "prompt",
+            )
+
+        self.assertEqual([rec.id for rec in final.recommendations], ["2", "1"])
+
+    def test_dual_result_intersection_keeps_judgment_a_relative_order(self) -> None:
+        result_a = FilterResult(
+            recommendations=[
+                Recommendation(id="3", reason="A3"),
+                Recommendation(id="1", reason="A1"),
+                Recommendation(id="2", reason="A2"),
+            ]
+        )
+        result_b = FilterResult(
+            recommendations=[Recommendation(id="2", reason="B2"), Recommendation(id="3", reason="B3")]
+        )
+
+        with patch("smzdm_notice.llm.arbitration._run_arbiter", return_value=None):
+            final, _ = resolve_dual_result(
+                LLMCallResult(result=result_a),
+                LLMCallResult(result=result_b),
+                [],
+                {},
+                "prompt",
+            )
+
+        self.assertEqual([rec.id for rec in final.recommendations], ["3", "2"])
 
 
 class LlmClientReuseTests(unittest.TestCase):

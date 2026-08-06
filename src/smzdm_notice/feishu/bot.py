@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from loguru import logger
@@ -33,8 +33,10 @@ from smzdm_notice.feishu.notifier import (
     build_disabled_arbitration_card,
     build_disabled_draft_card,
     build_draft_failure_card,
-    build_draft_processing_card,
+    build_draft_handoff_card,
+    build_draft_preview_card,
     disable_draft_card,
+    finish_streaming_draft_card,
     reply_card,
     reply_text,
     send_draft_preview,
@@ -42,9 +44,11 @@ from smzdm_notice.feishu.notifier import (
     send_help,
     send_text,
     send_text_to,
+    start_streaming_draft_processing,
     update_card_message,
     update_deal_card_feedback_state,
     update_draft_preview,
+    update_streaming_draft_content,
 )
 from smzdm_notice.feishu.sdk import (
     get_card_action_response_model,
@@ -77,7 +81,6 @@ from smzdm_notice.preferences.builder import build_deal_action_draft, build_mess
 from smzdm_notice.preferences.models import ConfigDraft
 from smzdm_notice.preferences.store import DraftStore
 
-DRAFT_PROGRESS_INTERVAL_SECONDS = 15
 INTERNAL_ERROR_MESSAGE = "处理消息时遇到内部错误，请稍后重试。"
 
 
@@ -138,15 +141,23 @@ class ModelRouteUpdateResult:
 
 @dataclass
 class DraftProgressCard:
-    """草案生成期间临时使用的处理中卡片及其刷新线程。"""
+    """草案生成期间使用的进度卡；仅流式卡片带刷新线程。"""
 
     message_id: str = ""
+    card_id: str = ""
     stop_event: threading.Event | None = None
     thread: threading.Thread | None = None
+    sequence: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def streaming(self) -> bool:
+        return bool(self.card_id)
 
 
 MODEL_CARD_FORM_STATE_LIMIT = 64
 DEAL_REASON_FORM_STATE_LIMIT = 256
+DRAFT_STREAMING_FINALIZE_LOCK_TIMEOUT_SECONDS = 1.0
 
 
 class FeishuInteractiveBot:
@@ -302,26 +313,25 @@ class FeishuInteractiveBot:
         try:
             draft = build_message_draft(clean, self.runtime.draft_store)
         except Exception as e:
-            processing_stopped = self._stop_draft_processing(processing)
+            self._stop_draft_processing(processing)
             logger.error(f"配置草案生成失败: {e}", exc_info=True)
             self._finish_draft_processing_failure(
-                processing if processing_stopped else DraftProgressCard(),
+                processing,
                 "处理消息失败，没能生成配置修改预览。",
                 reply_to_message_id,
                 INTERNAL_ERROR_MESSAGE,
             )
             return
-        processing_stopped = self._stop_draft_processing(processing)
+        self._stop_draft_processing(processing)
         if not draft:
             self._finish_draft_processing_failure(
-                processing if processing_stopped else DraftProgressCard(),
+                processing,
                 "草案生成失败：没能理解这次偏好/库存修改。",
                 reply_to_message_id,
                 "草案生成失败：没能理解这次偏好/库存修改，请换一种更明确的说法重试。",
             )
             return
-        processing_message_id = processing.message_id if processing_stopped else ""
-        self._send_and_store_draft_preview(draft, reply_to_message_id, processing_message_id)
+        self._send_and_store_draft_preview(draft, reply_to_message_id, processing)
 
     def _handle_draft_revision(
         self,
@@ -333,26 +343,29 @@ class FeishuInteractiveBot:
         try:
             revised = build_revision_draft(text, original_draft, self.runtime.draft_store)
         except Exception as e:
-            processing_stopped = self._stop_draft_processing(processing)
+            self._stop_draft_processing(processing)
             logger.error(f"配置草案修订失败: {e}", exc_info=True)
             self._finish_draft_processing_failure(
-                processing if processing_stopped else DraftProgressCard(),
+                processing,
                 "处理修改意见失败，没能生成新的配置修改预览。",
                 reply_to_message_id,
                 INTERNAL_ERROR_MESSAGE,
             )
             return
-        processing_stopped = self._stop_draft_processing(processing)
+        self._stop_draft_processing(processing)
         if not revised:
             self._finish_draft_processing_failure(
-                processing if processing_stopped else DraftProgressCard(),
+                processing,
                 "没能理解修改意见。",
                 reply_to_message_id,
                 "没能理解修改意见，请换一种说法重试，或发新消息重新生成。",
             )
             return
-        processing_message_id = processing.message_id if processing_stopped else ""
-        if self._send_and_store_draft_preview(revised, reply_to_message_id, processing_message_id):
+        if self._send_and_store_draft_preview(
+            revised,
+            reply_to_message_id,
+            processing,
+        ):
             self.runtime.draft_store.cancel(original_draft.draft_id)
             if original_draft.preview_message_id:
                 disable_draft_card(original_draft.preview_message_id, "已生成新的修改预览", original_draft)
@@ -363,15 +376,35 @@ class FeishuInteractiveBot:
         self,
         draft: ConfigDraft,
         reply_to_message_id: str = "",
-        processing_message_id: str = "",
+        processing: DraftProgressCard | None = None,
     ) -> bool:
+        processing = processing or DraftProgressCard()
         preview_sent = False
-        if processing_message_id:
-            preview_sent = update_draft_preview(processing_message_id, draft)
+        final_card: dict | None = None
+        if processing.message_id and processing.streaming:
+            final_card = build_draft_preview_card(draft)
+            finish_result = self._finish_streaming_card(
+                processing,
+                final_card,
+                lock_timeout=DRAFT_STREAMING_FINALIZE_LOCK_TIMEOUT_SECONDS,
+            )
+            preview_sent = finish_result is True
+            if preview_sent and hasattr(draft, "preview_message_id"):
+                draft.preview_message_id = processing.message_id
+        elif processing.message_id:
+            preview_sent = update_draft_preview(processing.message_id, draft)
             if not preview_sent:
-                logger.warning(f"处理中卡片更新为预览失败，回退为发送新预览: {processing_message_id}")
+                logger.warning(f"处理中卡片更新为预览失败，回退为发送新预览: {processing.message_id}")
+        fallback_preview_sent = False
         if not preview_sent:
-            preview_sent = send_draft_preview(draft, reply_to_message_id=reply_to_message_id)
+            fallback_preview_sent = send_draft_preview(draft, reply_to_message_id=reply_to_message_id)
+            preview_sent = fallback_preview_sent
+        if fallback_preview_sent and processing.streaming:
+            self._schedule_streaming_cleanup(processing, build_draft_handoff_card())
+        elif not preview_sent and processing.streaming and final_card is not None:
+            preview_sent = self._finish_streaming_card(processing, final_card) is True
+            if preview_sent and hasattr(draft, "preview_message_id"):
+                draft.preview_message_id = processing.message_id
         if not preview_sent:
             self.runtime.draft_store.cancel(draft.draft_id)
             return False
@@ -380,42 +413,103 @@ class FeishuInteractiveBot:
         return True
 
     def _start_draft_processing(self, reply_to_message_id: str, stage: str) -> DraftProgressCard:
-        """可以回复消息时发送进度卡片，并启动刷新线程。"""
+        """优先发送流式进度卡；失败时发送不定时刷新的普通进度卡。"""
         if not reply_to_message_id:
             return DraftProgressCard()
+        streaming_handle = start_streaming_draft_processing(stage, reply_to_message_id)
+        if streaming_handle:
+            message_id, card_id = streaming_handle
+            progress = DraftProgressCard(
+                message_id=message_id,
+                card_id=card_id,
+                stop_event=threading.Event(),
+            )
+            progress.thread = threading.Thread(
+                target=self._run_draft_processing_progress,
+                args=(progress, stage, time.monotonic()),
+                name="feishu-draft-progress-worker",
+                daemon=True,
+            )
+            progress.thread.start()
+            return progress
+
         message_id = send_draft_processing(stage, reply_to_message_id=reply_to_message_id)
         if not message_id:
             return DraftProgressCard()
-        stop_event = threading.Event()
-        thread = threading.Thread(
-            target=self._run_draft_processing_progress,
-            args=(message_id, stage, time.monotonic(), stop_event),
-            name="feishu-draft-progress-worker",
-            daemon=True,
-        )
-        thread.start()
-        return DraftProgressCard(message_id, stop_event, thread)
+        return DraftProgressCard(message_id=message_id)
 
     def _run_draft_processing_progress(
         self,
-        message_id: str,
+        processing: DraftProgressCard,
         stage: str,
         started_at: float,
-        stop_event: threading.Event,
     ) -> None:
-        """在草案生成结束前持续刷新处理中卡片。"""
-        while not stop_event.wait(DRAFT_PROGRESS_INTERVAL_SECONDS):
-            elapsed_seconds = int(time.monotonic() - started_at)
-            update_card_message(message_id, build_draft_processing_card(stage, elapsed_seconds))
+        """在草案生成结束前追加流式阶段文本。"""
+        stop_event = processing.stop_event
+        if stop_event is None or not processing.streaming:
+            return
+        lines = [stage, "请求已提交，正在等待模型生成预览"]
+        self._update_streaming_progress(processing, "\n\n".join(lines))
+        for threshold in (15, 30, 60, 120, 300):
+            remaining = max(0.0, threshold - (time.monotonic() - started_at))
+            if stop_event.wait(remaining):
+                return
+            lines.append(f"已等待 {threshold} 秒，模型仍在生成预览")
+            self._update_streaming_progress(processing, "\n\n".join(lines))
 
-    def _stop_draft_processing(self, processing: DraftProgressCard) -> bool:
-        """停止进度刷新线程；返回 False 表示线程可能仍会更新卡片。"""
+    def _update_streaming_progress(self, processing: DraftProgressCard, content: str) -> bool:
+        with processing.lock:
+            if processing.stop_event and processing.stop_event.is_set():
+                return False
+            processing.sequence += 1
+            return update_streaming_draft_content(processing.card_id, content, processing.sequence)
+
+    def _finish_streaming_card(
+        self,
+        processing: DraftProgressCard,
+        card: dict,
+        *,
+        lock_timeout: float | None = None,
+    ) -> bool | None:
+        if lock_timeout is None:
+            processing.lock.acquire()
+            acquired = True
+        else:
+            acquired = processing.lock.acquire(timeout=lock_timeout)
+        if not acquired:
+            logger.warning(f"流式进度更新仍在执行，先回退发送新卡片: {processing.card_id}")
+            return None
+        try:
+            close_sequence = processing.sequence + 1
+            update_sequence = close_sequence + 1
+            processing.sequence = update_sequence
+            return finish_streaming_draft_card(
+                processing.card_id,
+                card,
+                close_sequence,
+                update_sequence,
+            )
+        finally:
+            processing.lock.release()
+
+    def _schedule_streaming_cleanup(self, processing: DraftProgressCard, card: dict) -> None:
+        """新消息已承接结果后，在后台关闭并替换旧流式卡片。"""
+        def cleanup() -> None:
+            if self._finish_streaming_card(processing, card) is not True:
+                logger.warning(f"旧流式卡片清理失败: {processing.card_id}")
+
+        threading.Thread(
+            target=cleanup,
+            name="feishu-streaming-card-cleanup",
+            daemon=True,
+        ).start()
+
+    def _stop_draft_processing(self, processing: DraftProgressCard) -> None:
+        """停止流式刷新线程；普通静态进度卡无需停止。"""
         if processing.stop_event:
             processing.stop_event.set()
         if processing.thread:
             processing.thread.join(timeout=1)
-            return not processing.thread.is_alive()
-        return True
 
     def _finish_draft_processing_failure(
         self,
@@ -424,8 +518,25 @@ class FeishuInteractiveBot:
         reply_to_message_id: str,
         fallback_text: str,
     ) -> None:
-        if processing.message_id and update_card_message(processing.message_id, build_draft_failure_card(card_reason)):
-            return
+        if processing.message_id:
+            failure_card = build_draft_failure_card(card_reason)
+            if processing.streaming:
+                finish_result = self._finish_streaming_card(
+                    processing,
+                    failure_card,
+                    lock_timeout=DRAFT_STREAMING_FINALIZE_LOCK_TIMEOUT_SECONDS,
+                )
+                if finish_result is True:
+                    return
+                if reply_to_message_id and reply_card(reply_to_message_id, failure_card):
+                    self._schedule_streaming_cleanup(processing, failure_card)
+                    return
+                if self._finish_streaming_card(processing, failure_card) is True:
+                    return
+            if not processing.streaming and update_card_message(processing.message_id, failure_card):
+                return
+            if reply_to_message_id and reply_card(reply_to_message_id, failure_card):
+                return
         self._reply_text(reply_to_message_id, fallback_text)
 
     def _bind_current_conversation(self, data, reply_to_message_id: str = "") -> None:
@@ -740,27 +851,30 @@ class FeishuInteractiveBot:
             try:
                 draft = build_deal_action_draft(action, value, self.runtime.draft_store)
             finally:
-                processing_stopped = self._stop_draft_processing(processing)
+                self._stop_draft_processing(processing)
             if not draft:
                 self._finish_draft_processing_failure(
-                    processing if processing_stopped else DraftProgressCard(),
+                    processing,
                     "无法生成配置修改预览。",
                     reply_to_message_id,
                     "无法生成配置修改预览，请直接回复说明想怎么改。",
                 )
                 return
-            processing_message_id = processing.message_id if processing_stopped else ""
-            if not self._send_and_store_draft_preview(draft, reply_to_message_id, processing_message_id):
+            if not self._send_and_store_draft_preview(
+                draft,
+                reply_to_message_id,
+                processing,
+            ):
                 self._reply_text(reply_to_message_id, "商品快捷操作预览发送失败")
         except Exception as e:
-            processing_stopped = self._stop_draft_processing(processing)
+            self._stop_draft_processing(processing)
             logger.error(f"商品快捷操作处理失败: {e}", exc_info=True)
-            if processing_stopped and processing.message_id and update_card_message(
-                processing.message_id,
-                build_draft_failure_card("商品快捷操作处理失败，没能生成配置修改预览。"),
-            ):
-                return
-            self._reply_text(reply_to_message_id, INTERNAL_ERROR_MESSAGE)
+            self._finish_draft_processing_failure(
+                processing,
+                "商品快捷操作处理失败，没能生成配置修改预览。",
+                reply_to_message_id,
+                INTERNAL_ERROR_MESSAGE,
+            )
 
     def _handle_slash_command(self, text: str, reply_to_message_id: str = "") -> bool:
         if not text.startswith("/"):
@@ -1128,14 +1242,20 @@ def _extract_form_state(value: dict) -> dict[str, str]:
 
 def _deal_reason_from_card_value(value: dict) -> tuple[bool, str]:
     """读取不值理由输入；bool 表示 payload 是否明确包含该字段。"""
-    if str(value.get("name") or "").strip() == NOT_WORTH_REASON_FIELD and "input_value" in value:
+    reason_field = str(value.get("reason_field") or NOT_WORTH_REASON_FIELD).strip()
+    field_names = {NOT_WORTH_REASON_FIELD, reason_field}
+    if str(value.get("name") or "").strip() in field_names and "input_value" in value:
         return True, str(value.get("input_value") or "").strip()
-    if NOT_WORTH_REASON_FIELD in value:
-        return True, optional_card_field_value(value, NOT_WORTH_REASON_FIELD)
+    for field_name in field_names:
+        if field_name in value:
+            return True, optional_card_field_value(value, field_name)
     for group_key in ("form_values", "form_value", "form", "input_values"):
         group = value.get(group_key)
-        if isinstance(group, dict) and NOT_WORTH_REASON_FIELD in group:
-            return True, optional_card_field_value(value, NOT_WORTH_REASON_FIELD)
+        if not isinstance(group, dict):
+            continue
+        for field_name in field_names:
+            if field_name in group:
+                return True, optional_card_field_value(value, field_name)
     return False, ""
 
 

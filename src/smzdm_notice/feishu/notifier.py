@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections import OrderedDict
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from typing import Any
@@ -15,8 +17,26 @@ from loguru import logger
 
 from smzdm_notice.core import config
 from smzdm_notice.feishu.binding import FeishuBinding, FeishuBindingStore
+from smzdm_notice.feishu.card_v2 import (
+    Card,
+    body_elements,
+    build_card,
+    button,
+    callback_value,
+    card_component_count,
+    card_json_size_bytes,
+    column_set,
+    element_id,
+    form,
+    input_box,
+    iter_components,
+)
 from smzdm_notice.feishu.media import get_feishu_image_key
 from smzdm_notice.feishu.sdk import (
+    get_cardkit_content_models,
+    get_cardkit_create_models,
+    get_cardkit_settings_models,
+    get_cardkit_update_models,
     get_file_models,
     get_lark_client,
     get_message_models,
@@ -33,12 +53,29 @@ ARBITRATION_CARD_METADATA_KEY = "arbitration_card"
 _DIGEST_PREVIEW_LIMIT = 20
 _DIGEST_ATTACHMENT_FORMAT = "markdown"
 _DIGEST_ATTACHMENT_EXTENSIONS = {"markdown": "md"}
-Card = dict[str, Any]
 MessageId = str
 _DEAL_CARD_CACHE_MAX = 100
 _DEAL_CARD_CACHE: OrderedDict[str, Card] = OrderedDict()
 NOT_WORTH_REASON_FIELD = "not_worth_reason"
 NOT_WORTH_REASON_PLACEHOLDER = "可选：价格一般 / 已有类似 / 非刚需 / 品类不合适"
+DRAFT_STREAMING_ELEMENT_ID = "draft_progress_text"
+DEAL_CARD_COMPONENT_BUDGET = 180
+DEAL_CARD_JSON_BUDGET_BYTES = 28_000
+
+
+@dataclass(frozen=True)
+class DealSendResult:
+    """一轮商品卡片发送结果，用于精确持久化已送达商品。"""
+
+    delivered_article_ids: tuple[str, ...] = ()
+    failed_article_ids: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.delivered_article_ids)
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.delivered_article_ids) and not self.failed_article_ids
 
 
 def _current_binding() -> FeishuBinding | None:
@@ -59,13 +96,6 @@ def _send_card_message_id(card: Card) -> MessageId | None:
 def _send_card_success(card: Card) -> bool:
     """发送卡片到当前绑定目标，只返回是否成功。"""
     return _send_card_message_id(card) is not None
-
-
-def _send_text(text: str) -> bool:
-    binding = _current_binding()
-    if not binding:
-        return False
-    return send_text_to(binding.receive_id_type, binding.receive_id, text)
 
 
 def _do_reply_message(message_id: str, msg_type: str, content: str) -> MessageId | None:
@@ -101,6 +131,12 @@ def reply_text(message_id: str, text: str) -> bool:
 def reply_card(message_id: str, card: Card) -> MessageId | None:
     """回复一张交互卡片，成功返回回复 message_id。"""
     return _do_reply_message(message_id, "interactive", json.dumps(card, ensure_ascii=False))
+
+
+def reply_card_entity(message_id: str, card_id: str) -> MessageId | None:
+    """在线程中回复一个 CardKit 卡片实体。"""
+    content = json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
+    return _do_reply_message(message_id, "interactive", content)
 
 
 def update_card_message(message_id: str, card: Card) -> bool:
@@ -229,40 +265,150 @@ def _send_card_to_message_id(receive_id_type: str, receive_id: str, card: Card) 
 def send_deals(
     items: list[tuple[RankingItem, str]],
     price_bypass_article_ids: set[str] | None = None,
-) -> bool:
+    notification_names_by_article_id: dict[str, str] | None = None,
+) -> DealSendResult:
     """推送匹配到的好价商品。"""
     if not items:
-        return False
+        return DealSendResult()
     price_bypass_article_ids = price_bypass_article_ids or set()
-    card = _build_deals_card(items, price_bypass_article_ids)
-    message_id = _send_card_message_id(card)
-    if not message_id:
-        return False
-    _cache_deal_card_snapshot(message_id, card)
-    return True
+    notification_names = notification_names_by_article_id or {}
+    prepared = _prepare_deal_items(items, price_bypass_article_ids)
+    chunks = _pack_prepared_deals(prepared, notification_names)
+    delivered: list[str] = []
+    failed: list[str] = []
+    sent_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for chunk in chunks:
+        chunk_items = [match for match, _ in chunk]
+        card = _build_prepared_deals_card(chunk, notification_names, sent_at=sent_at)
+        article_ids = [item.article_id for item, _ in chunk_items]
+        if not _deal_card_within_budget(card):
+            logger.error(f"单件商品卡片仍超过飞书限制，跳过发送: article_ids={article_ids}")
+            failed.extend(article_ids)
+            continue
+        message_id = _send_card_message_id(card)
+        if not message_id:
+            failed.extend(article_ids)
+            continue
+        delivered.extend(article_ids)
+        _cache_deal_card_snapshot(message_id, card)
+    if failed:
+        logger.warning(f"好价卡片部分发送失败: delivered={len(delivered)}, failed={len(failed)}")
+    return DealSendResult(tuple(delivered), tuple(failed))
 
 
 def _build_deals_card(
     items: list[tuple[RankingItem, str]],
     price_bypass_article_ids: set[str],
+    notification_names_by_article_id: dict[str, str] | None = None,
 ) -> Card:
+    notification_names_by_article_id = notification_names_by_article_id or {}
+    prepared = _prepare_deal_items(items, price_bypass_article_ids)
+    return _build_prepared_deals_card(prepared, notification_names_by_article_id)
+
+
+def _prepare_deal_items(
+    items: list[tuple[RankingItem, str]],
+    price_bypass_article_ids: set[str],
+) -> list[tuple[tuple[RankingItem, str], list[Card]]]:
+    """预构建每件商品的元素，拆卡计算时不重复上传图片。"""
+    return [
+        (
+            (item, reason),
+            _build_deal_item_elements(item, reason, item.article_id in price_bypass_article_ids),
+        )
+        for item, reason in items
+    ]
+
+
+def _pack_prepared_deals(
+    prepared: list[tuple[tuple[RankingItem, str], list[Card]]],
+    notification_names_by_article_id: dict[str, str],
+) -> list[list[tuple[tuple[RankingItem, str], list[Card]]]]:
+    """按飞书组件和体积限制顺序拆分商品卡片。"""
+    chunks: list[list[tuple[tuple[RankingItem, str], list[Card]]]] = []
+    current: list[tuple[tuple[RankingItem, str], list[Card]]] = []
+    for entry in prepared:
+        candidate = [*current, entry]
+        candidate_card = _build_prepared_deals_card(candidate, notification_names_by_article_id)
+        if current and not _deal_card_within_budget(candidate_card):
+            chunks.append(current)
+            current = [entry]
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _deal_card_within_budget(card: Card) -> bool:
+    return (
+        card_component_count(card) <= DEAL_CARD_COMPONENT_BUDGET
+        and card_json_size_bytes(card) <= DEAL_CARD_JSON_BUDGET_BYTES
+    )
+
+
+def _build_prepared_deals_card(
+    prepared: list[tuple[tuple[RankingItem, str], list[Card]]],
+    notification_names_by_article_id: dict[str, str],
+    *,
+    sent_at: str | None = None,
+) -> Card:
+    items = [match for match, _ in prepared]
     elements = [
         {
             "tag": "markdown",
-            "content": f"🔥 发现 **{len(items)}** 件好价商品！\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            "content": f"🔥 发现 **{len(items)}** 件好价商品！\n📅 {sent_at or datetime.now().strftime('%Y-%m-%d %H:%M')}",
         },
         {"tag": "hr"},
     ]
-    for item, reason in items:
-        elements.extend(_build_deal_item_elements(item, reason, item.article_id in price_bypass_article_ids))
-    return {
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "🛒 什么值得买 · 好价推荐"},
-            "template": "red",
-        },
-        "elements": elements,
-    }
+    for _, item_elements in prepared:
+        elements.extend(item_elements)
+    return build_card(
+        "🛒 什么值得买 · 好价推荐",
+        "red",
+        elements,
+        summary=_build_deals_summary(items, notification_names_by_article_id),
+    )
+
+
+def _build_deals_summary(
+    items: list[tuple[RankingItem, str]],
+    notification_names_by_article_id: dict[str, str],
+) -> str:
+    item_count = len(items)
+    counts: OrderedDict[str, int] = OrderedDict()
+    for item, _ in items:
+        name = _notification_summary_name(notification_names_by_article_id.get(item.article_id))
+        if not name:
+            continue
+        counts[name] = counts.get(name, 0) + 1
+
+    labels = [f"{name}×{count}" if count > 1 else name for name, count in counts.items()]
+    if not labels:
+        return f"推荐了 {item_count} 个商品"
+
+    prefix = "好价："
+    full = prefix + "、".join(labels)
+    named_item_count = sum(counts.values())
+    if named_item_count == item_count and len(full) <= 80:
+        return full
+
+    suffix = f"等 {item_count} 件"
+    included: list[str] = []
+    for label in labels:
+        candidate = prefix + "、".join([*included, label]) + suffix
+        if len(candidate) > 80:
+            break
+        included.append(label)
+    if included:
+        return prefix + "、".join(included) + suffix
+    return f"推荐了 {item_count} 个商品"
+
+
+def _notification_summary_name(value: object) -> str:
+    """清理显式通知名称；价格直推搜索词允许截短到摘要名称上限。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" 、，,|-")
+    return _compact_table_text(text, 16)
 
 
 def _build_deal_item_elements(item: RankingItem, reason: str, is_price_bypass: bool) -> list[Card]:
@@ -273,19 +419,50 @@ def _build_deal_item_elements(item: RankingItem, reason: str, is_price_bypass: b
         elements.append(_deal_image_element(item, image_key))
     # 第一行：偏好反馈（好价/不值）+ 查看详情
     memory_enabled = config.DEAL_MEMORY_ENABLED and not is_price_bypass
-    memory_actions = _memory_action_buttons(item, enabled=memory_enabled)
-    if memory_actions:
-        elements.append({"tag": "action", "actions": memory_actions})
+    memory_container = _memory_action_container(item, enabled=memory_enabled)
+    if memory_container:
+        elements.append(memory_container)
     # 第二行：当前需求操作
-    elements.append({"tag": "action", "actions": _config_action_buttons(item, is_price_bypass)})
+    elements.append(column_set(_config_action_buttons(item, is_price_bypass), component_id=element_id("config", item.article_id)))
     elements.append({"tag": "hr"})
     return elements
 
 
-def _memory_action_buttons(item: RankingItem, enabled: bool = True, selected: str = "") -> list[Card]:
+def _memory_action_container(item: RankingItem, enabled: bool = True) -> Card | None:
     """长期偏好反馈按钮。"""
     value = _button_value(item)
-    return _memory_action_buttons_from_value(value, item.link, enabled=enabled, selected=selected)
+    return _memory_action_container_from_value(value, item.link, enabled=enabled)
+
+
+def _memory_action_container_from_value(
+    base_value: Card,
+    item_link: str = "",
+    enabled: bool = True,
+    selected: str = "",
+    reason: str = "",
+) -> Card | None:
+    elements = _memory_action_buttons_from_value(
+        base_value,
+        item_link,
+        enabled=enabled,
+        selected=selected,
+        reason=reason,
+    )
+    if not elements:
+        return None
+
+    article_id = str(base_value.get("article_id") or "item")
+    component_id = element_id("memory", article_id)
+    if enabled and selected == "deal_not_worth":
+        return form(
+            elements,
+            name=element_id("memory_form", article_id),
+            component_id=component_id,
+        )
+
+    container = elements[0]
+    container["element_id"] = component_id
+    return container
 
 
 def _memory_action_buttons_from_value(
@@ -297,34 +474,40 @@ def _memory_action_buttons_from_value(
 ) -> list[Card]:
     """长期偏好反馈按钮。选中后只显示当前选中项，再次点击取消恢复两个。"""
     buttons: list[Card] = []
+    fields: list[Card] = []
+    reason_field = element_id("reason", str(base_value.get("article_id") or "item"))
     if enabled:
         if selected == "deal_good":
             buttons.append(_button_from_value("✅ 好价", "deal_good", base_value, "primary"))
         elif selected == "deal_not_worth":
             buttons.append(_button_from_value("❌ 不值", "deal_not_worth", base_value, "danger"))
-            buttons.append(
-                _input(
-                    NOT_WORTH_REASON_FIELD,
+            fields.append(
+                input_box(
+                    reason_field,
                     NOT_WORTH_REASON_PLACEHOLDER,
                     default_value=reason,
-                    value=base_value,
+                    value={**base_value, "field": NOT_WORTH_REASON_FIELD, "reason_field": reason_field},
                 )
             )
-            buttons.append(_button_from_value("保存理由", "deal_not_worth_reason", base_value, "default"))
+            save_value = {**base_value, "reason_field": reason_field}
+            buttons.append(
+                _button_from_value(
+                    "保存理由",
+                    "deal_not_worth_reason",
+                    save_value,
+                    "default",
+                    action_type="form_submit",
+                )
+            )
         else:
             buttons.append(_button_from_value("好价👍", "deal_good", base_value, "primary"))
             buttons.append(_button_from_value("不值👎", "deal_not_worth", base_value, "danger"))
     link = item_link or str(base_value.get("item_link") or "")
     if link:
-        buttons.append(
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "查看详情"},
-                "url": link,
-                "type": "default",
-            }
-        )
-    return buttons
+        buttons.append(button("查看详情", url=link))
+    if buttons:
+        fields.append(column_set(buttons))
+    return fields
 
 
 def update_deal_card_feedback_state(
@@ -353,21 +536,21 @@ def update_deal_card_feedback_state(
 
 
 def _apply_deal_feedback_state_to_card(card: Card, article_id: str, selected: str, reason: str = "") -> bool:
-    """原地重写匹配商品的 action 行和相邻状态文本。"""
-    elements = card.get("elements", [])
+    """原地重写匹配商品的反馈容器和相邻状态文本。"""
+    elements = body_elements(card)
     for idx, element in enumerate(elements):
-        if element.get("tag") != "action":
-            continue
-        actions = element.get("actions", [])
-        base_value = _memory_row_value(actions, article_id)
+        base_value = _memory_row_value(element, article_id)
         if base_value is None:
             continue
-        element["actions"] = _memory_action_buttons_from_value(
+        replacement = _memory_action_container_from_value(
             base_value,
             enabled=True,
             selected=selected,
             reason=_clean_feedback_reason(reason),
         )
+        if replacement is None:
+            return False
+        elements[idx] = replacement
         _update_preceding_markdown(elements, idx, _feedback_status_text(selected, reason=reason))
         return True
     return False
@@ -416,10 +599,10 @@ def _update_preceding_markdown(elements: list[Card], action_idx: int, feedback_s
         return
 
 
-def _memory_row_value(actions: list[Card], article_id: str) -> Card | None:
-    for action in actions:
-        value = action.get("value")
-        if not isinstance(value, dict):
+def _memory_row_value(container: Card, article_id: str) -> Card | None:
+    for action in iter_components(container):
+        value = callback_value(action)
+        if value is None:
             continue
         if str(value.get("article_id") or "") != article_id:
             continue
@@ -452,15 +635,17 @@ def _button_value(item: RankingItem) -> Card:
     return value
 
 
-def _button_from_value(label: str, action: str, base_value: Card, button_type: str) -> dict:
+def _button_from_value(
+    label: str,
+    action: str,
+    base_value: Card,
+    button_type: str,
+    *,
+    action_type: str = "",
+) -> dict:
     value = dict(base_value)
     value["action"] = action
-    return {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": label},
-        "type": button_type,
-        "value": value,
-    }
+    return button(label, button_type=button_type, value=value, action_type=action_type)
 
 
 def _config_action_buttons(item: RankingItem, is_price_bypass: bool) -> list[Card]:
@@ -505,15 +690,16 @@ def send_heartbeat(hours: int) -> bool:
     """发送心跳消息。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     return _send_card_success(
-        {
-            "header": {"title": {"tag": "plain_text", "content": "🤖 好价监控 · 心跳"}, "template": "blue"},
-            "elements": [
+        build_card(
+            "🤖 好价监控 · 心跳",
+            "blue",
+            [
                 {
                     "tag": "markdown",
                     "content": f"✅ 好价监控运行正常\n⏰ {now}\n📢 最近 **{hours} 小时**未发现匹配商品\n💡 机器人将持续监控，发现好价立即推送",
                 }
             ],
-        }
+        )
     )
 
 
@@ -522,10 +708,11 @@ def send_shutdown(reason: str = "") -> bool:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     reason_text = f"\n📌 原因: {reason}" if reason else ""
     return _send_card_success(
-        {
-            "header": {"title": {"tag": "plain_text", "content": "⛔ 好价监控 · 已停止"}, "template": "red"},
-            "elements": [{"tag": "markdown", "content": f"📅 {now}{reason_text}\n\n如需恢复，请重新启动程序"}],
-        }
+        build_card(
+            "⛔ 好价监控 · 已停止",
+            "red",
+            [{"tag": "markdown", "content": f"📅 {now}{reason_text}\n\n如需恢复，请重新启动程序"}],
+        )
     )
 
 
@@ -533,10 +720,11 @@ def send_startup(config_summary: str) -> bool:
     """发送启动通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     return _send_card_success(
-        {
-            "header": {"title": {"tag": "plain_text", "content": "🚀 好价监控 · 启动"}, "template": "green"},
-            "elements": [{"tag": "markdown", "content": f"📅 {now}\n\n{config_summary}"}],
-        }
+        build_card(
+            "🚀 好价监控 · 启动",
+            "green",
+            [{"tag": "markdown", "content": f"📅 {now}\n\n{config_summary}"}],
+        )
     )
 
 
@@ -544,59 +732,26 @@ def send_config_warning(message: str) -> bool:
     """发送运行时配置读取告警。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     return _send_card_success(
-        {
-            "header": {
-                "title": {"tag": "plain_text", "content": "⚠️ 好价监控 · 配置读取告警"},
-                "template": "orange",
-            },
-            "elements": [
+        build_card(
+            "⚠️ 好价监控 · 配置读取告警",
+            "orange",
+            [
                 {
                     "tag": "markdown",
                     "content": f"📅 {now}\n\n{message}\n\n将继续使用上一次成功读取的内容。",
                 }
             ],
-        }
+        )
     )
 
 
 def build_help_card(help_content: str) -> Card:
     """构造快捷命令帮助卡片。"""
-    return {
-        "header": {
-            "title": {"tag": "plain_text", "content": "好价监控 · 快捷命令"},
-            "template": "blue",
-        },
-        "elements": [{"tag": "markdown", "content": help_content}],
-    }
-
-
-def _plain_text(content: str) -> dict:
-    return {"tag": "plain_text", "content": content}
-
-
-def _input(name: str, placeholder: str, default_value: str | None = None, value: dict | None = None) -> dict:
-    payload: dict = {
-        "tag": "input",
-        "name": name,
-        "placeholder": _plain_text(placeholder),
-    }
-    if default_value is not None:
-        payload["default_value"] = default_value
-    if value:
-        payload["value"] = value
-    return payload
-
-
-def _card_button(label: str, action: str, button_type: str, confirm: dict | None = None) -> dict:
-    btn: dict = {
-        "tag": "button",
-        "text": _plain_text(label),
-        "type": button_type,
-        "value": {"action": action},
-    }
-    if confirm:
-        btn["confirm"] = confirm
-    return btn
+    return build_card(
+        "好价监控 · 快捷命令",
+        "blue",
+        [{"tag": "markdown", "content": help_content}],
+    )
 
 
 def send_help(help_content: str, reply_to_message_id: str = "") -> bool:
@@ -618,12 +773,10 @@ def send_poll_failure_warning(count: int, reason: str, detail: str | None = None
     }.get(reason, reason or "未知失败")
     detail_text = _sanitize_warning_detail(detail) if detail else "无详细错误信息"
     return _send_card_success(
-        {
-            "header": {
-                "title": {"tag": "plain_text", "content": "⚠️ 好价监控 · 轮询失败告警"},
-                "template": "red",
-            },
-            "elements": [
+        build_card(
+            "⚠️ 好价监控 · 轮询失败告警",
+            "red",
+            [
                 {
                     "tag": "markdown",
                     "content": (
@@ -635,7 +788,7 @@ def send_poll_failure_warning(count: int, reason: str, detail: str | None = None
                     ),
                 }
             ],
-        }
+        )
     )
 
 
@@ -693,17 +846,11 @@ def build_arbitration_card(
 ) -> Card:
     """构造仲裁分析卡片；disabled_reason 非空时移除按钮并显示失效原因。"""
     elements = _arbitration_elements(snapshot, draft, disabled_reason)
-    return {
-        "config": {"update_multi": True},
-        "header": {
-            "title": {
-                "tag": "plain_text",
-                "content": "⚖️ 好价监控 · 仲裁分析" + ("（已失效）" if disabled_reason else ""),
-            },
-            "template": "grey" if disabled_reason else "purple",
-        },
-        "elements": elements,
-    }
+    return build_card(
+        "⚖️ 好价监控 · 仲裁分析" + ("（已失效）" if disabled_reason else ""),
+        "grey" if disabled_reason else "purple",
+        elements,
+    )
 
 
 def _arbitration_elements(snapshot: dict, draft: Any | None, disabled_reason: str) -> list[Card]:
@@ -721,7 +868,7 @@ def _arbitration_elements(snapshot: dict, draft: Any | None, disabled_reason: st
     if disabled_reason:
         elements.extend([{"tag": "hr"}, {"tag": "markdown", "content": f"**状态：已失效**\n\n原因：{disabled_reason}"}])
     elif actions:
-        elements.append({"tag": "action", "actions": actions})
+        elements.append(column_set(actions, component_id=element_id("arbiter_actions", str(getattr(draft, "draft_id", "")))))
     return elements
 
 
@@ -731,28 +878,25 @@ def _arbitration_actions(draft: Any | None, disabled_reason: str) -> list[Card]:
     actions: list[Card] = []
     if draft:
         actions.append(
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "采纳并更新"},
-                "type": "primary",
-                "value": {
+            button(
+                "采纳并更新",
+                button_type="primary",
+                value={
                     "action": "apply_draft",
                     "draft_id": draft.draft_id,
                     "card_kind": ARBITRATION_CARD_KIND,
                 },
-            }
+            )
         )
     actions.append(
-        {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "忽略"},
-            "type": "default",
-            "value": {
+        button(
+            "忽略",
+            value={
                 "action": "ignore_arbitration",
                 "draft_id": getattr(draft, "draft_id", ""),
                 "card_kind": ARBITRATION_CARD_KIND,
             },
-        }
+        )
     )
     return actions
 
@@ -791,16 +935,11 @@ def send_digest(entries: list[dict], digest_date: str) -> bool:
             }
         )
 
-    card = {
-        "header": {
-            "title": {
-                "tag": "plain_text",
-                "content": f"🌙 好价监控 · 夜间汇总 ({digest_date})",
-            },
-            "template": "orange",
-        },
-        "elements": elements,
-    }
+    card = build_card(
+        f"🌙 好价监控 · 夜间汇总 ({digest_date})",
+        "orange",
+        elements,
+    )
 
     if not needs_attachment:
         return _send_card_success(card)
@@ -871,68 +1010,198 @@ def _format_digest_markdown(entries: list[dict], digest_date: str) -> str:
 
 def build_draft_preview_card(draft: Any) -> Card:
     """构造带确认/取消按钮的偏好/库存修改预览卡片。"""
-    return {
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "📝 配置修改预览"},
-            "template": "blue",
-        },
-        "elements": [
+    return build_card(
+        "📝 配置修改预览",
+        "blue",
+        [
             {"tag": "markdown", "content": build_draft_preview_content(draft)},
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "确认应用"},
-                        "type": "primary",
-                        "value": {"action": "apply_draft", "draft_id": draft.draft_id},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "取消"},
-                        "type": "danger",
-                        "value": {"action": "cancel_draft", "draft_id": draft.draft_id},
-                    },
+            column_set(
+                [
+                    button(
+                        "确认应用",
+                        button_type="primary",
+                        value={"action": "apply_draft", "draft_id": draft.draft_id},
+                    ),
+                    button(
+                        "取消",
+                        button_type="danger",
+                        value={"action": "cancel_draft", "draft_id": draft.draft_id},
+                    ),
                 ],
-            },
+                component_id=element_id("draft_actions", str(draft.draft_id)),
+            ),
         ],
-    }
+    )
 
 
-def build_draft_processing_card(stage: str = "正在生成配置修改预览", elapsed_seconds: int = 0) -> Card:
+def build_draft_processing_card(stage: str = "正在生成配置修改预览") -> Card:
     """构造无按钮的草案生成处理中卡片。"""
-    elapsed_text = f"\n\n已等待：{elapsed_seconds} 秒" if elapsed_seconds > 0 else ""
-    return {
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "📝 配置修改预览生成中"},
-            "template": "blue",
-        },
-        "elements": [
+    return build_card(
+        "📝 配置修改预览生成中",
+        "blue",
+        [
             {
                 "tag": "markdown",
-                "content": f"正在生成配置修改预览，请稍候。\n\n当前阶段：{stage}{elapsed_text}",
+                "content": f"正在生成配置修改预览，请稍候。\n\n当前阶段：{stage}",
             },
         ],
-    }
+        summary="正在生成配置修改预览",
+    )
+
+
+def build_streaming_draft_processing_card(stage: str) -> Card:
+    """构造启用 CardKit 流式模式、只有固定 Markdown 元素的进度卡片。"""
+    return build_card(
+        "📝 配置修改预览生成中",
+        "blue",
+        [{"tag": "markdown", "element_id": DRAFT_STREAMING_ELEMENT_ID, "content": stage}],
+        summary="正在生成配置修改预览",
+        streaming_mode=True,
+    )
+
+
+def start_streaming_draft_processing(stage: str, reply_to_message_id: str) -> tuple[str, str] | None:
+    """创建并回复 CardKit 流式卡片，返回 (message_id, card_id)。"""
+    if not reply_to_message_id:
+        return None
+    card_id = _create_cardkit_card(build_streaming_draft_processing_card(stage))
+    if not card_id:
+        return None
+    message_id = reply_card_entity(reply_to_message_id, card_id)
+    if not message_id:
+        logger.warning(f"CardKit 卡片实体已创建但发送失败，将回退普通卡片: {card_id}")
+        return None
+    return message_id, card_id
+
+
+def _create_cardkit_card(card: Card) -> str:
+    try:
+        CreateCardRequest, CreateCardRequestBody = get_cardkit_create_models()
+        request = (
+            CreateCardRequest.builder()
+            .request_body(
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(json.dumps(card, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        response = get_lark_client().cardkit.v1.card.create(request)
+        if response.success():
+            card_id = str(getattr(response.data, "card_id", "") or "")
+            if card_id:
+                return card_id
+        logger.warning(f"CardKit 卡片实体创建失败: code={response.code}, msg={response.msg}")
+    except Exception as e:
+        logger.warning(f"CardKit 卡片实体创建异常，将回退普通卡片: {e}")
+    return ""
+
+
+def update_streaming_draft_content(card_id: str, content: str, sequence: int) -> bool:
+    """按 sequence 流式更新固定 Markdown 元素。"""
+    try:
+        ContentRequest, ContentRequestBody = get_cardkit_content_models()
+        request = (
+            ContentRequest.builder()
+            .card_id(card_id)
+            .element_id(DRAFT_STREAMING_ELEMENT_ID)
+            .request_body(
+                ContentRequestBody.builder()
+                .uuid(str(uuid.uuid4()))
+                .content(content)
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        response = get_lark_client().cardkit.v1.card_element.content(request)
+        if response.success():
+            return True
+        logger.warning(f"CardKit 流式文本更新失败: code={response.code}, msg={response.msg}")
+    except Exception as e:
+        logger.warning(f"CardKit 流式文本更新异常: {e}")
+    return False
+
+
+def finish_streaming_draft_card(card_id: str, card: Card, close_sequence: int, update_sequence: int) -> bool:
+    """先关闭流式模式，再整体替换为最终交互卡片。"""
+    if not _close_cardkit_streaming_mode(card_id, close_sequence):
+        return False
+    return _update_cardkit_card(card_id, card, update_sequence)
+
+
+def _close_cardkit_streaming_mode(card_id: str, sequence: int) -> bool:
+    try:
+        SettingsRequest, SettingsRequestBody = get_cardkit_settings_models()
+        request = (
+            SettingsRequest.builder()
+            .card_id(card_id)
+            .request_body(
+                SettingsRequestBody.builder()
+                .settings(json.dumps({"config": {"streaming_mode": False}}))
+                .uuid(str(uuid.uuid4()))
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        response = get_lark_client().cardkit.v1.card.settings(request)
+        if response.success():
+            return True
+        logger.warning(f"CardKit 流式模式关闭失败: code={response.code}, msg={response.msg}")
+    except Exception as e:
+        logger.warning(f"CardKit 流式模式关闭异常: {e}")
+    return False
+
+
+def _update_cardkit_card(card_id: str, card: Card, sequence: int) -> bool:
+    try:
+        CardModel, UpdateRequest, UpdateRequestBody = get_cardkit_update_models()
+        card_model = CardModel.builder().type("card_json").data(json.dumps(card, ensure_ascii=False)).build()
+        request = (
+            UpdateRequest.builder()
+            .card_id(card_id)
+            .request_body(
+                UpdateRequestBody.builder()
+                .card(card_model)
+                .uuid(str(uuid.uuid4()))
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        response = get_lark_client().cardkit.v1.card.update(request)
+        if response.success():
+            return True
+        logger.warning(f"CardKit 最终卡片更新失败: code={response.code}, msg={response.msg}")
+    except Exception as e:
+        logger.warning(f"CardKit 最终卡片更新异常: {e}")
+    return False
 
 
 def build_draft_failure_card(reason: str) -> Card:
     """构造无按钮的草案生成失败卡片。"""
-    return {
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "📝 配置修改预览生成失败"},
-            "template": "red",
-        },
-        "elements": [
+    return build_card(
+        "📝 配置修改预览生成失败",
+        "red",
+        [
             {
                 "tag": "markdown",
                 "content": f"{reason}\n\n请换一种更明确的说法重试，或稍后再试。",
             },
         ],
-    }
+    )
+
+
+def build_draft_handoff_card() -> Card:
+    """流式卡片已由新消息承接时，替换旧卡片的生成中状态。"""
+    return build_card(
+        "📝 配置修改预览已生成",
+        "green",
+        [{"tag": "markdown", "content": "已生成新的配置修改预览，请查看后续消息。"}],
+        summary="配置修改预览已生成",
+    )
 
 
 def send_draft_processing(stage: str, reply_to_message_id: str = "") -> MessageId | None:
@@ -969,16 +1238,11 @@ def build_disabled_draft_card(reason: str, draft: Any | None = None) -> Card:
         if draft
         else f"~~此预览已失效~~\n原因：{reason}"
     )
-    return {
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "📝 配置修改预览（已失效）"},
-            "template": "grey",
-        },
-        "elements": [
-            {"tag": "markdown", "content": content},
-        ],
-    }
+    return build_card(
+        "📝 配置修改预览（已失效）",
+        "grey",
+        [{"tag": "markdown", "content": content}],
+    )
 
 
 def build_disabled_arbitration_card(reason: str, draft: Any | None = None) -> Card:
@@ -991,14 +1255,11 @@ def build_disabled_arbitration_card(reason: str, draft: Any | None = None) -> Ca
     content = f"~~本次仲裁卡片已失效~~\n\n原因：{reason}"
     if draft:
         content = f"{content}\n\n**原配置修改预览：**\n\n{build_draft_preview_content(draft)}"
-    return {
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "⚖️ 好价监控 · 仲裁分析（已失效）"},
-            "template": "grey",
-        },
-        "elements": [{"tag": "markdown", "content": content}],
-    }
+    return build_card(
+        "⚖️ 好价监控 · 仲裁分析（已失效）",
+        "grey",
+        [{"tag": "markdown", "content": content}],
+    )
 
 
 def disable_draft_card(message_id: str, reason: str, draft: Any | None = None) -> bool:
@@ -1019,7 +1280,10 @@ def _is_arbitration_draft(draft: Any | None) -> bool:
 
 
 def send_text(text: str) -> bool:
-    return _send_text(text)
+    binding = _current_binding()
+    if not binding:
+        return False
+    return send_text_to(binding.receive_id_type, binding.receive_id, text)
 
 
 def _button(label: str, action: str, item: RankingItem, button_type: str) -> dict:

@@ -149,12 +149,14 @@ smzdm-notice setup
 
 1. 创建企业自建应用，添加「机器人」能力
 2. 复制 App ID 和 App Secret，填入 `.env`
-3. 申请权限：`im:message:send_as_bot`、`im:resource`、`im:message.reactions:write`、私聊 `im:message.p2p_msg:readonly`、群聊 `im:message.group_at_msg:readonly`
+3. 申请权限：`im:message:send_as_bot`、`im:resource`、`im:message.reactions:write`、`cardkit:card:write`、私聊 `im:message.p2p_msg:readonly`、群聊 `im:message.group_at_msg:readonly`
 4. 事件与回调选择「使用长连接接收事件」，订阅 `im.message.receive_v1`
 5. 卡片回调开启「卡片回传交互」，SDK key 为 `card.action.trigger`
 6. 保存并发布应用
 
 启动后在飞书私聊或群聊 @机器人 发送 `/bind` 完成绑定。绑定前不会轮询。
+
+卡片使用 JSON 2.0，建议接收端使用飞书 7.20 或以上版本。`cardkit:card:write` 用于创建和更新配置草案的流式进度卡片；未授权或调用失败时会自动发送普通 2.0 卡片。
 
 ### 运行
 

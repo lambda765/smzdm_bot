@@ -691,7 +691,10 @@ class MainSearchPriceBypassTests(unittest.TestCase):
             filter_items = stack.enter_context(
                 patch(
                     "smzdm_notice.runtime.filter_items",
-                    return_value=FilterItemsResult(matched=[(llm_item, "LLM 推荐")]),
+                    return_value=FilterItemsResult(
+                        matched=[(llm_item, "LLM 推荐")],
+                        notification_names_by_article_id={"llm": "苹果耳机"},
+                    ),
                 )
             )
             send_deals = stack.enter_context(patch("smzdm_notice.runtime.send_deals", return_value=True))
@@ -705,6 +708,10 @@ class MainSearchPriceBypassTests(unittest.TestCase):
         sent = send_deals.call_args.args[0]
         self.assertEqual([item.article_id for item, _ in sent], ["bypass", "llm"])
         self.assertEqual(send_deals.call_args.kwargs["price_bypass_article_ids"], {"bypass"})
+        self.assertEqual(
+            send_deals.call_args.kwargs["notification_names_by_article_id"],
+            {"bypass": "AirPods Pro 2", "llm": "苹果耳机"},
+        )
         self.assertIn("小于等于阈值", sent[0][1])
         dedup.mark_batch.assert_called_once_with([bypass.link, llm_item.link])
 
@@ -775,6 +782,31 @@ class MainSearchPriceBypassTests(unittest.TestCase):
             self.assertEqual(outcome.status, "success")
             filter_items.assert_not_called()
             self.assertEqual(main._deal_memory.pending_count, 0)
+
+    def test_partial_card_delivery_persists_only_successful_items(self) -> None:
+        delivered_item = self._search_item("delivered", 10.1, 10.0)
+        failed_item = self._search_item("failed", 10.2, 10.0)
+        dedup = MagicMock()
+        near_miss_mgr = MagicMock()
+        memory = MagicMock()
+        main._deal_memory = memory
+
+        with patch(
+            "smzdm_notice.runtime.send_deals",
+            return_value=main.DealSendResult(("delivered",), ("failed",)),
+        ):
+            success = main._send_matches_and_persist_runtime_state(
+                [(delivered_item, "推荐 A"), (failed_item, "推荐 B")],
+                dedup,
+                near_miss_mgr,
+                categories_by_article_id={"delivered": "品类 A", "failed": "品类 B"},
+            )
+
+        self.assertTrue(success)
+        dedup.mark_batch.assert_called_once_with([delivered_item.link])
+        near_miss_mgr.remove_batch.assert_called_once_with(["delivered"])
+        pending_items = memory.record_to_pending.call_args.args[0]
+        self.assertEqual([item.article_id for item, _ in pending_items], ["delivered"])
 
     def test_dedup_runs_before_price_bypass(self) -> None:
         bypass = self._search_item("bypass", 9.9, 10.0)

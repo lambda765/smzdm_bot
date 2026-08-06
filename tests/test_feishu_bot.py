@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -23,6 +24,32 @@ from smzdm_notice.feishu.notifier import NOT_WORTH_REASON_FIELD
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
 from smzdm_notice.preferences.models import ConfigDraft
 from smzdm_notice.preferences.store import DraftStore
+
+
+def _card_elements(card: dict) -> list[dict]:
+    return card["body"]["elements"]
+
+
+def _card_components(card: dict, tag: str = "") -> list[dict]:
+    result: list[dict] = []
+
+    def visit(component: dict) -> None:
+        if not tag or component.get("tag") == tag:
+            result.append(component)
+        for key in ("elements", "columns"):
+            for child in component.get(key, []):
+                visit(child)
+
+    for element in _card_elements(card):
+        visit(element)
+    return result
+
+
+def _component_callback_value(component: dict) -> dict:
+    for behavior in component.get("behaviors", []):
+        if behavior.get("type") == "callback":
+            return behavior.get("value", {})
+    return {}
 
 
 class FakeAction:
@@ -460,7 +487,7 @@ class FeishuBotParsingTests(unittest.TestCase):
             send_preview.assert_not_called()
             self.assertEqual(draft_store.get_by_preview_message_id("om_processing").draft_id, "generated-draft")
 
-    def test_message_draft_sends_new_preview_when_processing_thread_is_still_running(self) -> None:
+    def test_message_draft_finalizes_processing_card_after_stop_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             binding_store = FeishuBindingStore(root / "binding.json")
@@ -491,15 +518,15 @@ class FeishuBotParsingTests(unittest.TestCase):
                     "_start_draft_processing",
                     return_value=DraftProgressCard(message_id="om_processing"),
                 ),
-                patch.object(bot, "_stop_draft_processing", return_value=False),
+                patch.object(bot, "_stop_draft_processing"),
                 patch("smzdm_notice.feishu.bot.build_message_draft", return_value=generated),
-                patch("smzdm_notice.feishu.bot.update_draft_preview") as update_preview,
-                patch("smzdm_notice.feishu.bot.send_draft_preview", return_value=True) as send_preview,
+                patch("smzdm_notice.feishu.bot.update_draft_preview", return_value=True) as update_preview,
+                patch("smzdm_notice.feishu.bot.send_draft_preview") as send_preview,
             ):
                 bot._handle_text_command("拉黑坚果", FakeMessageData(), reply_to_message_id="om_original")
 
-            update_preview.assert_not_called()
-            send_preview.assert_called_once_with(generated, reply_to_message_id="om_original")
+            update_preview.assert_called_once_with("om_processing", generated)
+            send_preview.assert_not_called()
 
     def test_message_draft_failure_updates_processing_card(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -528,6 +555,228 @@ class FeishuBotParsingTests(unittest.TestCase):
             self.assertEqual(update_card.call_args.args[0], "om_processing")
             reply_text_fn.assert_not_called()
             send_text_fn.assert_not_called()
+
+    def test_cardkit_start_failure_uses_static_processing_card_without_worker(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+
+        with (
+            patch("smzdm_notice.feishu.bot.start_streaming_draft_processing", return_value=None),
+            patch("smzdm_notice.feishu.bot.send_draft_processing", return_value="om-static") as send_processing,
+            patch("smzdm_notice.feishu.bot.threading.Thread") as thread,
+        ):
+            progress = bot._start_draft_processing("om-parent", "正在理解偏好")
+
+        self.assertEqual(progress.message_id, "om-static")
+        self.assertFalse(progress.streaming)
+        self.assertIsNone(progress.stop_event)
+        self.assertIsNone(progress.thread)
+        send_processing.assert_called_once_with("正在理解偏好", reply_to_message_id="om-parent")
+        thread.assert_not_called()
+
+    def test_static_processing_patch_failure_sends_new_final_preview(self) -> None:
+        draft_store = Mock()
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=draft_store,
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        draft = ConfigDraft(
+            draft_id="static-fallback",
+            target_file="preference.md",
+            title="test",
+            summary="test",
+            append_text="- rule",
+            source="test",
+        )
+        progress = DraftProgressCard(message_id="om-static")
+
+        def send_preview(current_draft, reply_to_message_id=""):
+            current_draft.preview_message_id = "om-final"
+            return True
+
+        with (
+            patch("smzdm_notice.feishu.bot.update_draft_preview", return_value=False) as update_preview,
+            patch("smzdm_notice.feishu.bot.send_draft_preview", side_effect=send_preview) as send_preview_fn,
+        ):
+            self.assertTrue(bot._send_and_store_draft_preview(draft, "om-parent", progress))
+
+        update_preview.assert_called_once_with("om-static", draft)
+        send_preview_fn.assert_called_once_with(draft, reply_to_message_id="om-parent")
+        self.assertEqual(draft.preview_message_id, "om-final")
+        draft_store.update.assert_called_once_with(draft)
+
+    def test_streaming_progress_uses_monotonic_sequence_for_updates_and_finish(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        progress = DraftProgressCard(message_id="om-progress", card_id="card-1")
+
+        with (
+            patch(
+                "smzdm_notice.feishu.bot.update_streaming_draft_content",
+                side_effect=[False, True],
+            ) as update_content,
+            patch("smzdm_notice.feishu.bot.finish_streaming_draft_card", return_value=True) as finish_card,
+        ):
+            self.assertFalse(bot._update_streaming_progress(progress, "first"))
+            self.assertTrue(bot._update_streaming_progress(progress, "second"))
+            self.assertTrue(bot._finish_streaming_card(progress, {"schema": "2.0"}))
+
+        self.assertEqual([call.args[2] for call in update_content.call_args_list], [1, 2])
+        finish_card.assert_called_once_with("card-1", {"schema": "2.0"}, 3, 4)
+        self.assertEqual(progress.sequence, 4)
+
+    def test_streaming_progress_skips_updates_after_stop_signal(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        stop_event = threading.Event()
+        stop_event.set()
+        progress = DraftProgressCard(message_id="om-progress", card_id="card-1", stop_event=stop_event)
+
+        with patch("smzdm_notice.feishu.bot.update_streaming_draft_content") as update_content:
+            self.assertFalse(bot._update_streaming_progress(progress, "late update"))
+
+        update_content.assert_not_called()
+        self.assertEqual(progress.sequence, 0)
+
+    def test_streaming_finish_waits_for_inflight_progress_update(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        progress = DraftProgressCard(message_id="om-progress", card_id="card-1", stop_event=threading.Event())
+        update_started = threading.Event()
+        release_update = threading.Event()
+        finish_called = threading.Event()
+        calls: list[str] = []
+
+        def slow_update(*_args) -> bool:
+            update_started.set()
+            release_update.wait(timeout=2)
+            calls.append("progress")
+            return True
+
+        def finish(*_args) -> bool:
+            calls.append("finish")
+            finish_called.set()
+            return True
+
+        with (
+            patch("smzdm_notice.feishu.bot.update_streaming_draft_content", side_effect=slow_update),
+            patch("smzdm_notice.feishu.bot.finish_streaming_draft_card", side_effect=finish),
+        ):
+            update_thread = threading.Thread(target=bot._update_streaming_progress, args=(progress, "progress"))
+            update_thread.start()
+            self.assertTrue(update_started.wait(timeout=1))
+            progress.stop_event.set()
+            finish_thread = threading.Thread(target=bot._finish_streaming_card, args=(progress, {"schema": "2.0"}))
+            finish_thread.start()
+            self.assertFalse(finish_called.wait(timeout=0.05))
+            release_update.set()
+            update_thread.join(timeout=1)
+            finish_thread.join(timeout=1)
+
+        self.assertEqual(calls, ["progress", "finish"])
+        self.assertFalse(update_thread.is_alive())
+        self.assertFalse(finish_thread.is_alive())
+
+    def test_streaming_final_update_failure_sends_new_preview_and_stores_new_message(self) -> None:
+        draft_store = Mock()
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=draft_store,
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        draft = ConfigDraft(
+            draft_id="stream-fallback",
+            target_file="preference.md",
+            title="test",
+            summary="test",
+            append_text="- rule",
+            source="test",
+        )
+        progress = DraftProgressCard(message_id="om-progress", card_id="card-1")
+
+        def send_preview(current_draft, reply_to_message_id=""):
+            current_draft.preview_message_id = "om-final"
+            return True
+
+        with (
+            patch.object(bot, "_finish_streaming_card", return_value=False) as finish_card,
+            patch.object(bot, "_schedule_streaming_cleanup") as schedule_cleanup,
+            patch("smzdm_notice.feishu.bot.send_draft_preview", side_effect=send_preview) as send_preview_fn,
+        ):
+            self.assertTrue(bot._send_and_store_draft_preview(draft, "om-parent", progress))
+
+        finish_card.assert_called_once()
+        schedule_cleanup.assert_called_once()
+        send_preview_fn.assert_called_once_with(draft, reply_to_message_id="om-parent")
+        self.assertEqual(draft.preview_message_id, "om-final")
+        draft_store.update.assert_called_once_with(draft)
+
+    def test_streaming_busy_update_falls_back_and_schedules_old_card_cleanup(self) -> None:
+        draft_store = Mock()
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=draft_store,
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        draft = ConfigDraft(
+            draft_id="stream-busy-fallback",
+            target_file="preference.md",
+            title="test",
+            summary="test",
+            append_text="- rule",
+            source="test",
+        )
+        progress = DraftProgressCard(message_id="om-progress", card_id="card-1")
+
+        def send_preview(current_draft, reply_to_message_id=""):
+            current_draft.preview_message_id = "om-final"
+            return True
+
+        with (
+            patch.object(bot, "_finish_streaming_card", return_value=None) as finish_card,
+            patch.object(bot, "_schedule_streaming_cleanup") as schedule_cleanup,
+            patch("smzdm_notice.feishu.bot.send_draft_preview", side_effect=send_preview),
+        ):
+            self.assertTrue(bot._send_and_store_draft_preview(draft, "om-parent", progress))
+
+        finish_card.assert_called_once()
+        schedule_cleanup.assert_called_once()
+        self.assertEqual(draft.preview_message_id, "om-final")
+        draft_store.update.assert_called_once_with(draft)
 
     def test_status_command_replies_to_original_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -613,6 +862,40 @@ class FeishuBotParsingTests(unittest.TestCase):
             "1001",
             selected="deal_not_worth",
             reason="价格一般",
+        )
+
+    def test_memory_feedback_reason_reads_dynamic_json2_form_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            callback = Mock(return_value="reason_updated")
+            bot = FeishuInteractiveBot(
+                BotRuntime(
+                    draft_store=DraftStore(root / "drafts.json", root / "backups", root / "audit.jsonl", root=root),
+                    binding_store=FeishuBindingStore(root / "binding.json"),
+                    status_provider=lambda: "status",
+                    run_once=Mock(return_value=True),
+                    record_memory_feedback=callback,
+                )
+            )
+
+            with patch("smzdm_notice.feishu.bot.update_deal_card_feedback_state", return_value={}) as update_card:
+                result = bot._handle_memory_feedback(
+                    "deal_not_worth_reason",
+                    {
+                        "article_id": "1001",
+                        "reason_field": "reason_abcd1234",
+                        "form_value": {"reason_abcd1234": {"value": "已有类似商品"}},
+                    },
+                    "om_deal",
+                )
+
+        self.assertEqual(result.message, "已保存不值理由")
+        callback.assert_called_once_with("1001", "deal_not_worth", "已有类似商品")
+        update_card.assert_called_once_with(
+            "om_deal",
+            "1001",
+            selected="deal_not_worth",
+            reason="已有类似商品",
         )
 
     def test_not_worth_reason_input_change_is_cached_without_dispatch(self) -> None:
@@ -1369,7 +1652,7 @@ class FeishuBotParsingTests(unittest.TestCase):
             disable_card.assert_not_called()
             self.assertEqual(response.card.type, "raw")
             self.assertIn("仲裁分析", response.card.data["header"]["title"]["content"])
-            elements = response.card.data["elements"]
+            elements = _card_elements(response.card.data)
             self.assertNotIn("action", {element.get("tag") for element in elements})
             markdown = "\n".join(element.get("content", "") for element in elements)
             self.assertIn("已忽略", markdown)
@@ -1424,7 +1707,7 @@ class FeishuBotParsingTests(unittest.TestCase):
             send_text.assert_not_called()
             disable_card.assert_not_called()
             self.assertEqual(response.card.type, "raw")
-            elements = response.card.data["elements"]
+            elements = _card_elements(response.card.data)
             self.assertNotIn("action", {element.get("tag") for element in elements})
             self.assertIn("预览已失效", elements[0]["content"])
 
@@ -1493,7 +1776,7 @@ class FeishuBotParsingTests(unittest.TestCase):
             self.assertEqual(draft_store.get("expired-arbiter").status, "cancelled")
             disable_card.assert_not_called()
             self.assertIn("仲裁分析", response.card.data["header"]["title"]["content"])
-            elements = response.card.data["elements"]
+            elements = _card_elements(response.card.data)
             self.assertNotIn("action", {element.get("tag") for element in elements})
             markdown = "\n".join(element.get("content", "") for element in elements)
             self.assertIn("A 过度扩展黑名单。", markdown)
@@ -1511,15 +1794,20 @@ class FeishuModelCommandTests(unittest.TestCase):
         self.assertIn("input", serialized)
         self.assertIn("切换 model_id", serialized)
         self.assertNotIn("切换 connection + model", serialized)
-        # 元素顺序：[markdown, hr, hint_markdown, select_action, input_action, ...]
-        select_actions = card["elements"][3]["actions"]
-        self.assertEqual(select_actions[0]["value"], {"field": "target"})
-        self.assertEqual(select_actions[1]["value"], {"field": "connection"})
+        select_actions = _card_components(card, "select_static")
+        self.assertEqual(_component_callback_value(select_actions[0]), {"field": "target"})
+        self.assertEqual(_component_callback_value(select_actions[1]), {"field": "connection"})
         self.assertEqual(select_actions[0]["initial_option"], "default")
         self.assertEqual(select_actions[1]["initial_option"], "deepseek")
         self.assertEqual(select_actions[0]["options"][1]["value"], "filter")
         self.assertEqual(select_actions[1]["options"][0]["value"], "deepseek")
-        input_actions = card["elements"][4]["actions"]
+        input_actions = _card_components(card, "input")
+        self.assertEqual([element.get("tag") for element in _card_elements(card)].count("input"), 2)
+        self.assertEqual(
+            [input_action["label"]["content"] for input_action in input_actions],
+            ["模型 ID", "Temperature（0 到 5）"],
+        )
+        self.assertTrue(all(input_action["width"] == "fill" for input_action in input_actions))
         self.assertEqual(input_actions[0]["default_value"], "deepseek-chat")
 
     def test_build_model_management_card_response_builds_target_options_from_agents_state(self) -> None:
@@ -1539,7 +1827,7 @@ class FeishuModelCommandTests(unittest.TestCase):
 
         card = build_model_management_card(state)
 
-        target_options = card["elements"][3]["actions"][0]["options"]
+        target_options = _card_components(card, "select_static")[0]["options"]
         self.assertEqual([option["value"] for option in target_options], ["default", "filter", "arbiter", "draft", "reviewer"])
 
     def test_model_command_replies_with_management_card_and_ignores_subcommands(self) -> None:
@@ -1986,8 +2274,8 @@ class FeishuModelCommandTests(unittest.TestCase):
         self.assertNotIn("om_card:ou_real_open_id", bot._model_card_form_state)
         self.assertIsNotNone(result)
         card_data = result.card.data
-        select_actions = card_data["elements"][3]["actions"]
-        input_actions = card_data["elements"][4]["actions"]
+        select_actions = _card_components(card_data, "select_static")
+        input_actions = _card_components(card_data, "input")
         self.assertEqual(select_actions[0]["initial_option"], "default")
         self.assertEqual(select_actions[1]["initial_option"], "deepseek")
         self.assertEqual(input_actions[0]["default_value"], "deepseek-chat")
@@ -2321,12 +2609,11 @@ class FeishuModelCommandTests(unittest.TestCase):
         self.assertNotIn("仅切换模型", serialized)
         self.assertNotIn("应用全部设置", serialized)
 
-        # 元素顺序：[markdown, hr, hint_markdown, select_action, input_action, ...]
-        select_actions = card["elements"][3]["actions"]
+        select_actions = _card_components(card, "select_static")
         self.assertEqual(select_actions[0]["initial_option"], "filter")
         self.assertEqual(select_actions[1]["initial_option"], "deepseek")
 
-        input_actions = card["elements"][4]["actions"]
+        input_actions = _card_components(card, "input")
         self.assertEqual(input_actions[0]["default_value"], "deepseek-chat")
         self.assertEqual(input_actions[1]["default_value"], "0.3")
 
@@ -2339,7 +2626,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         }
         card = build_model_management_card(_model_card_state(), form_state=form_state)
 
-        input_actions = card["elements"][4]["actions"]
+        input_actions = _card_components(card, "input")
         self.assertEqual(input_actions[0]["default_value"], "")
         self.assertEqual(input_actions[1]["default_value"], "")
 
@@ -2354,8 +2641,12 @@ class FeishuModelCommandTests(unittest.TestCase):
 
         self.assertIn("切换 connection + model", serialized)
         self.assertNotIn("切换 model_id", serialized)
-        route_actions = card["elements"][5]["actions"]
-        self.assertEqual(route_actions[0]["value"]["action"], "model_apply_connection_model")
+        route_actions = [
+            component
+            for component in _card_components(card, "button")
+            if _component_callback_value(component).get("action") == "model_apply_connection_model"
+        ]
+        self.assertEqual(len(route_actions), 1)
 
     def test_build_model_management_card_response_ignores_invalid_initial_option(self) -> None:
         form_state = {
@@ -2365,7 +2656,7 @@ class FeishuModelCommandTests(unittest.TestCase):
         }
         card = build_model_management_card(_model_card_state(), form_state=form_state)
 
-        select_actions = card["elements"][3]["actions"]
+        select_actions = _card_components(card, "select_static")
         self.assertEqual(select_actions[0]["initial_option"], "filter")
         # 无效 connection 应被跳过。
         self.assertNotIn("initial_option", select_actions[1])

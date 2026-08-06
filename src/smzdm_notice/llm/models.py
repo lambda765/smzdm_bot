@@ -43,6 +43,7 @@ class Recommendation(BaseModel):
     id: str
     reason: str
     category: str = ""
+    notification_name: str = ""
     decision_context: DecisionContext = Field(default_factory=DecisionContext)
 
     @field_validator("category", mode="before")
@@ -51,6 +52,14 @@ class Recommendation(BaseModel):
             return value
         if value is not None:
             logger.warning(f"LLM 推荐 category 类型异常，已降级为未分类: {type(value).__name__}")
+        return ""
+
+    @field_validator("notification_name", mode="before")
+    def _normalize_notification_name(cls, value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if value is not None:
+            logger.warning(f"LLM 推荐 notification_name 类型异常，已从通知摘要略过: {type(value).__name__}")
         return ""
 
     @field_validator("decision_context", mode="before")
@@ -106,6 +115,7 @@ class FilterItemsResult:
     near_misses: list[tuple[RankingItem, str]] = field(default_factory=list)
     categories_by_article_id: dict[str, str] = field(default_factory=dict)
     contexts_by_article_id: dict[str, dict] = field(default_factory=dict)
+    notification_names_by_article_id: dict[str, str] = field(default_factory=dict)
     arbiter_info: ArbiterInfo | None = None
     diagnostics: FilterDiagnostics = field(default_factory=FilterDiagnostics)
 

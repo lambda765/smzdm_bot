@@ -82,6 +82,38 @@ def get_message_update_models() -> tuple[Any, Any]:
         return PatchMessageRequest, PatchMessageRequestBody
 
 
+def get_cardkit_create_models() -> tuple[Any, Any]:
+    """获取创建 CardKit 卡片实体需要的 SDK model。"""
+    with _IMPORT_LOCK:
+        from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
+
+        return CreateCardRequest, CreateCardRequestBody
+
+
+def get_cardkit_content_models() -> tuple[Any, Any]:
+    """获取流式更新 CardKit 元素需要的 SDK model。"""
+    with _IMPORT_LOCK:
+        from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
+
+        return ContentCardElementRequest, ContentCardElementRequestBody
+
+
+def get_cardkit_settings_models() -> tuple[Any, Any]:
+    """获取更新 CardKit 设置需要的 SDK model。"""
+    with _IMPORT_LOCK:
+        from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
+
+        return SettingsCardRequest, SettingsCardRequestBody
+
+
+def get_cardkit_update_models() -> tuple[Any, Any, Any]:
+    """获取整体更新 CardKit 卡片实体需要的 SDK model。"""
+    with _IMPORT_LOCK:
+        from lark_oapi.api.cardkit.v1 import Card, UpdateCardRequest, UpdateCardRequestBody
+
+        return Card, UpdateCardRequest, UpdateCardRequestBody
+
+
 def get_card_action_response_model() -> Any:
     """获取卡片回调响应 model。"""
     with _IMPORT_LOCK:

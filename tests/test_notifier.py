@@ -11,9 +11,40 @@ from unittest.mock import Mock, patch
 
 from smzdm_notice.feishu import notifier
 from smzdm_notice.feishu.binding import FeishuBinding, FeishuBindingStore
+from smzdm_notice.feishu.card_v2 import card_component_count, card_json_size_bytes
+from smzdm_notice.feishu.model_cards import build_model_management_card
 from smzdm_notice.llm.models import ArbiterInfo, FilterResult, Recommendation
 from smzdm_notice.preferences.models import ConfigDraft
 from smzdm_notice.smzdm.ranking import RankingItem
+
+
+def _elements(card: dict) -> list[dict]:
+    return card["body"]["elements"]
+
+
+def _components(card: dict) -> list[dict]:
+    result: list[dict] = []
+
+    def visit(component: dict) -> None:
+        result.append(component)
+        for key in ("elements", "columns"):
+            for child in component.get(key, []):
+                visit(child)
+
+    for element in _elements(card):
+        visit(element)
+    return result
+
+
+def _callback_value(component: dict) -> dict:
+    for behavior in component.get("behaviors", []):
+        if behavior.get("type") == "callback":
+            return behavior.get("value", {})
+    return {}
+
+
+def _actions(card: dict) -> list[dict]:
+    return [_callback_value(component) for component in _components(card) if _callback_value(component).get("action")]
 
 
 def _item(pic: str = "https://img.example.com/a.jpg") -> RankingItem:
@@ -62,6 +93,27 @@ def _digest_entry(index: int) -> dict:
 
 
 class NotifierBindingTests(unittest.TestCase):
+    def assert_card_v2(self, card: dict) -> None:
+        self.assertEqual(card.get("schema"), "2.0")
+        self.assertNotIn("elements", card)
+        self.assertIn("summary", card.get("config", {}))
+        self.assertLessEqual(len(card["config"]["summary"]["content"]), 80)
+        interactive_ids: list[str] = []
+        for component in _components(card):
+            self.assertNotEqual(component.get("tag"), "action")
+            self.assertNotIn("form_action_type", component)
+            if component.get("tag") == "button":
+                self.assertNotIn("value", component)
+                self.assertNotIn("url", component)
+                self.assertIn("behaviors", component)
+            if component.get("tag") in {"button", "input", "select_static"}:
+                interactive_ids.append(component.get("element_id", ""))
+            if "confirm" in component:
+                self.assertIn("text", component["confirm"])
+                self.assertNotIn("content", component["confirm"])
+        self.assertTrue(all(interactive_ids))
+        self.assertEqual(len(interactive_ids), len(set(interactive_ids)))
+
     def test_binding_file_is_written_with_owner_only_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "binding.json"
@@ -116,7 +168,7 @@ class NotifierBindingTests(unittest.TestCase):
             self.assertTrue(notifier.send_deals([(_item(), "值得买")]))
 
         get_image_key.assert_called_once_with("https://img.example.com/a.jpg")
-        elements = sent_cards[0]["elements"]
+        elements = _elements(sent_cards[0])
         image_elements = [element for element in elements if element.get("tag") == "img"]
         self.assertEqual(image_elements[0]["img_key"], "img_test_key")
         self.assertEqual(image_elements[0]["alt"]["content"], "测试商品")
@@ -134,7 +186,7 @@ class NotifierBindingTests(unittest.TestCase):
         ):
             self.assertTrue(notifier.send_deals([(_item(), "值得买")]))
 
-        elements = sent_cards[0]["elements"]
+        elements = _elements(sent_cards[0])
         self.assertFalse([element for element in elements if element.get("tag") == "img"])
         markdown = "\n".join(element.get("content", "") for element in elements if element.get("tag") == "markdown")
         self.assertIn("查看商品图片", markdown)
@@ -149,6 +201,102 @@ class NotifierBindingTests(unittest.TestCase):
 
         get_image_key.assert_not_called()
 
+    def test_deals_summary_groups_names_and_preserves_item_order(self) -> None:
+        first = _item(pic="")
+        second = _item(pic="")
+        third = _item(pic="")
+        first.article_id = "1"
+        second.article_id = "2"
+        third.article_id = "3"
+
+        card = notifier._build_deals_card(
+            [(first, "A"), (second, "B"), (third, "C")],
+            set(),
+            {"1": "纸尿裤", "2": "纸尿裤", "3": "蓝莓"},
+        )
+
+        self.assertEqual(card["config"]["summary"]["content"], "好价：纸尿裤×2、蓝莓")
+        markdown = "\n".join(element.get("content", "") for element in _elements(card))
+        self.assertLess(markdown.index("**测试商品**"), markdown.rindex("**测试商品**"))
+
+    def test_deals_summary_skips_missing_names_but_keeps_all_card_items(self) -> None:
+        first = _item(pic="")
+        second = _item(pic="")
+        third = _item(pic="")
+        first.article_id, first.title = "1", "蓝莓商品正文"
+        second.article_id, second.title = "2", "缺名商品正文一"
+        third.article_id, third.title = "3", "缺名商品正文二"
+
+        card = notifier._build_deals_card(
+            [(first, "A"), (second, "B"), (third, "C")],
+            set(),
+            {"1": "蓝莓"},
+        )
+
+        self.assertEqual(card["config"]["summary"]["content"], "好价：蓝莓等 3 件")
+        markdown = "\n".join(element.get("content", "") for element in _elements(card))
+        self.assertIn("蓝莓商品正文", markdown)
+        self.assertIn("缺名商品正文一", markdown)
+        self.assertIn("缺名商品正文二", markdown)
+
+    def test_deals_summary_uses_count_when_all_names_are_missing(self) -> None:
+        items = [(_item(pic=""), "A"), (_item(pic=""), "B")]
+        items[0][0].article_id = "1"
+        items[1][0].article_id = "2"
+
+        card = notifier._build_deals_card(items, set(), {})
+
+        self.assertEqual(card["config"]["summary"]["content"], "推荐了 2 个商品")
+
+    def test_deals_summary_uses_search_keyword_and_stays_within_80_characters(self) -> None:
+        items: list[tuple[RankingItem, str]] = []
+        names: dict[str, str] = {}
+        for index in range(8):
+            item = _item(pic="")
+            item.article_id = str(index)
+            item.title = f"原标题{index}"
+            items.append((item, "reason"))
+            names[item.article_id] = f"精简商品名称{index}号超长文本"
+        search_item = _search_bypass_item()
+        search_item.article_id = "search"
+        items.insert(0, (search_item, "bypass"))
+        names[search_item.article_id] = search_item.search_keyword
+
+        card = notifier._build_deals_card(items, {"search"}, names)
+        summary = card["config"]["summary"]["content"]
+
+        self.assertTrue(summary.startswith("好价：AirPods Pro 2"))
+        self.assertTrue(summary.endswith("等 9 件"))
+        self.assertLessEqual(len(summary), 80)
+
+    def test_representative_cards_use_json_2_without_legacy_actions(self) -> None:
+        draft = ConfigDraft(
+            draft_id="v2-check",
+            target_file="preference.md",
+            title="test",
+            summary="test",
+            append_text="- rule",
+            source="test",
+        )
+        model_state = {
+            "defaults": {"connection": "test", "model_id": "model"},
+            "agents": [],
+            "connections": [{"name": "test", "label": "Test", "key_configured": True}],
+        }
+        cards = [
+            notifier._build_deals_card([(_item(pic=""), "reason")], set()),
+            notifier.build_help_card("help"),
+            notifier.build_draft_preview_card(draft),
+            notifier.build_draft_processing_card(),
+            notifier.build_draft_failure_card("failed"),
+            notifier.build_draft_handoff_card(),
+            notifier.build_disabled_draft_card("disabled", draft),
+            build_model_management_card(model_state),
+        ]
+
+        for card in cards:
+            self.assert_card_v2(card)
+
     def test_send_deals_uses_search_price_bypass_buttons(self) -> None:
         sent_cards = []
         with (
@@ -161,13 +309,7 @@ class NotifierBindingTests(unittest.TestCase):
             item = _search_bypass_item()
             self.assertTrue(notifier.send_deals([(item, "价格直推")], price_bypass_article_ids={item.article_id}))
 
-        action_rows = [element for element in sent_cards[0]["elements"] if element.get("tag") == "action"]
-        all_action_values = [
-            action.get("value", {}).get("action")
-            for row in action_rows
-            for action in row["actions"]
-            if action.get("value")
-        ]
+        all_action_values = [value["action"] for value in _actions(sent_cards[0])]
         self.assertNotIn("deal_good", all_action_values)
         self.assertNotIn("deal_not_worth", all_action_values)
         self.assertIn("search_remove_keyword", all_action_values)
@@ -186,14 +328,7 @@ class NotifierBindingTests(unittest.TestCase):
         ):
             self.assertTrue(notifier.send_deals([(_search_bypass_item(), "LLM 推荐")]))
 
-        # 新版布局：两个 action 行（memory + config）
-        action_rows = [element for element in sent_cards[0]["elements"] if element.get("tag") == "action"]
-        all_action_values = [
-            action.get("value", {}).get("action")
-            for row in action_rows
-            for action in row["actions"]
-            if action.get("value")
-        ]
+        all_action_values = [value["action"] for value in _actions(sent_cards[0])]
         self.assertIn("deal_good", all_action_values)
         self.assertIn("deal_not_worth", all_action_values)
         self.assertIn("deal_ignore_category", all_action_values)
@@ -203,9 +338,8 @@ class NotifierBindingTests(unittest.TestCase):
         self.assertNotIn("search_clear_price", all_action_values)
         self.assertFalse(
             any(
-                action.get("name") == notifier.NOT_WORTH_REASON_FIELD
-                for row in action_rows
-                for action in row["actions"]
+                component.get("tag") == "input"
+                for component in _components(sent_cards[0])
             )
         )
 
@@ -221,13 +355,7 @@ class NotifierBindingTests(unittest.TestCase):
         ):
             self.assertTrue(notifier.send_deals([(_item(), "LLM 推荐")]))
 
-        action_rows = [element for element in sent_cards[0]["elements"] if element.get("tag") == "action"]
-        all_action_values = [
-            action.get("value", {}).get("action")
-            for row in action_rows
-            for action in row["actions"]
-            if action.get("value")
-        ]
+        all_action_values = [value["action"] for value in _actions(sent_cards[0])]
         self.assertNotIn("deal_good", all_action_values)
         self.assertNotIn("deal_not_worth", all_action_values)
         self.assertIn("deal_ignore_category", all_action_values)
@@ -253,11 +381,11 @@ class NotifierBindingTests(unittest.TestCase):
             self.assertIsNotNone(result)
 
         update_card.assert_called_once()
-        action_rows = [element for element in updated_cards[0]["elements"] if element.get("tag") == "action"]
+        components = _components(updated_cards[0])
         memory_labels = [
-            action["text"]["content"]
-            for action in action_rows[0]["actions"]
-            if action.get("value", {}).get("action") in {"deal_good", "deal_not_worth"}
+            component["text"]["content"]
+            for component in components
+            if _callback_value(component).get("action") in {"deal_good", "deal_not_worth"}
         ]
         self.assertEqual(memory_labels, ["✅ 好价"])
 
@@ -286,17 +414,99 @@ class NotifierBindingTests(unittest.TestCase):
             )
             self.assertIsNotNone(result)
 
-        action_rows = [element for element in updated_cards[0]["elements"] if element.get("tag") == "action"]
-        memory_actions = action_rows[0]["actions"]
-        reason_inputs = [action for action in memory_actions if action.get("name") == notifier.NOT_WORTH_REASON_FIELD]
+        self.assertFalse(any(component.get("tag") == "form" for component in _components(sent_cards[0])))
+        components = _components(updated_cards[0])
+        forms = [component for component in components if component.get("tag") == "form"]
+        self.assertEqual(len(forms), 1)
+        reason_inputs = [component for component in components if component.get("tag") == "input"]
         self.assertEqual(len(reason_inputs), 1)
         self.assertEqual(reason_inputs[0]["default_value"], "价格一般 非刚需")
-        self.assertEqual(reason_inputs[0]["value"]["article_id"], item.article_id)
+        self.assertEqual(_callback_value(reason_inputs[0])["article_id"], item.article_id)
+        self.assertEqual(_callback_value(reason_inputs[0])["field"], notifier.NOT_WORTH_REASON_FIELD)
         self.assertTrue(
-            any(action.get("value", {}).get("action") == "deal_not_worth_reason" for action in memory_actions)
+            any(value.get("action") == "deal_not_worth_reason" for value in _actions(updated_cards[0]))
         )
-        markdown = "\n".join(element.get("content", "") for element in updated_cards[0]["elements"])
+        save_buttons = [
+            component
+            for component in components
+            if _callback_value(component).get("action") == "deal_not_worth_reason"
+        ]
+        self.assertEqual(save_buttons[0]["action_type"], "form_submit")
+        self.assertNotIn("form_action_type", save_buttons[0])
+        markdown = "\n".join(element.get("content", "") for element in _elements(updated_cards[0]))
         self.assertIn("价格一般 非刚需", markdown)
+
+    def test_send_deals_splits_large_result_within_card_budgets_and_preserves_order(self) -> None:
+        items: list[tuple[RankingItem, str]] = []
+        for index in range(20):
+            item = _item(pic=f"https://img.example.com/{index}.jpg")
+            item.article_id = str(index)
+            item.link = f"https://example.com/deal/{index}"
+            item.title = f"测试商品 {index}"
+            items.append((item, f"推荐理由 {index}"))
+
+        sent_cards: list[dict] = []
+        with (
+            patch("smzdm_notice.feishu.notifier.config.DEAL_MEMORY_ENABLED", True),
+            patch(
+                "smzdm_notice.feishu.notifier.get_feishu_image_key",
+                side_effect=lambda url: f"img_{url.rsplit('/', 1)[-1]}",
+            ) as get_image_key,
+            patch(
+                "smzdm_notice.feishu.notifier._send_card_message_id",
+                side_effect=lambda card: sent_cards.append(card) or f"om_{len(sent_cards)}",
+            ),
+        ):
+            result = notifier.send_deals(items)
+
+        self.assertTrue(result.complete)
+        self.assertGreater(len(sent_cards), 1)
+        self.assertEqual(get_image_key.call_count, len(items))
+        sent_order = [
+            value["article_id"]
+            for card in sent_cards
+            for value in _actions(card)
+            if value.get("action") == "deal_ignore_category"
+        ]
+        self.assertEqual(sent_order, [str(index) for index in range(20)])
+        for card in sent_cards:
+            self.assertLessEqual(card_component_count(card), notifier.DEAL_CARD_COMPONENT_BUDGET)
+            self.assertLessEqual(card_json_size_bytes(card), notifier.DEAL_CARD_JSON_BUDGET_BYTES)
+
+    def test_send_deals_reports_only_articles_from_successful_chunks(self) -> None:
+        items: list[tuple[RankingItem, str]] = []
+        for index in range(20):
+            item = _item(pic=f"https://img.example.com/{index}.jpg")
+            item.article_id = str(index)
+            item.link = f"https://example.com/deal/{index}"
+            items.append((item, "推荐理由"))
+
+        sent_cards: list[dict] = []
+
+        def send_card(card: dict) -> str | None:
+            sent_cards.append(card)
+            return None if len(sent_cards) == 2 else f"om_{len(sent_cards)}"
+
+        with (
+            patch("smzdm_notice.feishu.notifier.config.DEAL_MEMORY_ENABLED", True),
+            patch("smzdm_notice.feishu.notifier.get_feishu_image_key", return_value="img_key"),
+            patch("smzdm_notice.feishu.notifier._send_card_message_id", side_effect=send_card),
+        ):
+            result = notifier.send_deals(items)
+
+        chunk_article_ids = [
+            [
+                value["article_id"]
+                for value in _actions(card)
+                if value.get("action") == "deal_ignore_category"
+            ]
+            for card in sent_cards
+        ]
+        self.assertEqual(result.failed_article_ids, tuple(chunk_article_ids[1]))
+        self.assertEqual(
+            result.delivered_article_ids,
+            tuple([*chunk_article_ids[0], *chunk_article_ids[2]]),
+        )
 
     def test_send_digest_without_overflow_sends_only_card(self) -> None:
         sent_cards = []
@@ -311,7 +521,7 @@ class NotifierBindingTests(unittest.TestCase):
             self.assertTrue(notifier.send_digest(entries, "2026-05-30"))
 
         upload_file.assert_not_called()
-        markdown = "\n".join(element.get("content", "") for element in sent_cards[0]["elements"])
+        markdown = "\n".join(element.get("content", "") for element in _elements(sent_cards[0]))
         self.assertIn("完整测试商品 20", markdown)
         self.assertNotIn("完整测试商品 21", markdown)
         self.assertNotIn("完整内容见附件", markdown)
@@ -344,7 +554,7 @@ class NotifierBindingTests(unittest.TestCase):
             self.assertTrue(notifier.send_digest(entries, "2026-05-30"))
 
         self.assertEqual(calls, ["upload", "card", "file"])
-        card_markdown = "\n".join(element.get("content", "") for element in sent_cards[0]["elements"])
+        card_markdown = "\n".join(element.get("content", "") for element in _elements(sent_cards[0]))
         self.assertIn("完整测试商品 20", card_markdown)
         self.assertNotIn("完整测试商品 21", card_markdown)
         self.assertIn("完整内容见附件", card_markdown)
@@ -413,7 +623,7 @@ class NotifierBindingTests(unittest.TestCase):
             self.assertTrue(notifier.send_poll_failure_warning(3, "llm_failed", detail))
 
         self.assertEqual(sent_cards[0]["header"]["template"], "red")
-        markdown = sent_cards[0]["elements"][0]["content"]
+        markdown = _elements(sent_cards[0])[0]["content"]
         self.assertIn("连续 **3** 次轮询失败", markdown)
         self.assertIn("LLM 调用失败", markdown)
         self.assertIn("<redacted>", markdown)
@@ -424,7 +634,7 @@ class NotifierBindingTests(unittest.TestCase):
         card = notifier.build_help_card("help content")
 
         self.assertEqual(card["header"]["template"], "blue")
-        self.assertEqual(card["elements"][0]["content"], "help content")
+        self.assertEqual(_elements(card)[0]["content"], "help content")
 
     def test_reply_text_uses_feishu_reply_api(self) -> None:
         ReplyRequest = Mock()
@@ -505,19 +715,20 @@ class NotifierBindingTests(unittest.TestCase):
 
         build_content.assert_called_once_with(draft)
         self.assertEqual(draft.preview_message_id, "om_preview")
-        self.assertEqual(sent_cards[0]["elements"][0]["content"], "preview content")
-        actions = sent_cards[0]["elements"][1]["actions"]
-        self.assertEqual(actions[0]["value"]["draft_id"], "preview-only")
-        self.assertEqual(actions[1]["value"]["action"], "cancel_draft")
+        self.assertEqual(_elements(sent_cards[0])[0]["content"], "preview content")
+        actions = _actions(sent_cards[0])
+        self.assertEqual(actions[0]["draft_id"], "preview-only")
+        self.assertEqual(actions[1]["action"], "cancel_draft")
 
     def test_draft_status_cards_do_not_include_actions(self) -> None:
-        processing = notifier.build_draft_processing_card("正在理解偏好/库存修改", elapsed_seconds=15)
+        processing = notifier.build_draft_processing_card("正在理解偏好/库存修改")
         failure = notifier.build_draft_failure_card("草案生成失败")
 
-        self.assertNotIn("action", {element.get("tag") for element in processing["elements"]})
-        self.assertNotIn("action", {element.get("tag") for element in failure["elements"]})
-        self.assertIn("15 秒", processing["elements"][0]["content"])
-        self.assertIn("草案生成失败", failure["elements"][0]["content"])
+        self.assertNotIn("action", {element.get("tag") for element in _elements(processing)})
+        self.assertNotIn("action", {element.get("tag") for element in _elements(failure)})
+        self.assertIn("正在理解偏好/库存修改", _elements(processing)[0]["content"])
+        self.assertNotIn("已等待", _elements(processing)[0]["content"])
+        self.assertIn("草案生成失败", _elements(failure)[0]["content"])
 
     def test_build_draft_preview_card_includes_apply_and_cancel_actions(self) -> None:
         draft = ConfigDraft(
@@ -531,9 +742,9 @@ class NotifierBindingTests(unittest.TestCase):
         with patch("smzdm_notice.feishu.notifier.build_draft_preview_content", return_value="preview content"):
             card = notifier.build_draft_preview_card(draft)
 
-        actions = card["elements"][1]["actions"]
-        self.assertEqual(actions[0]["value"], {"action": "apply_draft", "draft_id": "preview-card"})
-        self.assertEqual(actions[1]["value"], {"action": "cancel_draft", "draft_id": "preview-card"})
+        actions = _actions(card)
+        self.assertEqual(actions[0], {"action": "apply_draft", "draft_id": "preview-card"})
+        self.assertEqual(actions[1], {"action": "cancel_draft", "draft_id": "preview-card"})
 
     def test_send_draft_preview_replies_and_stores_reply_message_id(self) -> None:
         draft = ConfigDraft(
@@ -555,6 +766,111 @@ class NotifierBindingTests(unittest.TestCase):
         self.assertEqual(reply_card.call_args.args[0], "om_original")
         send_card.assert_not_called()
         self.assertEqual(draft.preview_message_id, "om_reply")
+
+    def test_streaming_content_update_uses_unique_uuid_and_requested_sequence(self) -> None:
+        ContentRequest = Mock()
+        request_builder = Mock()
+        request_builder.card_id.return_value = request_builder
+        request_builder.element_id.return_value = request_builder
+        request_builder.request_body.return_value = request_builder
+        request_builder.build.return_value = "request"
+        ContentRequest.builder.return_value = request_builder
+
+        ContentBody = Mock()
+        body_builder = Mock()
+        body_builder.uuid.return_value = body_builder
+        body_builder.content.return_value = body_builder
+        body_builder.sequence.return_value = body_builder
+        body_builder.build.return_value = "body"
+        ContentBody.builder.return_value = body_builder
+
+        response = Mock()
+        response.success.return_value = True
+        client = Mock()
+        client.cardkit.v1.card_element.content.return_value = response
+
+        with (
+            patch(
+                "smzdm_notice.feishu.notifier.get_cardkit_content_models",
+                return_value=(ContentRequest, ContentBody),
+            ),
+            patch("smzdm_notice.feishu.notifier.get_lark_client", return_value=client),
+        ):
+            self.assertTrue(notifier.update_streaming_draft_content("card-1", "stage 1", 3))
+            self.assertTrue(notifier.update_streaming_draft_content("card-1", "stage 2", 4))
+
+        uuids = [call.args[0] for call in body_builder.uuid.call_args_list]
+        self.assertEqual(len(set(uuids)), 2)
+        self.assertEqual([call.args[0] for call in body_builder.sequence.call_args_list], [3, 4])
+        request_builder.element_id.assert_called_with(notifier.DRAFT_STREAMING_ELEMENT_ID)
+
+    def test_finish_streaming_card_closes_mode_before_final_update(self) -> None:
+        calls: list[tuple] = []
+        with (
+            patch(
+                "smzdm_notice.feishu.notifier._close_cardkit_streaming_mode",
+                side_effect=lambda card_id, sequence: calls.append(("settings", card_id, sequence)) or True,
+            ),
+            patch(
+                "smzdm_notice.feishu.notifier._update_cardkit_card",
+                side_effect=lambda card_id, card, sequence: calls.append(("update", card_id, card, sequence)) or True,
+            ),
+        ):
+            card = notifier.build_draft_failure_card("failed")
+            self.assertTrue(notifier.finish_streaming_draft_card("card-1", card, 5, 6))
+
+        self.assertEqual(calls[0], ("settings", "card-1", 5))
+        self.assertEqual(calls[1], ("update", "card-1", card, 6))
+
+    def test_streaming_settings_wraps_streaming_mode_in_config(self) -> None:
+        SettingsRequest = Mock()
+        request_builder = Mock()
+        request_builder.card_id.return_value = request_builder
+        request_builder.request_body.return_value = request_builder
+        request_builder.build.return_value = "request"
+        SettingsRequest.builder.return_value = request_builder
+
+        SettingsBody = Mock()
+        body_builder = Mock()
+        body_builder.settings.return_value = body_builder
+        body_builder.uuid.return_value = body_builder
+        body_builder.sequence.return_value = body_builder
+        body_builder.build.return_value = "body"
+        SettingsBody.builder.return_value = body_builder
+
+        response = Mock()
+        response.success.return_value = True
+        client = Mock()
+        client.cardkit.v1.card.settings.return_value = response
+
+        with (
+            patch(
+                "smzdm_notice.feishu.notifier.get_cardkit_settings_models",
+                return_value=(SettingsRequest, SettingsBody),
+            ),
+            patch("smzdm_notice.feishu.notifier.get_lark_client", return_value=client),
+        ):
+            self.assertTrue(notifier._close_cardkit_streaming_mode("card-1", 5))
+
+        self.assertEqual(
+            json.loads(body_builder.settings.call_args.args[0]),
+            {"config": {"streaming_mode": False}},
+        )
+        body_builder.sequence.assert_called_once_with(5)
+
+    def test_streaming_start_falls_back_when_create_or_send_fails(self) -> None:
+        with (
+            patch("smzdm_notice.feishu.notifier._create_cardkit_card", return_value=""),
+            patch("smzdm_notice.feishu.notifier.reply_card_entity") as reply_entity,
+        ):
+            self.assertIsNone(notifier.start_streaming_draft_processing("stage", "om-parent"))
+            reply_entity.assert_not_called()
+
+        with (
+            patch("smzdm_notice.feishu.notifier._create_cardkit_card", return_value="card-1"),
+            patch("smzdm_notice.feishu.notifier.reply_card_entity", return_value=None),
+        ):
+            self.assertIsNone(notifier.start_streaming_draft_processing("stage", "om-parent"))
 
     def test_update_card_message_patches_message_content(self) -> None:
         PatchRequest = Mock()
@@ -625,17 +941,18 @@ class NotifierBindingTests(unittest.TestCase):
         build_content.assert_called_once_with(draft)
         self.assertEqual(draft.preview_message_id, "om_arbiter")
         markdown = "\n".join(
-            element.get("content", "") for element in sent_cards[0]["elements"] if element.get("tag") == "markdown"
+            element.get("content", "") for element in _elements(sent_cards[0]) if element.get("tag") == "markdown"
         )
         self.assertIn("preview content", markdown)
-        actions = sent_cards[0]["elements"][-1]["actions"]
-        self.assertEqual(actions[0]["text"]["content"], "采纳并更新")
+        buttons = [component for component in _components(sent_cards[0]) if component.get("tag") == "button"]
+        actions = _actions(sent_cards[0])
+        self.assertEqual(buttons[0]["text"]["content"], "采纳并更新")
         self.assertEqual(
-            actions[0]["value"],
+            actions[0],
             {"action": "apply_draft", "draft_id": "arbiter-draft", "card_kind": "arbitration"},
         )
         self.assertEqual(
-            actions[1]["value"],
+            actions[1],
             {"action": "ignore_arbitration", "draft_id": "arbiter-draft", "card_kind": "arbitration"},
         )
         self.assertEqual(draft.metadata["card_kind"], "arbitration")
@@ -658,11 +975,11 @@ class NotifierBindingTests(unittest.TestCase):
         ):
             self.assertTrue(notifier.send_arbitration(info))
 
-        actions = sent_cards[0]["elements"][-1]["actions"]
+        actions = _actions(sent_cards[0])
         self.assertEqual(len(actions), 1)
-        self.assertEqual(actions[0]["value"]["action"], "ignore_arbitration")
+        self.assertEqual(actions[0]["action"], "ignore_arbitration")
         markdown = "\n".join(
-            element.get("content", "") for element in sent_cards[0]["elements"] if element.get("tag") == "markdown"
+            element.get("content", "") for element in _elements(sent_cards[0]) if element.get("tag") == "markdown"
         )
         self.assertIn("未生成可直接采纳", markdown)
 
@@ -678,9 +995,9 @@ class NotifierBindingTests(unittest.TestCase):
         card = notifier.build_disabled_draft_card("已生成新的修改预览", draft)
 
         self.assertEqual(card["header"]["template"], "grey")
-        self.assertNotIn("action", {element.get("tag") for element in card["elements"]})
-        self.assertIn("新规则", card["elements"][0]["content"])
-        self.assertIn("已生成新的修改预览", card["elements"][0]["content"])
+        self.assertNotIn("action", {element.get("tag") for element in _elements(card)})
+        self.assertIn("新规则", _elements(card)[0]["content"])
+        self.assertIn("已生成新的修改预览", _elements(card)[0]["content"])
 
     def test_disabled_arbitration_card_preserves_analysis_without_buttons(self) -> None:
         draft = ConfigDraft(
@@ -707,8 +1024,8 @@ class NotifierBindingTests(unittest.TestCase):
 
         self.assertEqual(card["header"]["template"], "grey")
         self.assertIn("仲裁分析", card["header"]["title"]["content"])
-        self.assertNotIn("action", {element.get("tag") for element in card["elements"]})
-        markdown = "\n".join(element.get("content", "") for element in card["elements"])
+        self.assertNotIn("action", {element.get("tag") for element in _elements(card)})
+        markdown = "\n".join(element.get("content", "") for element in _elements(card))
         self.assertIn("A 过度扩展黑名单。", markdown)
         self.assertIn("黑名单只按字面精确匹配。", markdown)
         self.assertIn("已忽略", markdown)
@@ -763,9 +1080,9 @@ class NotifierBindingTests(unittest.TestCase):
         client.im.v1.message.patch.assert_called_once_with("request")
         card = json.loads(content_holder["content"])
         self.assertEqual(card["header"]["template"], "grey")
-        self.assertNotIn("action", {element.get("tag") for element in card["elements"]})
-        self.assertIn("preview content", card["elements"][0]["content"])
-        self.assertIn("已生成新的修改预览", card["elements"][0]["content"])
+        self.assertNotIn("action", {element.get("tag") for element in _elements(card)})
+        self.assertIn("preview content", _elements(card)[0]["content"])
+        self.assertIn("已生成新的修改预览", _elements(card)[0]["content"])
 
 
 if __name__ == "__main__":

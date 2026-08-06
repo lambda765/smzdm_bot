@@ -5,7 +5,16 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-Card = dict[str, Any]
+from smzdm_notice.feishu.card_v2 import (
+    Card,
+    build_card,
+    button,
+    column_set,
+    element_id,
+    input_box,
+    plain_text,
+    select_static,
+)
 
 
 def build_model_management_card(state: Mapping[str, Any], form_state: Mapping[str, str] | None = None) -> Card:
@@ -22,58 +31,68 @@ def build_model_management_card(state: Mapping[str, Any], form_state: Mapping[st
     target_initial = _valid_initial_option(form_state, "target", target_options)
     connection_initial = _valid_initial_option(form_state, "connection", connection_options)
     primary_route_button = _model_primary_route_button(state, form_state)
-    return {
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "LLM 模型路由"},
-            "template": "blue",
-        },
-        "elements": [
+    return build_card(
+        "LLM 模型路由",
+        "blue",
+        [
             {"tag": "markdown", "content": _model_management_markdown(state)},
             {"tag": "hr"},
             {
                 "tag": "markdown",
                 "content": "💡 先选择「作用范围」，再填写参数，最后点击按钮执行操作。",
             },
-            {
-                "tag": "action",
-                "actions": [
-                    _select_static("target", "选择作用范围", target_options, {"field": "target"}, initial_option=target_initial),
-                    _select_static("connection", "选择连接", connection_options, {"field": "connection"}, initial_option=connection_initial),
+            column_set(
+                [
+                    _select_static(
+                        "target", "选择作用范围", target_options, {"field": "target"}, initial_option=target_initial
+                    ),
+                    _select_static(
+                        "connection",
+                        "选择连接",
+                        connection_options,
+                        {"field": "connection"},
+                        initial_option=connection_initial,
+                    ),
                 ],
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    _input("model_id", "model_id，例如 deepseek-chat", default_value=form_state.get("model_id")),
-                    _input("temperature", "temperature，0 到 5", default_value=form_state.get("temperature")),
-                ],
-            },
-            {
-                "tag": "action",
-                "actions": [
+                component_id="model_route_selects",
+            ),
+            _input(
+                "model_id",
+                "例如 deepseek-chat",
+                label="模型 ID",
+                default_value=form_state.get("model_id"),
+            ),
+            _input(
+                "temperature",
+                "例如 0.7",
+                label="Temperature（0 到 5）",
+                default_value=form_state.get("temperature"),
+            ),
+            column_set(
+                [
                     primary_route_button,
                     _card_button("设置温度", "model_set_temperature", "default"),
                 ],
-            },
-            {
-                "tag": "action",
-                "actions": [
+                component_id="model_route_apply",
+            ),
+            column_set(
+                [
                     _card_button(
                         "恢复默认",
                         "model_reset_agent",
                         "danger",
                         confirm={
                             "title": {"tag": "plain_text", "content": "确认恢复默认？"},
-                            "content": {"tag": "plain_text", "content": "将清除该 agent 的自定义设置，恢复为继承默认配置。"},
+                            "text": {"tag": "plain_text", "content": "将清除该 agent 的自定义设置，恢复为继承默认配置。"},
                         },
                     ),
                     _card_button("发送测试", "model_test", "default"),
                     _card_button("刷新状态", "model_refresh", "default"),
                 ],
-            },
+                component_id="model_route_tools",
+            ),
         ],
-    }
+    )
 
 
 def _model_primary_route_button(state: Mapping[str, Any], form_state: Mapping[str, str]) -> dict:
@@ -167,39 +186,33 @@ def _temperature_text(value: Any) -> str:
     return f"，temperature `{value}`"
 
 
-def _plain_text(content: str) -> dict:
-    return {"tag": "plain_text", "content": content}
-
-
 def _select_option(label: str, value: str) -> dict:
-    return {"text": _plain_text(label), "value": value}
+    return {"text": plain_text(label), "value": value}
 
 
 def _select_static(
     name: str, placeholder: str, options: list[dict], value: dict | None = None, initial_option: str | None = None,
 ) -> dict:
-    payload: dict = {
-        "tag": "select_static",
-        "name": name,
-        "placeholder": _plain_text(placeholder),
-        "options": options,
-    }
-    if value:
-        payload["value"] = value
-    if initial_option:
-        payload["initial_option"] = initial_option
-    return payload
+    return select_static(
+        name,
+        placeholder,
+        options,
+        value=value,
+        component_id=element_id("model_select", name),
+        initial_option=initial_option or "",
+    )
 
 
-def _input(name: str, placeholder: str, default_value: str | None = None) -> dict:
-    payload: dict = {
-        "tag": "input",
-        "name": name,
-        "placeholder": _plain_text(placeholder),
-    }
-    if default_value is not None:
-        payload["default_value"] = default_value
-    return payload
+def _input(name: str, placeholder: str, label: str, default_value: str | None = None) -> dict:
+    return input_box(
+        name,
+        placeholder,
+        default_value=default_value,
+        value={"field": name},
+        component_id=element_id("model_input", name),
+        label=label,
+        width="fill",
+    )
 
 
 def _valid_initial_option(form_state: Mapping[str, str], key: str, options: list[dict]) -> str | None:
@@ -212,12 +225,4 @@ def _valid_initial_option(form_state: Mapping[str, str], key: str, options: list
 
 
 def _card_button(label: str, action: str, button_type: str, confirm: dict | None = None) -> dict:
-    btn: dict = {
-        "tag": "button",
-        "text": _plain_text(label),
-        "type": button_type,
-        "value": {"action": action},
-    }
-    if confirm:
-        btn["confirm"] = confirm
-    return btn
+    return button(label, button_type=button_type, value={"action": action}, confirm=confirm)

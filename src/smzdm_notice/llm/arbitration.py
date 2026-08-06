@@ -215,9 +215,9 @@ def _parse_arbiter_response(content: str | None, request: ArbitrationRequest) ->
 
 
 def compare_results(a: FilterResult, b: FilterResult) -> bool:
-    """比较两次结果的推荐 ID 集合是否一致。"""
-    ids_a = {rec.id for rec in a.recommendations}
-    ids_b = {rec.id for rec in b.recommendations}
+    """比较两次结果的推荐 ID 及排序是否一致。"""
+    ids_a = [rec.id for rec in a.recommendations]
+    ids_b = [rec.id for rec in b.recommendations]
     return ids_a == ids_b
 
 
