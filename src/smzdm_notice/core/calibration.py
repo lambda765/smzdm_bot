@@ -235,14 +235,14 @@ class MemoryAnalyzer:
     def __init__(self) -> None:
         pass
 
-    def analyze(self, records: list[dict]) -> MemoryAnalysis | None:
+    def analyze(self, records: list[dict], preference_text: str = "") -> MemoryAnalysis | None:
         """调 LLM 分析 records，返回模式和建议。返回 None 表示分析失败。"""
         try:
             llm_config = resolve("draft")
             if llm_config.temperature is None:
                 llm_config = replace(llm_config, temperature=0.1)
             client = get_client_for_config(llm_config)
-            messages = self._build_messages(records)
+            messages = self._build_messages(records, preference_text)
             response = client.chat.completions.create(**build_chat_completion_kwargs(llm_config, messages=messages))
             content = response.choices[0].message.content or ""
             return self._parse_response(content)
@@ -258,12 +258,14 @@ class MemoryAnalyzer:
                 return None
             raise
 
-    def _build_messages(self, records: list[dict]) -> list[dict]:
+    def _build_messages(self, records: list[dict], preference_text: str = "") -> list[dict]:
         """构建 LLM 分析 prompt。"""
         from smzdm_notice.llm.memory_prompts import MEMORY_ANALYSIS_SYSTEM_PROMPT
 
         records_text = json.dumps(records, ensure_ascii=False, indent=2)
         user_message = (
+            f"以下是当前 preference.md 完整内容。已有规则不得重复新增；需要强化时应明确指出待合并的原规则。\n\n"
+            f"```markdown\n{preference_text}\n```\n\n"
             f"以下是用户对推荐商品的好价/不值反馈历史记录，每条记录包含商品信号、"
             f"推荐理由、品类提示、决策上下文和用户评价。\n\n"
             f"```json\n{records_text}\n```\n\n"
@@ -286,7 +288,7 @@ class MemoryAnalyzer:
 
             return MemoryAnalysis(
                 summary=str(data.get("summary", "")),
-                suggested_rules=_filter_suggested_rules(data.get("suggested_rules", [])),
+                suggested_rules=_filter_suggested_rules(data.get("suggested_rules", []))[:1],
                 patterns=data.get("patterns", []),
             )
         except Exception as e:

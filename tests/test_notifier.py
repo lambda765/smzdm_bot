@@ -14,7 +14,7 @@ from smzdm_notice.feishu.binding import FeishuBinding, FeishuBindingStore
 from smzdm_notice.feishu.card_v2 import card_component_count, card_json_size_bytes
 from smzdm_notice.feishu.model_cards import build_model_management_card
 from smzdm_notice.llm.models import ArbiterInfo, FilterResult, Recommendation
-from smzdm_notice.preferences.models import ConfigDraft
+from smzdm_notice.preferences.models import ConfigDraft, DraftBuildOutcome
 from smzdm_notice.smzdm.ranking import RankingItem
 
 
@@ -745,12 +745,17 @@ class NotifierBindingTests(unittest.TestCase):
     def test_draft_status_cards_do_not_include_actions(self) -> None:
         processing = notifier.build_draft_processing_card("正在理解偏好/库存修改")
         failure = notifier.build_draft_failure_card("草案生成失败")
+        noop = notifier.build_draft_noop_card("当前规则已经覆盖")
 
         self.assertNotIn("action", {element.get("tag") for element in _elements(processing)})
         self.assertNotIn("action", {element.get("tag") for element in _elements(failure)})
+        self.assertNotIn("action", {element.get("tag") for element in _elements(noop)})
         self.assertIn("正在理解偏好/库存修改", _elements(processing)[0]["content"])
         self.assertNotIn("已等待", _elements(processing)[0]["content"])
         self.assertIn("草案生成失败", _elements(failure)[0]["content"])
+        self.assertEqual(noop["header"]["template"], "blue")
+        self.assertIn("当前规则已经覆盖", _elements(noop)[0]["content"])
+        self.assertNotIn("重试", _elements(noop)[0]["content"])
 
     def test_build_draft_preview_card_includes_apply_and_cancel_actions(self) -> None:
         draft = ConfigDraft(
@@ -946,6 +951,7 @@ class NotifierBindingTests(unittest.TestCase):
             result_a=FilterResult(recommendations=[Recommendation(id="1", reason="A")]),
             result_b=FilterResult(recommendations=[Recommendation(id="2", reason="B")]),
             items={},
+            change_assessment={"cause": "preference_gap", "should_change_preference": True},
         )
         sent_cards = []
         with (
@@ -966,6 +972,9 @@ class NotifierBindingTests(unittest.TestCase):
             element.get("content", "") for element in _elements(sent_cards[0]) if element.get("tag") == "markdown"
         )
         self.assertIn("preview content", markdown)
+        self.assertIn("差异归因", markdown)
+        self.assertIn("存在真实偏好缺口", markdown)
+        self.assertIn("建议修改 preference.md", markdown)
         buttons = [component for component in _components(sent_cards[0]) if component.get("tag") == "button"]
         actions = _actions(sent_cards[0])
         self.assertEqual(buttons[0]["text"]["content"], "采纳并更新")
@@ -989,6 +998,7 @@ class NotifierBindingTests(unittest.TestCase):
             result_a=FilterResult(),
             result_b=FilterResult(),
             items={},
+            change_assessment={"cause": "soft_judgment", "should_change_preference": False},
         )
         sent_cards = []
         with patch(
@@ -1003,7 +1013,36 @@ class NotifierBindingTests(unittest.TestCase):
         markdown = "\n".join(
             element.get("content", "") for element in _elements(sent_cards[0]) if element.get("tag") == "markdown"
         )
-        self.assertIn("未生成可直接采纳", markdown)
+        self.assertIn("本次差异不代表缺少用户偏好", markdown)
+
+    def test_send_arbitration_noop_explains_existing_rule_coverage(self) -> None:
+        info = ArbiterInfo(
+            chosen="A",
+            reason="A 更准确",
+            analysis="候选规则已经存在。",
+            suggestion="无需修改。",
+            result_a=FilterResult(),
+            result_b=FilterResult(),
+            items={},
+            change_assessment={"cause": "preference_gap", "should_change_preference": True},
+        )
+        sent_cards = []
+        with patch(
+            "smzdm_notice.feishu.notifier._send_card_message_id",
+            side_effect=lambda card: sent_cards.append(card) or "om_arbiter",
+        ):
+            self.assertTrue(
+                notifier.send_arbitration(
+                    info,
+                    draft_outcome=DraftBuildOutcome("noop", message="当前 preference.md 已覆盖候选规则"),
+                )
+            )
+
+        markdown = "\n".join(
+            element.get("content", "") for element in _elements(sent_cards[0]) if element.get("tag") == "markdown"
+        )
+        self.assertIn("当前 preference.md 已覆盖候选规则", markdown)
+        self.assertNotIn("安全校验", markdown)
 
     def test_disable_draft_card_patches_message_without_buttons(self) -> None:
         draft = ConfigDraft(
@@ -1042,15 +1081,61 @@ class NotifierBindingTests(unittest.TestCase):
             },
         )
 
-        card = notifier.build_disabled_arbitration_card("已忽略", draft)
+        for reason in ("已采纳并更新", "已忽略", "草案已超过 24 小时自动失效"):
+            with self.subTest(reason=reason):
+                card = notifier.build_disabled_arbitration_card(reason, draft)
 
-        self.assertEqual(card["header"]["template"], "grey")
-        self.assertIn("仲裁分析", card["header"]["title"]["content"])
-        self.assertNotIn("action", {element.get("tag") for element in _elements(card)})
-        markdown = "\n".join(element.get("content", "") for element in _elements(card))
+                self.assertEqual(card["header"]["template"], "grey")
+                self.assertIn("仲裁分析", card["header"]["title"]["content"])
+                self.assertNotIn("action", {element.get("tag") for element in _elements(card)})
+                markdown = "\n".join(element.get("content", "") for element in _elements(card))
+                self.assertIn("A 过度扩展黑名单。", markdown)
+                self.assertIn("黑名单只按字面精确匹配。", markdown)
+                self.assertIn(reason, markdown)
+                self.assertNotIn("差异归因", markdown)
+                self.assertNotIn("未分类", markdown)
+                self.assertNotIn("本次不建议修改 preference.md", markdown)
+
+    def test_rebased_arbitration_preview_keeps_analysis_and_uses_new_draft_id(self) -> None:
+        draft = ConfigDraft(
+            draft_id="new-arbiter-draft",
+            target_file="preference.md",
+            title="刷新后的草案",
+            summary="重新定位",
+            append_text="- 黑名单只精确匹配",
+            source="仲裁建议一键采纳",
+            metadata={
+                "card_kind": "arbitration",
+                "arbitration_card": {
+                    "sent_at": "2026-05-20 10:00",
+                    "diff_text": "差异商品 A",
+                    "chosen": "B",
+                    "reason": "B 更准确",
+                    "analysis": "A 过度扩展黑名单。",
+                    "suggestion": "黑名单只按字面精确匹配。",
+                    "change_assessment": {
+                        "cause": "preference_gap",
+                        "should_change_preference": True,
+                    },
+                },
+            },
+        )
+        captured = {}
+
+        def update_card(message_id, card):
+            captured["message_id"] = message_id
+            captured["card"] = card
+            return True
+
+        with patch("smzdm_notice.feishu.notifier.update_card_message", side_effect=update_card):
+            self.assertTrue(notifier.update_rebased_draft_preview("om_original", draft))
+
+        self.assertEqual(draft.preview_message_id, "om_original")
+        self.assertEqual(captured["message_id"], "om_original")
+        markdown = "\n".join(element.get("content", "") for element in _elements(captured["card"]))
         self.assertIn("A 过度扩展黑名单。", markdown)
-        self.assertIn("黑名单只按字面精确匹配。", markdown)
-        self.assertIn("已忽略", markdown)
+        apply_actions = [action for action in _actions(captured["card"]) if action["action"] == "apply_draft"]
+        self.assertEqual(apply_actions[0]["draft_id"], "new-arbiter-draft")
 
     def test_disable_draft_card_patches_message(self) -> None:
         draft = ConfigDraft(

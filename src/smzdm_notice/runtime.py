@@ -39,7 +39,10 @@ from smzdm_notice.llm import routing as llm_routing
 from smzdm_notice.llm.filter import filter_items
 from smzdm_notice.llm.models import ArbiterInfo
 from smzdm_notice.llm.routing import RoutingSnapshot
-from smzdm_notice.preferences.builder import build_arbitration_draft
+from smzdm_notice.preferences.builder import (
+    build_arbitration_candidate_draft_outcome,
+    build_memory_rule_draft_outcome,
+)
 from smzdm_notice.preferences.store import CONFIG_FILE_LOCK, DraftStore
 from smzdm_notice.smzdm.client import close_client
 from smzdm_notice.smzdm.keywords import SearchKeywordRule
@@ -230,13 +233,13 @@ def _config_summary() -> str:
         f"- 🌙 夜间汇总: 每天 {config.DIGEST_HOUR}:00\n"
         f"- 📊 监控榜单: {', '.join(ranking_names)}\n"
         f"- 🔎 搜索关键词: {search_summary}\n"
-        f"- 🔢 每榜 Top: {config.TOP_N}\n"
+        f"- 🔢 每榜 Top: {config.TOP_N}\n\n"
         f"{llm_summary}\n"
         f"- 🔀 双重判断: {'已启用' if config.LLM_DUAL_FILTER else '未启用'}"
         + (" (含仲裁)" if config.LLM_DUAL_FILTER and config.LLM_ARBITER_ENABLED else "")
         + "\n"
         + prefilter_summary
-        + f"- 🎯 用户偏好: {_current_user_prompt[:80]}{'...' if len(_current_user_prompt) > 80 else ''}"
+        + "- 🎯 用户偏好: 已加载"
     )
 
 
@@ -361,6 +364,11 @@ def _poll_once(dedup: DedupManager, near_miss_mgr: NearMissManager) -> None:
         outcome = _run_poll_pipeline_unlocked(dedup, near_miss_mgr, routing_snapshot)
         if _poll_failure_tracker:
             _poll_failure_tracker.record(outcome)
+        if not _stop_event.is_set():
+            try:
+                _maybe_send_daily_digest(near_miss_mgr)
+            except Exception as e:
+                logger.error(f"每日分析或夜间汇总执行失败: {e}", exc_info=True)
     finally:
         _last_poll_finished_at = time.time()
         _maintain_config_drafts("轮询结束清理")
@@ -371,7 +379,7 @@ def _run_poll_pipeline_unlocked(
     near_miss_mgr: NearMissManager,
     routing_snapshot: RoutingSnapshot | None = None,
 ) -> PollOutcome:
-    """在不持有轮询锁的前提下执行抓取、去重、筛选、通知和汇总。"""
+    """在不持有轮询锁的前提下执行抓取、去重、筛选和通知。"""
     # 待反馈记忆只在原商品仍可能收到反馈时有价值；放在轮询热路径清理可避免依赖启动流程。
     if _deal_memory is not None:
         _deal_memory.cleanup_expired_pending(config.DEAL_MEMORY_PENDING_EXPIRE_DAYS)
@@ -404,7 +412,6 @@ def _run_poll_pipeline_unlocked(
         evaluation.contexts_by_article_id,
         evaluation.notification_names_by_article_id,
     )
-    _maybe_send_daily_digest(near_miss_mgr)
     if not evaluation.matched:
         _check_heartbeat()
     return PollOutcome.success()
@@ -513,17 +520,34 @@ def _evaluate_poll_matches(
 def _handle_arbitration(arbiter_info: ArbiterInfo | None) -> None:
     if arbiter_info:
         arbitration_draft = None
+        arbitration_outcome = None
         if _draft_store:
-            arbitration_draft = build_arbitration_draft(
-                arbiter_info.config_change_draft,
-                _draft_store,
-                suggestion=arbiter_info.suggestion,
-            )
-            if arbiter_info.config_change_draft and not arbitration_draft:
+            assessment = arbiter_info.change_assessment
+            if assessment.get("cause") == "preference_gap" and assessment.get("should_change_preference") is True:
+                arbitration_outcome = build_arbitration_candidate_draft_outcome(
+                    arbiter_info.preference_change,
+                    _draft_store,
+                    suggestion=arbiter_info.suggestion,
+                )
+                arbitration_draft = arbitration_outcome.draft
+            if (
+                arbiter_info.preference_change
+                and not arbitration_draft
+                and (arbitration_outcome is None or arbitration_outcome.status != "noop")
+            ):
                 logger.warning("仲裁配置草案无效，跳过一键采纳按钮")
-        arbitration_sent = send_arbitration(arbiter_info, arbitration_draft)
+        if arbitration_outcome is None:
+            arbitration_sent = send_arbitration(arbiter_info, arbitration_draft)
+        else:
+            arbitration_sent = send_arbitration(
+                arbiter_info,
+                arbitration_draft,
+                draft_outcome=arbitration_outcome,
+            )
         if arbitration_sent and arbitration_draft and _draft_store and arbitration_draft.preview_message_id:
             _draft_store.update(arbitration_draft)
+        elif not arbitration_sent and arbitration_draft and _draft_store:
+            _draft_store.cancel(arbitration_draft.draft_id, reason="preview_send_failed")
 
 
 def _record_near_misses(
@@ -721,7 +745,13 @@ def _run_daily_memory_analysis(today_str: str) -> MemoryAnalysisStatus:
             return "ready"
 
         analyzer = MemoryAnalyzer()
-        analysis = analyzer.analyze(records)
+        try:
+            analysis = analyzer.analyze(records, preference_text=config.get_user_prompt())
+        except TypeError as e:
+            if "preference_text" not in str(e):
+                raise
+            # 兼容测试替身和外部自定义 Analyzer 的旧签名。
+            analysis = analyzer.analyze(records)
         if analysis is None:
             fail_count = _deal_memory.record_analysis_failure()
             logger.warning(f"Deal Memory: LLM 分析失败（{fail_count}/{_MAX_ANALYSIS_RETRIES}）")
@@ -732,13 +762,17 @@ def _run_daily_memory_analysis(today_str: str) -> MemoryAnalysisStatus:
                 return "abandoned"
             return "retry_later"
 
-        _deal_memory.set_last_analysis_date(today_str)
-        _deal_memory.reset_analysis_state()
         logger.info(f"Deal Memory: LLM 分析完成, {len(analysis.patterns)} 个模式, {len(analysis.suggested_rules)} 条建议")
 
         # 如果有建议规则，通过 draft 机制推送给用户确认
-        for rule in analysis.suggested_rules:
-            _suggest_memory_rule(rule, analysis.summary)
+        if analysis.suggested_rules and not _suggest_memory_rule(analysis.suggested_rules[0], analysis.summary):
+            fail_count = _deal_memory.record_analysis_failure()
+            logger.warning(f"Deal Memory: 偏好草案未成功处理（{fail_count}/{_MAX_ANALYSIS_RETRIES}）")
+            if fail_count < _MAX_ANALYSIS_RETRIES:
+                return "retry_later"
+            _notify_analysis_failure()
+        _deal_memory.set_last_analysis_date(today_str)
+        _deal_memory.reset_analysis_state()
         return "ready"
 
     except Exception as e:
@@ -761,38 +795,42 @@ def _notify_analysis_failure() -> None:
         logger.warning("Deal Memory: 分析失败提醒发送失败")
 
 
-def _suggest_memory_rule(rule: dict, analysis_summary: str) -> None:
+def _suggest_memory_rule(rule: dict, analysis_summary: str) -> bool:
     """将 LLM 分析出的建议规则生成 preference.md 修改草案。"""
     if not _draft_store:
-        return
+        return False
 
     rule_text = str(rule.get("rule", "")).strip()
-    reason = str(rule.get("reason", "")).strip()
     if not rule_text:
-        return
+        return True
+    from smzdm_notice.llm.json_utils import content_hash
 
-    # 构造自然语言消息，复用现有的草案生成流程
-    from smzdm_notice.preferences.builder import build_message_draft
-
-    message = (
-        f"Deal Memory 偏好学习建议：{analysis_summary}\n\n"
-        f"建议规则：{rule_text}\n"
-        f"依据：{reason}\n\n"
-        f"请将以上规则添加到 preference.md 中适当的位置。"
-    )
+    suggestion_hash = content_hash(rule_text)
+    if _draft_store.has_recent_suggestion(suggestion_hash):
+        logger.info("Deal Memory: 相同建议已采纳或近期被取消，跳过重复推送")
+        return True
     try:
-        draft = build_message_draft(message, store=_draft_store)
+        outcome = build_memory_rule_draft_outcome(rule, analysis_summary, store=_draft_store)
+        draft = outcome.draft
         if draft:
             from smzdm_notice.feishu.notifier import send_draft_preview
 
             if not send_draft_preview(draft):
+                _draft_store.cancel(draft.draft_id, reason="preview_send_failed")
                 logger.warning(f"Deal Memory: 偏好草案推送失败: {draft.title}")
-                return
+                return False
             if draft.preview_message_id:
                 _draft_store.update(draft)
             logger.info(f"Deal Memory: 偏好草案已推送: {draft.title}")
+            return True
+        if outcome.status == "noop":
+            logger.info(f"Deal Memory: 当前偏好已覆盖候选: {outcome.message}")
+            return True
+        logger.warning(f"Deal Memory: 候选草案生成未通过: {outcome.status} {outcome.message}")
+        return False
     except Exception as e:
         logger.warning(f"Deal Memory: 偏好草案生成失败: {e}")
+        return False
 
 
 def _record_memory_feedback(article_id: str, action: str, reason: str | None = None) -> str:

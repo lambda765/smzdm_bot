@@ -44,6 +44,7 @@ from smzdm_notice.feishu.sdk import (
     get_reply_message_models,
 )
 from smzdm_notice.llm.models import ArbiterInfo
+from smzdm_notice.preferences.models import DraftBuildOutcome
 from smzdm_notice.preferences.preview import build_draft_preview_content
 from smzdm_notice.smzdm.ranking import RankingItem
 
@@ -772,11 +773,18 @@ def send_poll_failure_warning(count: int, reason: str, detail: str | None = None
     )
 
 
-def send_arbitration(arbiter_info: ArbiterInfo, draft: Any | None = None) -> bool:
+def send_arbitration(
+    arbiter_info: ArbiterInfo,
+    draft: Any | None = None,
+    draft_outcome: DraftBuildOutcome | None = None,
+) -> bool:
     """推送仲裁分析结果，附带一键采纳按钮。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     snapshot = _build_arbitration_card_snapshot(arbiter_info, now)
+    if draft_outcome is not None:
+        snapshot["draft_outcome_status"] = str(getattr(draft_outcome, "status", "") or "")
+        snapshot["draft_outcome_message"] = str(getattr(draft_outcome, "message", "") or "")
     if draft and hasattr(draft, "metadata"):
         draft.metadata[ARBITRATION_CARD_METADATA_KEY] = snapshot
         draft.metadata["card_kind"] = ARBITRATION_CARD_KIND
@@ -804,10 +812,27 @@ def _build_arbitration_card_snapshot(arbiter_info: ArbiterInfo, sent_at: str) ->
         "reason": arbiter_info.reason,
         "analysis": arbiter_info.analysis,
         "suggestion": arbiter_info.suggestion,
+        "change_assessment": arbiter_info.change_assessment,
     }
 
 
 def _build_arbitration_content(snapshot: dict) -> str:
+    assessment = snapshot.get("change_assessment") or {}
+    assessment_block = ""
+    if assessment:
+        cause_labels = {
+            "preference_gap": "存在真实偏好缺口",
+            "filter_prompt_gap": "筛选 Prompt 说明不足",
+            "model_execution_error": "模型单次执行错误",
+            "soft_judgment": "软信号判断差异",
+        }
+        assessment_text = cause_labels.get(str(assessment.get("cause") or ""), "未分类")
+        preference_note = (
+            "建议修改 preference.md"
+            if assessment.get("should_change_preference") is True
+            else "本次不建议修改 preference.md"
+        )
+        assessment_block = f"**差异归因：** {assessment_text}；{preference_note}\n\n"
     return (
         f"📅 {snapshot.get('sent_at', '')}\n\n"
         f"**两次判断不一致，已仲裁**\n\n"
@@ -815,6 +840,7 @@ def _build_arbitration_content(snapshot: dict) -> str:
         f"**仲裁选择：** 判断 {snapshot.get('chosen', '')}\n"
         f"**原因：** {snapshot.get('reason', '')}\n\n"
         f"**不一致分析：**\n{snapshot.get('analysis', '')}\n\n"
+        f"{assessment_block}"
         f"**Prompt 优化建议：**\n{snapshot.get('suggestion', '')}"
     )
 
@@ -839,10 +865,21 @@ def _arbitration_elements(snapshot: dict, draft: Any | None, disabled_reason: st
     if draft:
         elements.extend([{"tag": "hr"}, {"tag": "markdown", "content": build_draft_preview_content(draft)}])
     elif not disabled_reason:
+        assessment = snapshot.get("change_assessment") or {}
+        outcome_status = str(snapshot.get("draft_outcome_status") or "")
+        if outcome_status == "noop":
+            outcome_message = str(snapshot.get("draft_outcome_message") or "").strip()
+            no_change_text = f"ℹ️ {outcome_message or '当前 preference.md 已覆盖该候选规则，无需修改。'}"
+        elif not assessment:
+            no_change_text = "⚠️ 本次未生成可直接采纳的配置修改，请按需手动调整偏好文件。"
+        elif assessment.get("should_change_preference") is not True:
+            no_change_text = "ℹ️ 本次差异不代表缺少用户偏好，因此不生成 preference.md 修改。"
+        else:
+            no_change_text = "⚠️ 已识别偏好缺口，但未能生成通过安全校验的修改草案。"
         elements.append(
             {
                 "tag": "markdown",
-                "content": "⚠️ 本次未生成可直接采纳的配置修改，请按需手动调整偏好文件。",
+                "content": no_change_text,
             }
         )
     if disabled_reason:
@@ -1174,6 +1211,16 @@ def build_draft_failure_card(reason: str) -> Card:
     )
 
 
+def build_draft_noop_card(message: str) -> Card:
+    """构造无需修改的无按钮信息卡片。"""
+    return build_card(
+        "📝 当前配置无需修改",
+        "blue",
+        [{"tag": "markdown", "content": message}],
+        summary="当前配置无需修改",
+    )
+
+
 def build_draft_handoff_card() -> Card:
     """流式卡片已由新消息承接时，替换旧卡片的生成中状态。"""
     return build_card(
@@ -1209,6 +1256,20 @@ def update_draft_preview(message_id: str, draft: Any) -> bool:
             draft.preview_message_id = message_id
         return True
     return False
+
+
+def update_rebased_draft_preview(message_id: str, draft: Any) -> bool:
+    """在原消息上展示冲突刷新后的草案，并保留仲裁卡片上下文。"""
+    if _is_arbitration_draft(draft):
+        snapshot = draft.metadata.get(ARBITRATION_CARD_METADATA_KEY) or {}
+        card = build_arbitration_card(snapshot, draft)
+    else:
+        card = build_draft_preview_card(draft)
+    if not update_card_message(message_id, card):
+        return False
+    if hasattr(draft, "preview_message_id"):
+        draft.preview_message_id = message_id
+    return True
 
 
 def build_disabled_draft_card(reason: str, draft: Any | None = None) -> Card:

@@ -301,6 +301,13 @@ class MemoryAnalyzerTests(unittest.TestCase):
         self.assertIsNotNone(analysis)
         return analysis.suggested_rules
 
+    def test_build_messages_include_complete_current_preference(self) -> None:
+        preference = "# preference\n\n## 水果\n- 水果需要更强社区信号\n"
+
+        messages = MemoryAnalyzer()._build_messages([], preference)
+
+        self.assertIn(preference, messages[1]["content"])
+
     def test_analyzes_three_records_without_internal_five_record_guard(self) -> None:
         captured = {}
         payload = {

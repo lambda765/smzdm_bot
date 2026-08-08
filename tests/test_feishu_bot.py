@@ -9,12 +9,16 @@ from unittest.mock import Mock, patch
 
 from smzdm_notice.feishu.binding import FeishuBindingStore
 from smzdm_notice.feishu.bot import (
+    DRAFT_STREAMING_DISPLAY_MAX_BYTES,
+    DRAFT_STREAMING_FINALIZE_LOCK_TIMEOUT_SECONDS,
     MODEL_CARD_FORM_STATE_LIMIT,
     BotRuntime,
     DraftProgressCard,
     FeishuInteractiveBot,
     MessageDeduper,
+    _append_draft_stream_text,
     _is_allowed_message,
+    _mask_card_event_id,
     _run_model_test,
 )
 from smzdm_notice.feishu.card_payload import extract_card_action_value, extract_message_text, strip_bot_mention
@@ -22,7 +26,7 @@ from smzdm_notice.feishu.commands import COMMAND_SPECS, help_markdown
 from smzdm_notice.feishu.model_cards import build_model_management_card
 from smzdm_notice.feishu.notifier import NOT_WORTH_REASON_FIELD
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
-from smzdm_notice.preferences.models import ConfigDraft
+from smzdm_notice.preferences.models import ConfigDraft, DraftBuildOutcome, DraftStreamEvent
 from smzdm_notice.preferences.store import DraftStore
 
 
@@ -413,13 +417,49 @@ class FeishuBotParsingTests(unittest.TestCase):
             )
 
             with (
-                patch("smzdm_notice.feishu.bot.build_message_draft", return_value=None),
+                patch(
+                    "smzdm_notice.feishu.bot.build_message_draft_outcome",
+                    return_value=DraftBuildOutcome("failed"),
+                ),
                 patch("smzdm_notice.feishu.bot.send_text") as send_text,
             ):
                 bot._handle_text_command("拉黑坚果", FakeMessageData())
 
             send_text.assert_called_once()
             self.assertIn("草案生成失败", send_text.call_args.args[0])
+
+    def test_message_draft_noop_updates_processing_card_as_information(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binding_store = FeishuBindingStore(root / "binding.json")
+            binding_store.bind("open_id", "ou_real_open_id", "ou_real_open_id", "p2p")
+            bot = FeishuInteractiveBot(
+                BotRuntime(
+                    draft_store=DraftStore(root / "drafts.json", root / "backups", root / "audit.jsonl", root=root),
+                    binding_store=binding_store,
+                    status_provider=lambda: "status",
+                    run_once=Mock(return_value=True),
+                )
+            )
+
+            with (
+                patch("smzdm_notice.feishu.bot.send_draft_processing", return_value="om_processing"),
+                patch(
+                    "smzdm_notice.feishu.bot.build_message_draft_outcome",
+                    return_value=DraftBuildOutcome("noop", message="现有规则已经覆盖这项要求"),
+                ),
+                patch("smzdm_notice.feishu.bot.update_card_message", return_value=True) as update_card,
+                patch("smzdm_notice.feishu.bot.reply_text") as reply_text,
+            ):
+                bot._handle_text_command("继续关注抽纸", FakeMessageData(), reply_to_message_id="om_original")
+
+            card = update_card.call_args.args[1]
+            self.assertEqual(card["header"]["template"], "blue")
+            markdown = "\n".join(component.get("content", "") for component in _card_components(card, "markdown"))
+            self.assertIn("现有规则已经覆盖", markdown)
+            self.assertNotIn("失败", markdown)
+            self.assertNotIn("重试", markdown)
+            reply_text.assert_not_called()
 
     def test_help_command_uses_registered_help_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -475,7 +515,10 @@ class FeishuBotParsingTests(unittest.TestCase):
 
             with (
                 patch("smzdm_notice.feishu.bot.send_draft_processing", return_value="om_processing") as processing,
-                patch("smzdm_notice.feishu.bot.build_message_draft", return_value=generated) as build_draft,
+                patch(
+                    "smzdm_notice.feishu.bot.build_message_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=generated),
+                ) as build_draft,
                 patch("smzdm_notice.feishu.bot.update_draft_preview", side_effect=update_preview) as update_preview_fn,
                 patch("smzdm_notice.feishu.bot.send_draft_preview") as send_preview,
             ):
@@ -519,7 +562,10 @@ class FeishuBotParsingTests(unittest.TestCase):
                     return_value=DraftProgressCard(message_id="om_processing"),
                 ),
                 patch.object(bot, "_stop_draft_processing"),
-                patch("smzdm_notice.feishu.bot.build_message_draft", return_value=generated),
+                patch(
+                    "smzdm_notice.feishu.bot.build_message_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=generated),
+                ),
                 patch("smzdm_notice.feishu.bot.update_draft_preview", return_value=True) as update_preview,
                 patch("smzdm_notice.feishu.bot.send_draft_preview") as send_preview,
             ):
@@ -544,7 +590,10 @@ class FeishuBotParsingTests(unittest.TestCase):
 
             with (
                 patch("smzdm_notice.feishu.bot.send_draft_processing", return_value="om_processing"),
-                patch("smzdm_notice.feishu.bot.build_message_draft", return_value=None),
+                patch(
+                    "smzdm_notice.feishu.bot.build_message_draft_outcome",
+                    return_value=DraftBuildOutcome("failed"),
+                ),
                 patch("smzdm_notice.feishu.bot.update_card_message", return_value=True) as update_card,
                 patch("smzdm_notice.feishu.bot.reply_text") as reply_text_fn,
                 patch("smzdm_notice.feishu.bot.send_text") as send_text_fn,
@@ -579,6 +628,40 @@ class FeishuBotParsingTests(unittest.TestCase):
         self.assertIsNone(progress.thread)
         send_processing.assert_called_once_with("正在理解偏好", reply_to_message_id="om-parent")
         thread.assert_not_called()
+
+    def test_streaming_message_draft_passes_model_events_to_progress_buffer(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        progress = DraftProgressCard(
+            message_id="om-progress",
+            card_id="card-1",
+            stage="正在理解偏好",
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        def build_draft(_text, _store, *, stream_callback):
+            stream_callback(DraftStreamEvent("attempt_start", "正在生成", 1))
+            stream_callback(DraftStreamEvent("reasoning_delta", "读取当前规则", 1))
+            return DraftBuildOutcome("noop", message="无需修改")
+
+        with (
+            patch.object(bot, "_start_draft_processing", return_value=progress),
+            patch("smzdm_notice.feishu.bot.build_message_draft_outcome", side_effect=build_draft),
+            patch.object(bot, "_stop_draft_processing"),
+            patch.object(bot, "_finish_draft_processing_noop"),
+        ):
+            bot._handle_new_draft("保持当前规则", "om-parent")
+
+        rendered = bot._render_draft_stream_content(progress)
+        self.assertIn("**模型思考**", rendered)
+        self.assertIn("读取当前规则", rendered)
 
     def test_static_processing_patch_failure_sends_new_final_preview(self) -> None:
         draft_store = Mock()
@@ -640,6 +723,125 @@ class FeishuBotParsingTests(unittest.TestCase):
         self.assertEqual([call.args[2] for call in update_content.call_args_list], [1, 2])
         finish_card.assert_called_once_with("card-1", {"schema": "2.0"}, 3, 4)
         self.assertEqual(progress.sequence, 4)
+
+    def test_streaming_buffer_prefers_reasoning_and_resets_for_retry(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        progress = DraftProgressCard(
+            message_id="om-progress",
+            card_id="card-1",
+            stage="正在理解偏好",
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+
+        bot._record_draft_stream_event(progress, DraftStreamEvent("attempt_start", "正在生成", 1))
+        bot._record_draft_stream_event(progress, DraftStreamEvent("content_delta", '{"draft":', 1))
+        bot._record_draft_stream_event(progress, DraftStreamEvent("reasoning_delta", "检查现有规则", 1))
+
+        rendered = bot._render_draft_stream_content(progress)
+        self.assertIn("**模型思考**", rendered)
+        self.assertIn("检查现有规则", rendered)
+        self.assertNotIn('{"draft":', rendered)
+
+        bot._record_draft_stream_event(
+            progress,
+            DraftStreamEvent("attempt_start", "首次结果未通过校验，正在修正生成结果", 2),
+        )
+        rendered = bot._render_draft_stream_content(progress)
+        self.assertIn("正在修正生成结果", rendered)
+        self.assertNotIn("检查现有规则", rendered)
+
+    def test_streaming_buffer_rolls_by_utf8_bytes(self) -> None:
+        text, truncated = _append_draft_stream_text("", "中" * DRAFT_STREAMING_DISPLAY_MAX_BYTES)
+
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(text.encode("utf-8")), DRAFT_STREAMING_DISPLAY_MAX_BYTES)
+        self.assertTrue(text)
+
+    def test_streaming_worker_flushes_model_content_without_elapsed_seconds(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        progress = DraftProgressCard(
+            message_id="om-progress",
+            card_id="card-1",
+            stage="正在理解偏好",
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        bot._record_draft_stream_event(progress, DraftStreamEvent("attempt_start", "正在生成", 1))
+        bot._record_draft_stream_event(progress, DraftStreamEvent("reasoning_delta", "检查库存与偏好", 1))
+        updated = threading.Event()
+        contents: list[str] = []
+
+        def update_content(_card_id: str, content: str, _sequence: int) -> bool:
+            contents.append(content)
+            updated.set()
+            return True
+
+        progress.thread = threading.Thread(target=bot._run_draft_processing_progress, args=(progress,))
+        with patch("smzdm_notice.feishu.bot.update_streaming_draft_content", side_effect=update_content):
+            progress.thread.start()
+            self.assertTrue(updated.wait(timeout=1))
+            bot._stop_draft_processing(progress)
+
+        self.assertFalse(progress.thread.is_alive())
+        self.assertIn("**模型思考**", contents[-1])
+        self.assertIn("检查库存与偏好", contents[-1])
+        self.assertNotIn("已等待", contents[-1])
+
+    def test_streaming_worker_batches_token_updates(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        progress = DraftProgressCard(
+            message_id="om-progress",
+            card_id="card-1",
+            stage="正在理解偏好",
+            stop_event=threading.Event(),
+            wake_event=threading.Event(),
+        )
+        first_update = threading.Event()
+        second_update = threading.Event()
+        contents: list[str] = []
+
+        def update_content(_card_id: str, content: str, _sequence: int) -> bool:
+            contents.append(content)
+            (first_update if len(contents) == 1 else second_update).set()
+            return True
+
+        progress.thread = threading.Thread(target=bot._run_draft_processing_progress, args=(progress,))
+        with (
+            patch("smzdm_notice.feishu.bot.DRAFT_STREAMING_UPDATE_INTERVAL_SECONDS", 0.05),
+            patch("smzdm_notice.feishu.bot.update_streaming_draft_content", side_effect=update_content),
+        ):
+            progress.thread.start()
+            bot._record_draft_stream_event(progress, DraftStreamEvent("attempt_start", "正在生成", 1))
+            self.assertTrue(first_update.wait(timeout=1))
+            for token in ("逐", "步", "分析"):
+                bot._record_draft_stream_event(progress, DraftStreamEvent("reasoning_delta", token, 1))
+            self.assertTrue(second_update.wait(timeout=1))
+            bot._stop_draft_processing(progress)
+
+        self.assertEqual(len(contents), 2)
+        self.assertIn("逐步分析", contents[-1])
 
     def test_streaming_progress_skips_updates_after_stop_signal(self) -> None:
         bot = FeishuInteractiveBot(
@@ -704,6 +906,35 @@ class FeishuBotParsingTests(unittest.TestCase):
         self.assertEqual(calls, ["progress", "finish"])
         self.assertFalse(update_thread.is_alive())
         self.assertFalse(finish_thread.is_alive())
+
+    def test_draft_final_card_streaming_busy_replies_and_schedules_cleanup(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        progress = DraftProgressCard(message_id="om-progress", card_id="card-1")
+        final_card = {"schema": "2.0"}
+
+        with (
+            patch.object(bot, "_finish_streaming_card", return_value=None) as finish_card,
+            patch.object(bot, "_schedule_streaming_cleanup") as schedule_cleanup,
+            patch("smzdm_notice.feishu.bot.reply_card", return_value=True) as reply_card_fn,
+            patch.object(bot, "_reply_text") as reply_text,
+        ):
+            bot._finish_draft_processing_with_card(progress, final_card, "om-parent", "fallback")
+
+        finish_card.assert_called_once_with(
+            progress,
+            final_card,
+            lock_timeout=DRAFT_STREAMING_FINALIZE_LOCK_TIMEOUT_SECONDS,
+        )
+        reply_card_fn.assert_called_once_with("om-parent", final_card)
+        schedule_cleanup.assert_called_once_with(progress, final_card)
+        reply_text.assert_not_called()
 
     def test_streaming_final_update_failure_sends_new_preview_and_stores_new_message(self) -> None:
         draft_store = Mock()
@@ -1135,7 +1366,7 @@ class FeishuBotParsingTests(unittest.TestCase):
             )
 
             with (
-                patch("smzdm_notice.feishu.bot.build_message_draft") as build_message_draft,
+                patch("smzdm_notice.feishu.bot.build_message_draft_outcome") as build_message_draft,
                 patch("smzdm_notice.feishu.bot.send_text") as send_text,
             ):
                 bot._handle_text_command("/search delete AirPods Pro 2", FakeMessageData())
@@ -1227,7 +1458,10 @@ class FeishuBotParsingTests(unittest.TestCase):
                 return True
 
             with (
-                patch("smzdm_notice.feishu.bot.build_revision_draft", return_value=revised) as build_revision,
+                patch(
+                    "smzdm_notice.feishu.bot.build_revision_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=revised),
+                ) as build_revision,
                 patch("smzdm_notice.feishu.bot.send_draft_preview", side_effect=send_preview),
                 patch("smzdm_notice.feishu.bot.disable_draft_card") as disable_card,
             ):
@@ -1235,6 +1469,10 @@ class FeishuBotParsingTests(unittest.TestCase):
 
             build_revision.assert_called_once_with("说得更具体一点", original, draft_store)
             self.assertEqual(draft_store.get("arbiter-draft").status, "cancelled")
+            self.assertEqual(
+                draft_store.get("arbiter-draft").metadata["cancel_reason"],
+                "superseded_by_revision",
+            )
             self.assertEqual(draft_store.get_by_preview_message_id("om_revised").draft_id, "revised-draft")
             disable_card.assert_called_once_with("om_arbiter", "已生成新的修改预览", original)
 
@@ -1283,7 +1521,10 @@ class FeishuBotParsingTests(unittest.TestCase):
 
             with (
                 patch("smzdm_notice.feishu.bot.send_draft_processing", return_value="om_revision_processing"),
-                patch("smzdm_notice.feishu.bot.build_revision_draft", return_value=revised) as build_revision,
+                patch(
+                    "smzdm_notice.feishu.bot.build_revision_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=revised),
+                ) as build_revision,
                 patch("smzdm_notice.feishu.bot.update_draft_preview", side_effect=update_preview) as update_preview_fn,
                 patch("smzdm_notice.feishu.bot.disable_draft_card") as disable_card,
             ):
@@ -1294,6 +1535,41 @@ class FeishuBotParsingTests(unittest.TestCase):
             self.assertEqual(draft_store.get("original-draft").status, "cancelled")
             self.assertEqual(draft_store.get_by_preview_message_id("om_revision_processing").draft_id, "revised-draft")
             disable_card.assert_called_once_with("om_original_preview", "已生成新的修改预览", original)
+
+    def test_revision_noop_keeps_original_draft_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_store = DraftStore(root / "drafts.json", root / "backups", root / "audit.jsonl", root=root)
+            original = draft_store.create(
+                ConfigDraft(
+                    "original-noop",
+                    "preference.md",
+                    "原草案",
+                    "测试",
+                    "- 关注抽纸",
+                    "test",
+                    preview_message_id="om_original",
+                )
+            )
+            bot = FeishuInteractiveBot(BotRuntime(draft_store, Mock(), lambda: "status", Mock(return_value=True)))
+
+            with (
+                patch.object(bot, "_start_draft_processing", return_value=DraftProgressCard()),
+                patch.object(bot, "_stop_draft_processing"),
+                patch.object(bot, "_reply_text") as reply_text,
+                patch(
+                    "smzdm_notice.feishu.bot.build_revision_draft_outcome",
+                    return_value=DraftBuildOutcome("noop", message="原草案已经符合修改意见"),
+                ),
+                patch("smzdm_notice.feishu.bot.send_draft_preview") as send_preview,
+                patch("smzdm_notice.feishu.bot.disable_draft_card") as disable_card,
+            ):
+                bot._handle_draft_revision("保持原样", original, "om_reply")
+
+            self.assertEqual(draft_store.get(original.draft_id).status, "pending")
+            reply_text.assert_called_once_with("om_reply", "原草案已经符合修改意见")
+            send_preview.assert_not_called()
+            disable_card.assert_not_called()
 
     def test_reply_to_cancelled_preview_is_not_treated_as_new_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1328,7 +1604,7 @@ class FeishuBotParsingTests(unittest.TestCase):
             )
 
             with (
-                patch("smzdm_notice.feishu.bot.build_message_draft") as build_message_draft,
+                patch("smzdm_notice.feishu.bot.build_message_draft_outcome") as build_message_draft,
                 patch("smzdm_notice.feishu.bot.disable_draft_card") as disable_card,
                 patch("smzdm_notice.feishu.bot.send_text") as send_text,
             ):
@@ -1358,7 +1634,7 @@ class FeishuBotParsingTests(unittest.TestCase):
             )
 
             with (
-                patch("smzdm_notice.feishu.bot.build_message_draft") as build_message_draft,
+                patch("smzdm_notice.feishu.bot.build_message_draft_outcome") as build_message_draft,
                 patch("smzdm_notice.feishu.bot.send_text") as send_text,
             ):
                 bot._handle_text_command("继续改一下", FakeMessageData(), parent_id="om_missing")
@@ -1395,7 +1671,7 @@ class FeishuBotParsingTests(unittest.TestCase):
 
             with (
                 patch.object(bot, "_start_deal_action_worker") as start_worker,
-                patch("smzdm_notice.feishu.bot.build_deal_action_draft") as build_draft,
+                patch("smzdm_notice.feishu.bot.build_deal_action_draft_outcome") as build_draft,
             ):
                 response = bot._handle_card_action(data)
 
@@ -1444,7 +1720,10 @@ class FeishuBotParsingTests(unittest.TestCase):
                 return True
 
             with (
-                patch("smzdm_notice.feishu.bot.build_deal_action_draft", return_value=generated) as build_draft,
+                patch(
+                    "smzdm_notice.feishu.bot.build_deal_action_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=generated),
+                ) as build_draft,
                 patch("smzdm_notice.feishu.bot.send_draft_preview", side_effect=send_preview),
             ):
                 bot._run_deal_action("deal_follow", value)
@@ -1496,7 +1775,10 @@ class FeishuBotParsingTests(unittest.TestCase):
 
             with (
                 patch("smzdm_notice.feishu.bot.send_draft_processing", return_value="om_deal_processing"),
-                patch("smzdm_notice.feishu.bot.build_deal_action_draft", return_value=generated) as build_draft,
+                patch(
+                    "smzdm_notice.feishu.bot.build_deal_action_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=generated),
+                ) as build_draft,
                 patch("smzdm_notice.feishu.bot.update_draft_preview", side_effect=update_preview) as update_preview_fn,
                 patch("smzdm_notice.feishu.bot.send_draft_preview") as send_preview,
             ):
@@ -1533,7 +1815,10 @@ class FeishuBotParsingTests(unittest.TestCase):
             }
 
             with (
-                patch("smzdm_notice.feishu.bot.build_deal_action_draft", return_value=None),
+                patch(
+                    "smzdm_notice.feishu.bot.build_deal_action_draft_outcome",
+                    return_value=DraftBuildOutcome("failed"),
+                ),
                 patch("smzdm_notice.feishu.bot.send_draft_preview") as send_preview,
                 patch("smzdm_notice.feishu.bot.send_text") as send_text,
             ):
@@ -1582,7 +1867,10 @@ class FeishuBotParsingTests(unittest.TestCase):
             )
 
             with (
-                patch("smzdm_notice.feishu.bot.build_revision_draft", return_value=revised),
+                patch(
+                    "smzdm_notice.feishu.bot.build_revision_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=revised),
+                ),
                 patch("smzdm_notice.feishu.bot.send_draft_preview", return_value=False),
                 patch("smzdm_notice.feishu.bot.send_text") as send_text,
             ):
@@ -1590,7 +1878,35 @@ class FeishuBotParsingTests(unittest.TestCase):
 
             self.assertEqual(draft_store.get("original-draft").status, "pending")
             self.assertEqual(draft_store.get("revised-draft").status, "cancelled")
+            self.assertEqual(
+                draft_store.get("revised-draft").metadata["cancel_reason"],
+                "preview_send_failed",
+            )
             self.assertIn("原草案仍保留", send_text.call_args.args[0])
+
+    def test_deal_action_noop_reports_existing_coverage_without_preview(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        with (
+            patch.object(bot, "_start_draft_processing", return_value=DraftProgressCard()),
+            patch.object(bot, "_stop_draft_processing"),
+            patch.object(bot, "_reply_text") as reply_text,
+            patch(
+                "smzdm_notice.feishu.bot.build_deal_action_draft_outcome",
+                return_value=DraftBuildOutcome("noop", message="当前配置已经关注该商品"),
+            ),
+            patch("smzdm_notice.feishu.bot.send_draft_preview") as send_preview,
+        ):
+            bot._run_deal_action("deal_follow", {"item_title": "抽纸"}, "om_deal")
+
+        reply_text.assert_called_once_with("om_deal", "当前配置已经关注该商品")
+        send_preview.assert_not_called()
 
     def test_ignore_arbitration_cancels_pending_draft(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1657,6 +1973,256 @@ class FeishuBotParsingTests(unittest.TestCase):
             markdown = "\n".join(element.get("content", "") for element in elements)
             self.assertIn("已忽略", markdown)
             self.assertIn("A 过度扩展黑名单。", markdown)
+
+    def test_apply_conflict_starts_only_one_refresh_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "preference.md").write_text("# preference\n- 已被改写\n", encoding="utf-8")
+            draft_store = DraftStore(
+                draft_file=root / "drafts.json",
+                backup_dir=root / "backups",
+                audit_file=root / "audit.jsonl",
+                root=root,
+            )
+            draft = draft_store.create(
+                ConfigDraft(
+                    "conflict",
+                    "preference.md",
+                    "t",
+                    "s",
+                    "- 新规则",
+                    "test",
+                    edit_mode="replace",
+                    search_text="- 已消失规则",
+                    replace_text="- 新规则",
+                    preview_message_id="om_conflict",
+                )
+            )
+            bot = FeishuInteractiveBot(
+                BotRuntime(draft_store, Mock(), lambda: "status", Mock(return_value=True))
+            )
+
+            with (
+                patch.object(bot, "_reply_text") as reply_text,
+                patch.object(bot, "_start_draft_refresh_worker") as start_worker,
+            ):
+                first = bot._apply_draft_card_action(
+                    {"draft_id": draft.draft_id},
+                    "ou_user",
+                    "om_conflict",
+                )
+                second = bot._apply_draft_card_action(
+                    {"draft_id": draft.draft_id},
+                    "ou_user",
+                    "om_conflict",
+                )
+
+            self.assertIn("正在刷新", first.message)
+            self.assertIn("正在刷新", second.message)
+            start_worker.assert_called_once_with(draft, "ou_user", "om_conflict")
+            reply_text.assert_called_once()
+            self.assertEqual(draft_store.get(draft.draft_id).status, "pending")
+
+    def test_refresh_success_reuses_original_card_then_supersedes_old_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_store = DraftStore(
+                draft_file=root / "drafts.json",
+                backup_dir=root / "backups",
+                audit_file=root / "audit.jsonl",
+                root=root,
+            )
+            original = draft_store.create(
+                ConfigDraft(
+                    "old",
+                    "preference.md",
+                    "old",
+                    "old",
+                    "- old",
+                    "test",
+                    preview_message_id="om_old",
+                )
+            )
+            refreshed = draft_store.create(
+                ConfigDraft("new", "preference.md", "new", "new", "- new", "test")
+            )
+            bot = FeishuInteractiveBot(
+                BotRuntime(draft_store, Mock(), lambda: "status", Mock(return_value=True))
+            )
+
+            def update_preview(message_id, draft):
+                draft.preview_message_id = message_id
+                return True
+
+            with (
+                patch(
+                    "smzdm_notice.feishu.bot.build_rebase_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=refreshed),
+                ),
+                patch(
+                    "smzdm_notice.feishu.bot.update_rebased_draft_preview",
+                    side_effect=update_preview,
+                ) as update_preview_fn,
+                patch.object(bot, "_reply_text") as reply_text,
+            ):
+                bot._run_draft_refresh(original, "ou_user", "om_old")
+
+            update_preview_fn.assert_called_once_with("om_old", refreshed)
+            self.assertEqual(draft_store.get("old").status, "cancelled")
+            self.assertEqual(draft_store.get("old").metadata["cancel_reason"], "superseded_by_rebase")
+            self.assertEqual(draft_store.get("new").status, "pending")
+            self.assertEqual(draft_store.get("new").preview_message_id, "om_old")
+            self.assertIn("再次点击采纳", reply_text.call_args.args[1])
+
+    def test_refresh_card_update_failure_keeps_old_draft_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_store = DraftStore(
+                draft_file=root / "drafts.json",
+                backup_dir=root / "backups",
+                audit_file=root / "audit.jsonl",
+                root=root,
+            )
+            original = draft_store.create(
+                ConfigDraft("old", "preference.md", "old", "old", "- old", "test", preview_message_id="om_old")
+            )
+            refreshed = draft_store.create(
+                ConfigDraft("new", "preference.md", "new", "new", "- new", "test")
+            )
+            bot = FeishuInteractiveBot(
+                BotRuntime(draft_store, Mock(), lambda: "status", Mock(return_value=True))
+            )
+
+            with (
+                patch(
+                    "smzdm_notice.feishu.bot.build_rebase_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=refreshed),
+                ),
+                patch("smzdm_notice.feishu.bot.update_rebased_draft_preview", return_value=False),
+                patch.object(bot, "_reply_text"),
+            ):
+                bot._run_draft_refresh(original, "ou_user", "om_old")
+
+            self.assertEqual(draft_store.get("old").status, "pending")
+            self.assertEqual(draft_store.get("new").status, "cancelled")
+            self.assertEqual(draft_store.get("new").metadata["cancel_reason"], "preview_update_failed")
+
+    def test_refresh_noop_marks_original_card_as_covered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_store = DraftStore(
+                draft_file=root / "drafts.json",
+                backup_dir=root / "backups",
+                audit_file=root / "audit.jsonl",
+                root=root,
+            )
+            original = draft_store.create(
+                ConfigDraft("old", "preference.md", "old", "old", "- old", "test", preview_message_id="om_old")
+            )
+            bot = FeishuInteractiveBot(
+                BotRuntime(draft_store, Mock(), lambda: "status", Mock(return_value=True))
+            )
+
+            with (
+                patch(
+                    "smzdm_notice.feishu.bot.build_rebase_draft_outcome",
+                    return_value=DraftBuildOutcome("noop", message="已有规则"),
+                ),
+                patch("smzdm_notice.feishu.bot.disable_draft_card", return_value=True) as disable_card,
+                patch.object(bot, "_reply_text"),
+            ):
+                bot._run_draft_refresh(original, "ou_user", "om_old")
+
+            disable_card.assert_called_once_with("om_old", "当前配置已覆盖：已有规则", original)
+            self.assertEqual(draft_store.get("old").status, "cancelled")
+            self.assertEqual(draft_store.get("old").metadata["cancel_reason"], "already_covered_after_rebase")
+
+    def test_refresh_failure_and_midflight_cancel_keep_no_new_active_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_store = DraftStore(
+                draft_file=root / "drafts.json",
+                backup_dir=root / "backups",
+                audit_file=root / "audit.jsonl",
+                root=root,
+            )
+            original = draft_store.create(
+                ConfigDraft("old", "preference.md", "old", "old", "- old", "test", preview_message_id="om_old")
+            )
+            bot = FeishuInteractiveBot(
+                BotRuntime(draft_store, Mock(), lambda: "status", Mock(return_value=True))
+            )
+            with (
+                patch(
+                    "smzdm_notice.feishu.bot.build_rebase_draft_outcome",
+                    return_value=DraftBuildOutcome("failed", message="LLM failed"),
+                ),
+                patch.object(bot, "_reply_text"),
+            ):
+                bot._run_draft_refresh(original, "ou_user", "om_old")
+            self.assertEqual(draft_store.get("old").status, "pending")
+
+            refreshed = draft_store.create(
+                ConfigDraft("new", "preference.md", "new", "new", "- new", "test")
+            )
+
+            def cancel_original(*_args, **_kwargs):
+                draft_store.cancel("old", reason="user_cancelled")
+                return DraftBuildOutcome("draft", draft=refreshed)
+
+            with (
+                patch(
+                    "smzdm_notice.feishu.bot.build_rebase_draft_outcome",
+                    side_effect=cancel_original,
+                ),
+                patch("smzdm_notice.feishu.bot.update_rebased_draft_preview") as update_preview,
+                patch.object(bot, "_reply_text"),
+            ):
+                bot._run_draft_refresh(original, "ou_user", "om_old")
+
+            update_preview.assert_not_called()
+            self.assertEqual(draft_store.get("old").status, "cancelled")
+            self.assertEqual(draft_store.get("new").status, "cancelled")
+            self.assertEqual(draft_store.get("new").metadata["cancel_reason"], "original_draft_not_pending")
+
+    def test_cancel_during_refresh_card_update_discards_new_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_store = DraftStore(
+                draft_file=root / "drafts.json",
+                backup_dir=root / "backups",
+                audit_file=root / "audit.jsonl",
+                root=root,
+            )
+            original = draft_store.create(
+                ConfigDraft("old", "preference.md", "old", "old", "- old", "test", preview_message_id="om_old")
+            )
+            refreshed = draft_store.create(ConfigDraft("new", "preference.md", "new", "new", "- new", "test"))
+            bot = FeishuInteractiveBot(BotRuntime(draft_store, Mock(), lambda: "status", Mock(return_value=True)))
+
+            def update_then_cancel(message_id, draft):
+                draft.preview_message_id = message_id
+                draft_store.cancel("old", reason="user_cancelled")
+                return True
+
+            with (
+                patch(
+                    "smzdm_notice.feishu.bot.build_rebase_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=refreshed),
+                ),
+                patch(
+                    "smzdm_notice.feishu.bot.update_rebased_draft_preview",
+                    side_effect=update_then_cancel,
+                ),
+                patch("smzdm_notice.feishu.bot.disable_draft_card", return_value=True) as disable_card,
+                patch.object(bot, "_reply_text"),
+            ):
+                bot._run_draft_refresh(original, "ou_user", "om_old")
+
+            self.assertEqual(draft_store.get("old").status, "cancelled")
+            self.assertEqual(draft_store.get("new").status, "cancelled")
+            self.assertEqual(draft_store.get("new").metadata["cancel_reason"], "original_draft_not_pending")
+            disable_card.assert_called_once_with("om_old", "原草案已取消，刷新结果已丢弃", original)
 
     def test_apply_expired_draft_disables_card(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1980,6 +2546,87 @@ class FeishuModelCommandTests(unittest.TestCase):
         binding_store.is_bound_operator.assert_not_called()
         reply_text.assert_not_called()
         send_text.assert_not_called()
+
+    def test_duplicate_card_action_event_id_is_dispatched_once(self) -> None:
+        binding_store = Mock()
+        binding_store.is_bound_operator.return_value = True
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=binding_store,
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        data = Mock()
+        first_event_id = "abcd1111wxyz"
+        second_event_id = "abcd2222wxyz"
+        data.header.event_id = first_event_id
+        data.event.token = "same-update-token"
+        data.event.action.token = "wrong-action-token"
+        data.event.action.value = {"action": "deal_good", "article_id": "1001"}
+        data.event.operator.open_id = "ou_real_open_id"
+        data.event.context.open_message_id = "om_deal"
+
+        with (
+            patch.object(
+                bot,
+                "_dispatch_card_action",
+                return_value=Mock(message="已记录为好价", response_card=None),
+            ) as dispatch,
+            patch("smzdm_notice.feishu.bot.logger.info") as log_info,
+        ):
+            first = bot._handle_card_action(data)
+            duplicate = bot._handle_card_action(data)
+            data.header.event_id = second_event_id
+            second_click = bot._handle_card_action(data)
+
+        self.assertIsNotNone(first)
+        self.assertEqual(duplicate.toast.content, "操作已处理，请勿重复提交")
+        self.assertIsNotNone(second_click)
+        self.assertEqual(dispatch.call_count, 2)
+        logs = "\n".join(str(call.args[0]) for call in log_info.call_args_list)
+        self.assertNotIn(first_event_id, logs)
+        self.assertNotIn(second_event_id, logs)
+        self.assertNotIn("same-update-token", logs)
+        self.assertIn("abcd******wxyz", logs)
+
+    def test_card_action_uses_legacy_uuid_when_event_id_is_missing(self) -> None:
+        binding_store = Mock()
+        binding_store.is_bound_operator.return_value = True
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=binding_store,
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        data = Mock()
+        data.header = None
+        data.uuid = "legacy-event-uuid"
+        data.event.token = "ignored-update-token"
+        data.event.action.value = {"action": "deal_good", "article_id": "1001"}
+        data.event.operator.open_id = "ou_real_open_id"
+        data.event.context.open_message_id = "om_deal"
+
+        with patch.object(
+            bot,
+            "_dispatch_card_action",
+            return_value=Mock(message="已记录为好价", response_card=None),
+        ) as dispatch:
+            bot._handle_card_action(data)
+            duplicate = bot._handle_card_action(data)
+
+        self.assertEqual(duplicate.toast.content, "操作已处理，请勿重复提交")
+        dispatch.assert_called_once()
+
+    def test_card_event_id_log_mask_formats(self) -> None:
+        self.assertEqual(_mask_card_event_id("abcdefghijk"), "abcd******hijk")
+        self.assertEqual(_mask_card_event_id("abcdefgh"), "a******h")
+        self.assertEqual(_mask_card_event_id("ab"), "a******b")
+        self.assertEqual(_mask_card_event_id("a"), "*")
+        self.assertEqual(_mask_card_event_id(""), "")
 
     def test_model_card_form_change_from_unbound_user_does_not_cache(self) -> None:
         binding_store = Mock()

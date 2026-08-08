@@ -21,7 +21,7 @@ from smzdm_notice.llm.filter import (
     _single_llm_call,
     filter_items,
 )
-from smzdm_notice.llm.models import ArbiterInfo, FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
+from smzdm_notice.llm.models import FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
 from smzdm_notice.llm.prompts import ARBITER_SYSTEM_PROMPT, SYSTEM_PROMPT
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
 from smzdm_notice.smzdm.ranking import RankingItem
@@ -159,20 +159,12 @@ class RecommendationOrderingTests(unittest.TestCase):
         self.assertEqual([item.article_id for item, _ in matched], ["3", "1", "2", "4", "5", "6"])
         self.assertEqual(notification_names, {"3": "蓝莓"})
 
-    def test_dual_result_uses_arbiter_selected_order(self) -> None:
+    def test_dual_result_same_items_different_order_uses_a_without_arbitration(self) -> None:
         result_a = FilterResult(recommendations=[Recommendation(id="1", reason="A1"), Recommendation(id="2", reason="A2")])
         result_b = FilterResult(recommendations=[Recommendation(id="2", reason="B2"), Recommendation(id="1", reason="B1")])
-        arbiter_info = ArbiterInfo(
-            chosen="B",
-            reason="B order",
-            analysis="",
-            suggestion="",
-            result_a=result_a,
-            result_b=result_b,
-        )
 
-        with patch("smzdm_notice.llm.arbitration._run_arbiter", return_value=arbiter_info):
-            final, _ = resolve_dual_result(
+        with patch("smzdm_notice.llm.arbitration._run_arbiter") as run_arbiter:
+            final, arbiter_info = resolve_dual_result(
                 LLMCallResult(result=result_a),
                 LLMCallResult(result=result_b),
                 [],
@@ -180,7 +172,10 @@ class RecommendationOrderingTests(unittest.TestCase):
                 "prompt",
             )
 
-        self.assertEqual([rec.id for rec in final.recommendations], ["2", "1"])
+        run_arbiter.assert_not_called()
+        self.assertIs(final, result_a)
+        self.assertIsNone(arbiter_info)
+        self.assertEqual([rec.id for rec in final.recommendations], ["1", "2"])
 
     def test_dual_result_intersection_keeps_judgment_a_relative_order(self) -> None:
         result_a = FilterResult(
@@ -408,6 +403,7 @@ class LlmPromptTests(unittest.TestCase):
         self.assertIn('{"recommendations":[],"near_misses":[]}', SYSTEM_PROMPT)
         self.assertIn("输出前必须自检", SYSTEM_PROMPT)
         self.assertIn("所有必填字段均存在且为字符串", SYSTEM_PROMPT)
+        self.assertIn("decision_context 都是对象而不是 null", SYSTEM_PROMPT)
         self.assertIn("JSON 没有注释、占位项或尾逗号", SYSTEM_PROMPT)
 
     def test_system_prompt_keeps_generic_examples_without_user_specific_categories(self) -> None:
@@ -694,6 +690,28 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         self.assertEqual(context.preference_basis, [])
         self.assertEqual(context.threshold_adjustment, "")
         self.assertEqual(context.context_summary, "")
+
+    def test_parse_response_normalizes_null_decision_context_without_dropping_batch(self) -> None:
+        payload = json.dumps(
+            {
+                "recommendations": [
+                    {"id": "1001", "reason": "值得买", "decision_context": None},
+                    {
+                        "id": "1002",
+                        "reason": "同样值得买",
+                        "decision_context": {"need_state": "normal"},
+                    },
+                ],
+                "near_misses": [],
+            },
+            ensure_ascii=False,
+        )
+
+        result = _parse_response(payload)
+
+        self.assertEqual([item.id for item in result.recommendations], ["1001", "1002"])
+        self.assertEqual(result.recommendations[0].decision_context.need_state, "")
+        self.assertEqual(result.recommendations[1].decision_context.need_state, "normal")
 
     def test_filter_items_injects_runtime_calibration_section(self) -> None:
         captured = {}
@@ -1094,7 +1112,42 @@ class CategorySanitizerTests(unittest.TestCase):
 
 
 class LlmFilterArbitrationTests(unittest.TestCase):
-    def test_arbitration_parses_config_change_draft(self) -> None:
+    def test_arbitration_parses_preference_gap_assessment(self) -> None:
+        payload = {
+            "chosen": "A",
+            "reason": "偏好缺少尺寸边界",
+            "inconsistency_analysis": "两侧对尺寸场景理解不同",
+            "prompt_optimization_suggestion": "补充真实空间限制",
+            "change_assessment": {
+                "cause": "preference_gap",
+                "should_change_preference": True,
+                "reason": "用户已明确空间有限",
+            },
+            "preference_change": {"rule": "不推荐体积过大的室内用品", "reason": "居住空间有限"},
+        }
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: response)))
+
+        info = arbitrate(
+            ArbitrationRequest(
+                result_a=FilterResult(),
+                result_b=FilterResult(),
+                raw_a="{}",
+                raw_b="{}",
+                items_summary=[],
+                items_by_id={},
+                user_message="用户偏好",
+                client=client,
+                llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
+            )
+        )
+
+        self.assertEqual(info.change_assessment["cause"], "preference_gap")
+        self.assertIn("体积过大", info.preference_change["rule"])
+
+    def test_arbitration_rejects_legacy_config_change_draft(self) -> None:
         payload = {
             "chosen": "B",
             "reason": "B 更严格遵守黑名单",
@@ -1136,42 +1189,106 @@ class LlmFilterArbitrationTests(unittest.TestCase):
             )
         )
 
-        self.assertIsNotNone(info)
-        self.assertEqual(info.chosen, "B")
+        self.assertIsNone(info)
         self.assertEqual(captured["extra_body"], {"arbiter_option": {"mode": "strict"}})
-        self.assertEqual(info.config_change_draft["target_file"], "preference.md")
-        self.assertIn("字面精确匹配", info.config_change_draft["append_text"])
 
-    def test_arbitration_ignores_non_object_config_change_draft(self) -> None:
-        payload = {
-            "chosen": "A",
-            "reason": "A 更准确",
-            "inconsistency_analysis": "差异不足以形成规则。",
-            "prompt_optimization_suggestion": "无需修改。",
-            "config_change_draft": None,
-        }
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
-        )
-        # 为匹配 OpenAI SDK create 签名，这里保留关键字参数；此处只需返回固定响应。
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: response)))
-
-        info = arbitrate(
-            ArbitrationRequest(
-                result_a=FilterResult(),
-                result_b=FilterResult(),
-                raw_a="{}",
-                raw_b="{}",
-                items_summary=[],
-                items_by_id={},
-                user_message="用户偏好",
-                client=client,
-                llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
+        with patch("smzdm_notice.llm.arbitration._run_arbiter", return_value=info):
+            final, returned_info = resolve_dual_result(
+                LLMCallResult(result=FilterResult(recommendations=[Recommendation(id="1", reason="A")])),
+                LLMCallResult(result=FilterResult(recommendations=[Recommendation(id="2", reason="B")])),
+                [],
+                {},
+                "用户偏好",
             )
-        )
 
-        self.assertIsNotNone(info)
-        self.assertIsNone(info.config_change_draft)
+        self.assertEqual(final.recommendations, [])
+        self.assertIsNone(returned_info)
+
+    def test_arbitration_rejects_invalid_change_assessment(self) -> None:
+        invalid_assessments = [
+            {"cause": "unknown", "should_change_preference": False},
+            {"cause": "soft_judgment", "should_change_preference": "false"},
+            {"cause": "model_execution_error", "should_change_preference": True},
+        ]
+        for assessment in invalid_assessments:
+            with self.subTest(assessment=assessment):
+                payload = {
+                    "chosen": "A",
+                    "reason": "A 更准确",
+                    "inconsistency_analysis": "差异不足以形成规则。",
+                    "prompt_optimization_suggestion": "无需修改。",
+                    "change_assessment": assessment,
+                    "preference_change": None,
+                }
+                response = SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+                )
+                client = SimpleNamespace(
+                    chat=SimpleNamespace(
+                        completions=SimpleNamespace(create=lambda response=response, **_kwargs: response)
+                    )
+                )
+
+                info = arbitrate(
+                    ArbitrationRequest(
+                        result_a=FilterResult(),
+                        result_b=FilterResult(),
+                        raw_a="{}",
+                        raw_b="{}",
+                        items_summary=[],
+                        items_by_id={},
+                        user_message="用户偏好",
+                        client=client,
+                        llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
+                    )
+                )
+
+                self.assertIsNone(info)
+
+    def test_arbitration_rejects_inconsistent_preference_change(self) -> None:
+        payloads = [
+            {
+                "change_assessment": {"cause": "preference_gap", "should_change_preference": True},
+                "preference_change": None,
+            },
+            {
+                "change_assessment": {"cause": "soft_judgment", "should_change_preference": False},
+                "preference_change": {"rule": "不应出现的规则"},
+            },
+        ]
+        for partial_payload in payloads:
+            with self.subTest(payload=partial_payload):
+                payload = {
+                    "chosen": "A",
+                    "reason": "A 更准确",
+                    "inconsistency_analysis": "差异分析",
+                    "prompt_optimization_suggestion": "无需修改",
+                    **partial_payload,
+                }
+                response = SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+                )
+                client = SimpleNamespace(
+                    chat=SimpleNamespace(
+                        completions=SimpleNamespace(create=lambda response=response, **_kwargs: response)
+                    )
+                )
+
+                info = arbitrate(
+                    ArbitrationRequest(
+                        result_a=FilterResult(),
+                        result_b=FilterResult(),
+                        raw_a="{}",
+                        raw_b="{}",
+                        items_summary=[],
+                        items_by_id={},
+                        user_message="用户偏好",
+                        client=client,
+                        llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
+                    )
+                )
+
+                self.assertIsNone(info)
 
     def test_arbitration_returns_none_on_sdk_error(self) -> None:
         info = arbitrate(

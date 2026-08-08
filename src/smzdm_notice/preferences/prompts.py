@@ -5,17 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from smzdm_notice.core import config
-
-MAX_CONTEXT_CHARS = 4000
+from smzdm_notice.preferences.validation import markdown_outline
 
 
 def read_target_content(filename: str, root: Path | None = None) -> str:
     path = (root or config.PROJECT_ROOT) / filename
     try:
-        content = path.read_text(encoding="utf-8")
-        if len(content) > MAX_CONTEXT_CHARS:
-            return content[:MAX_CONTEXT_CHARS] + "\n... (内容过长已截断)"
-        return content
+        return path.read_text(encoding="utf-8")
     except OSError:
         return ""
 
@@ -39,10 +35,14 @@ target_file 只能是 preference.md 或 inventory.md：
 
 <constraints>
 - 优先使用 replace，把规则自然合并进现有章节或列表项，不堆到文件末尾
+- 在现有章节中新增内容时，也使用 replace：用该章节内唯一的相邻规则作为 search_text，replace_text 包含原规则和新增规则
 - search_text 必须是文件中已有的、足够精确定位的连续文本（1-3行），不能是模糊描述，应包含足够上下文使其在文件中唯一
 - replace_text 是替换后的完整新文本，不是增量差异
 - delete 模式将 search_text 完整移除，不需要 replace_text
 - 只有当用户意思明确是新增独立条目且文件无合适位置时才用 append
+- 如果现有规则已经完整覆盖用户意图，输出 {"edit_mode":"noop","target_file":"preference.md","summary":"现有规则已覆盖"}
+- 修改前检查全文，避免同一需求散落在多个章节、与已有物品/黑名单/关注项冲突，或重复已有规则
+- 由你负责语义去重：结合完整标题路径和规则含义识别近义内容；同名子标题位于不同父章节时可以合法共存
 - append_text/replace_text 使用自然的 Markdown 正文，可直接成为配置文件的一部分
 - 不在 append_text/replace_text 中写"机器人确认修改""来源""仲裁建议""一键采纳"等审计或包装文字
 - 数字阈值默认写成参考线或质量信号，不要写成硬性门槛；只有用户明确使用"必须""一律""不得低于""绝不推荐"等强约束时，才生成硬规则表述
@@ -53,7 +53,12 @@ target_file 只能是 preference.md 或 inventory.md：
 def file_context_block(root: Path | None = None) -> str:
     pref_content = read_target_content("preference.md", root)
     inv_content = read_target_content("inventory.md", root)
-    return f"\n\n--- preference.md 当前内容 ---\n{pref_content}\n\n--- inventory.md 当前内容 ---\n{inv_content}"
+    return (
+        f"\n\n--- preference.md 动态结构索引 ---\n{markdown_outline(pref_content)}"
+        f"\n\n--- preference.md 当前完整内容 ---\n{pref_content}"
+        f"\n\n--- inventory.md 动态结构索引 ---\n{markdown_outline(inv_content)}"
+        f"\n\n--- inventory.md 当前完整内容 ---\n{inv_content}"
+    )
 
 
 def revision_system_prompt(root: Path | None = None) -> str:

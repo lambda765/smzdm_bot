@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass, field
+from typing import Literal
 
 ALLOWED_TARGETS = {"preference.md", "inventory.md"}
 DRAFT_TTL_SECONDS = 24 * 60 * 60
@@ -38,3 +39,41 @@ class ConfigDraft:
     @property
     def is_expired(self) -> bool:
         return time.time() - self.created_at > DRAFT_TTL_SECONDS
+
+
+@dataclass
+class DraftBuildOutcome:
+    """配置修改生成结果，区分无修改和真正的生成失败。"""
+
+    status: Literal["draft", "noop", "rejected", "failed"]
+    draft: ConfigDraft | None = None
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class DraftStreamEvent:
+    """配置草案生成期间可供交互层展示的模型增量。"""
+
+    kind: Literal["attempt_start", "reasoning_delta", "content_delta"]
+    text: str = ""
+    attempt: int = 1
+
+
+@dataclass
+class DraftApplyOutcome:
+    """草案应用结果，区分真实冲突和不可重试的拒绝。"""
+
+    status: Literal[
+        "applied",
+        "already_applied",
+        "needs_refresh",
+        "expired",
+        "rejected",
+        "missing",
+    ]
+    message: str = ""
+    draft: ConfigDraft | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status in {"applied", "already_applied"}

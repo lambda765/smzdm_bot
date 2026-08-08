@@ -20,6 +20,13 @@ from smzdm_notice.llm.models import ArbiterInfo, FilterResult, LLMCallResult, Ne
 from smzdm_notice.llm.prompts import ARBITER_SYSTEM_PROMPT
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot, build_chat_completion_kwargs, resolve
 
+_CHANGE_ASSESSMENT_CAUSES = {
+    "preference_gap",
+    "filter_prompt_gap",
+    "model_execution_error",
+    "soft_judgment",
+}
+
 
 @dataclass
 class ArbitrationRequest:
@@ -57,7 +64,7 @@ def resolve_dual_result(
     result_b = call_b.result
 
     if compare_results(result_a, result_b):
-        logger.info("两次判断推荐列表一致，无需仲裁")
+        logger.info("两次判断推荐商品集合一致，无需仲裁，采用 A 的结果与排序")
         return result_a, None
 
     ids_a = {rec.id for rec in result_a.recommendations}
@@ -200,6 +207,33 @@ def _parse_arbiter_response(content: str | None, request: ArbitrationRequest) ->
         logger.warning(f"仲裁响应 chosen 无效: {data.get('chosen')!r}")
         return None
 
+    raw_assessment = data.get("change_assessment")
+    if not isinstance(raw_assessment, dict):
+        logger.warning("仲裁响应缺少有效的 change_assessment")
+        return None
+    cause = str(raw_assessment.get("cause") or "")
+    should_change = raw_assessment.get("should_change_preference")
+    if cause not in _CHANGE_ASSESSMENT_CAUSES:
+        logger.warning(f"仲裁响应 change_assessment.cause 无效: {cause!r}")
+        return None
+    if not isinstance(should_change, bool):
+        logger.warning("仲裁响应 change_assessment.should_change_preference 必须是布尔值")
+        return None
+    if should_change and cause != "preference_gap":
+        logger.warning("仲裁响应只有 preference_gap 才能建议修改 preference.md")
+        return None
+
+    raw_preference_change = data.get("preference_change")
+    preference_change = raw_preference_change if isinstance(raw_preference_change, dict) else None
+    if should_change and (
+        preference_change is None or not str(preference_change.get("rule") or "").strip()
+    ):
+        logger.warning("仲裁响应建议修改 preference.md 时必须提供有效的 preference_change.rule")
+        return None
+    if preference_change is not None and not should_change:
+        logger.warning("仲裁响应不建议修改 preference.md 时 preference_change 必须为空")
+        return None
+
     return ArbiterInfo(
         chosen=chosen,
         reason=data.get("reason", ""),
@@ -208,16 +242,15 @@ def _parse_arbiter_response(content: str | None, request: ArbitrationRequest) ->
         result_a=request.result_a,
         result_b=request.result_b,
         items=request.items_by_id,
-        config_change_draft=(
-            data.get("config_change_draft") if isinstance(data.get("config_change_draft"), dict) else None
-        ),
+        change_assessment=raw_assessment,
+        preference_change=preference_change,
     )
 
 
 def compare_results(a: FilterResult, b: FilterResult) -> bool:
-    """比较两次结果的推荐 ID 及排序是否一致。"""
-    ids_a = [rec.id for rec in a.recommendations]
-    ids_b = [rec.id for rec in b.recommendations]
+    """比较两次结果的推荐商品 ID 集合是否一致（忽略排序）。"""
+    ids_a = {rec.id for rec in a.recommendations}
+    ids_b = {rec.id for rec in b.recommendations}
     return ids_a == ids_b
 
 

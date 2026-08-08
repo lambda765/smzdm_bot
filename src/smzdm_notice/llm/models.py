@@ -64,7 +64,10 @@ class Recommendation(BaseModel):
 
     @field_validator("decision_context", mode="before")
     def _normalize_decision_context(cls, value: object) -> object:
-        if value is None or isinstance(value, (dict, DecisionContext)):
+        if value is None:
+            logger.debug("LLM 推荐 decision_context=null，已降级为空上下文")
+            return {}
+        if isinstance(value, (dict, DecisionContext)):
             return value
         logger.warning(f"LLM 推荐 decision_context 类型异常，已降级为空上下文: {type(value).__name__}")
         return {}
@@ -130,4 +133,5 @@ class ArbiterInfo(BaseModel):
     result_a: FilterResult
     result_b: FilterResult
     items: dict[str, dict] = Field(default_factory=dict)
-    config_change_draft: Optional[dict] = None  # noqa: UP045 - 在 Python 3.9 下 Pydantic 需要这种写法。
+    change_assessment: dict
+    preference_change: Optional[dict] = None  # noqa: UP045

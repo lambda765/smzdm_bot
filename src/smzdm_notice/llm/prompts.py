@@ -82,6 +82,7 @@ reason 示例：
 - recommendations.notification_name：2-16 字的通知栏精简名称，优先使用“品牌 + 核心品类”，品牌不重要时只写核心品类，例如“帮宝适纸尿裤”“蓝莓”。去除 88VIP、今日必买、淘金币、价格、件数、容量和其他数量规格，不要写推荐理由
 - recommendations.category：优先从以下预设中选择：电脑数码、食品生鲜、运动户外、家用电器、服饰鞋包、日用百货、母婴用品、家居家装、办公设备、个护化妆、本地生活、医疗健康、图书文娱、玩模乐器。若都不合适，可生成 2-8 字自定义品类，如"厨房小家电""咖啡器具""宠物用品"；不得包含品牌、商城、型号、容量、价格、促销词、榜单词
 - recommendations.decision_context：记录当时的轻量决策上下文，用于历史学习。字段要求：
+  - 必须始终输出 JSON 对象，禁止输出 null；无法判断时使用下述 unknown、空字符串或空数组默认值
   - need_state：只能是 "urgent"、"normal"、"unknown"。库存告急或明确需要补货时用 urgent；普通需求或非耗材场景用 normal；无法判断用 unknown
   - inventory_basis：简短说明库存依据，如"咖啡豆库存不足""未命中库存项"
   - preference_basis：命中的偏好依据列表，最多 3 条，每条简短
@@ -110,7 +111,8 @@ reason 示例：
 1. recommendations 和 near_misses 两个数组都存在
 2. 两个数组均不包含 null 或非对象元素
 3. 所有必填字段均存在且为字符串
-4. JSON 没有注释、占位项或尾逗号
+4. 每条推荐的 decision_context 都是对象而不是 null
+5. JSON 没有注释、占位项或尾逗号
 </output_format>
 """
 
@@ -165,22 +167,24 @@ ARBITER_SYSTEM_PROMPT = """\
   "reason": "选择原因，50字以内",
   "inconsistency_analysis": "两次判断差异的可能原因",
   "prompt_optimization_suggestion": "建议如何优化筛选 Prompt 以减少类似不一致",
-  "config_change_draft": {
-    "target_file": "preference.md",
-    "edit_mode": "append",
-    "title": "配置修改标题",
-    "summary": "说明这次修改能避免什么误判",
-    "append_text": "- 可直接写入 preference.md 的具体筛选规则"
+  "change_assessment": {
+    "cause": "preference_gap/filter_prompt_gap/model_execution_error/soft_judgment",
+    "should_change_preference": true,
+    "reason": "为什么需要或不需要修改用户偏好"
+  },
+  "preference_change": {
+    "rule": "需要写入或融入 preference.md 的具体偏好规则",
+    "reason": "该规则对应的真实用户偏好缺口"
   }
 }
 
 chosen 必须是字符串 "A" 或 "B"。
-config_change_draft 只允许修改 preference.md，使用与配置修改预览一致的结构。
-新增规则用 append；修改现有规则用 replace 并提供 search_text 和完整 replace_text。
-append_text/replace_text 必须是面向用户偏好文件的具体规则，不含"仲裁建议"等包装文字。
-当差异来自已有物品的细分形态边界，config_change_draft 不应替用户写死排除该细分形态；只能建议用户补充边界偏好。若无法形成用户已明确表达的规则，输出 null。
-当差异来自参考数字被误读为硬门槛，config_change_draft 不应生成"评论必须 >= X"或"值票必须 >= X"这类硬化规则，除非用户明确要求。
-当差异只是一次模型漏读、软信号边界或综合质量信号权衡不同，config_change_draft 输出 null。
-差异不足以形成明确规则时，config_change_draft 输出 null。
+cause 只能取上述四值之一。只有用户现有偏好确实缺少一条已能从输入中确认的长期规则时，使用 preference_gap。
+只有 cause=preference_gap 时 should_change_preference 才能为 true，并输出 preference_change；其他原因 preference_change 输出 null。
+模型漏读已有规则、事实错误、单次推理失误属于 model_execution_error；系统筛选说明不清属于 filter_prompt_gap；软信号取舍属于 soft_judgment。
+当差异只是一次模型漏读、软信号边界或综合质量信号权衡不同时，不得据此新增长期偏好。
+preference_change 只表达语义规则，不生成 append/replace/delete 或 search_text，具体落点由后续配置草案管线决定。
+当差异来自已有物品的细分形态边界且用户未明确表达范围时，不应替用户写死排除该细分形态，应归为 soft_judgment 或 model_execution_error。
+不得生成"评论必须 >= X"、"值票必须 >= X"等硬化规则；只有用户原文明确要求时例外。
 </output_format>
 """

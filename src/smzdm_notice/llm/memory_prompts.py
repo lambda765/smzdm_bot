@@ -12,6 +12,7 @@ MEMORY_ANALYSIS_SYSTEM_PROMPT = """\
 - context: 推荐时的轻量上下文（筛选理由、快照时间、decision_context）
 - decision_context: 当时的库存/偏好决策摘要，包括 need_state（urgent/normal/unknown）、inventory_basis、preference_basis、threshold_adjustment（relaxed_due_to_need/strict_normal/none/unknown）和 context_summary
 - feedback: 用户的评价（deal_good = 好价，deal_not_worth = 不值）和评价时间
+此外会收到当前 preference.md 完整内容，用于判断候选是否已存在、应合并还是无需修改。
 </input>
 
 <task>
@@ -53,7 +54,8 @@ MEMORY_ANALYSIS_SYSTEM_PROMPT = """\
       "evidence": "支撑这条规则的数据摘要，必须写明 good/not_worth 样本数量",
       "good_count": 5,
       "not_worth_count": 0,
-      "evidence_scope": "可选：该规则基于哪个品类、标签或场景"
+      "evidence_scope": "可选：该规则基于哪个品类、标签或场景",
+      "evidence_ids": ["支撑该规则的 article_id"]
     }
   ]
 }
@@ -64,6 +66,7 @@ suggested_rules 不使用 evidence_count 作为证据字段，必须使用 good_
 patterns 可以使用 evidence_count 记录探索性发现，但 patterns 不会自动进入 preference.md 草案。
 如果 patterns 的 confidence 都是 low 或数据不足以形成规则，suggested_rules 输出空数组。
 不要重复用户偏好中已有的规则。
+每次最多输出一条 suggested_rules，选择证据最强、且能给当前偏好带来实际增量的一条。
 </output_format>
 
 <constraints>

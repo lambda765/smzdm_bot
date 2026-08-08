@@ -39,6 +39,7 @@ from smzdm_notice.feishu.notifier import (
     build_disabled_draft_card,
     build_draft_failure_card,
     build_draft_handoff_card,
+    build_draft_noop_card,
     build_draft_preview_card,
     disable_draft_card,
     finish_streaming_draft_card,
@@ -53,6 +54,7 @@ from smzdm_notice.feishu.notifier import (
     update_card_message,
     update_deal_card_feedback_state,
     update_draft_preview,
+    update_rebased_draft_preview,
     update_streaming_draft_content,
 )
 from smzdm_notice.feishu.sdk import (
@@ -82,8 +84,13 @@ from smzdm_notice.llm.routing import (
     ResolvedLLMConfig,
     build_chat_completion_kwargs,
 )
-from smzdm_notice.preferences.builder import build_deal_action_draft, build_message_draft, build_revision_draft
-from smzdm_notice.preferences.models import ConfigDraft
+from smzdm_notice.preferences.builder import (
+    build_deal_action_draft_outcome,
+    build_message_draft_outcome,
+    build_rebase_draft_outcome,
+    build_revision_draft_outcome,
+)
+from smzdm_notice.preferences.models import ConfigDraft, DraftBuildOutcome, DraftStreamEvent
 from smzdm_notice.preferences.store import DraftStore
 
 INTERNAL_ERROR_MESSAGE = "处理消息时遇到内部错误，请稍后重试。"
@@ -146,6 +153,15 @@ class DraftProgressCard:
     thread: threading.Thread | None = None
     sequence: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    stage: str = ""
+    wake_event: threading.Event | None = None
+    buffer_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    attempt_status: str = ""
+    reasoning_text: str = ""
+    content_text: str = ""
+    reasoning_seen: bool = False
+    reasoning_truncated: bool = False
+    content_truncated: bool = False
 
     @property
     def streaming(self) -> bool:
@@ -155,6 +171,24 @@ class DraftProgressCard:
 MODEL_CARD_FORM_STATE_LIMIT = 64
 DEAL_REASON_FORM_STATE_LIMIT = 256
 DRAFT_STREAMING_FINALIZE_LOCK_TIMEOUT_SECONDS = 1.0
+DRAFT_STREAMING_UPDATE_INTERVAL_SECONDS = 0.5
+DRAFT_STREAMING_DISPLAY_MAX_BYTES = 8 * 1024
+DRAFT_STREAMING_OMITTED_TEXT = "较早内容已省略\n\n"
+
+
+def _append_draft_stream_text(current: str, delta: str) -> tuple[str, bool]:
+    clean_delta = "".join(char for char in delta if char in "\n\t" or ord(char) >= 32)
+    combined = current + clean_delta
+    encoded = combined.encode("utf-8")
+    if len(encoded) <= DRAFT_STREAMING_DISPLAY_MAX_BYTES:
+        return combined, False
+    tail = encoded[-DRAFT_STREAMING_DISPLAY_MAX_BYTES :]
+    while tail:
+        try:
+            return tail.decode("utf-8"), True
+        except UnicodeDecodeError:
+            tail = tail[1:]
+    return "", True
 
 
 class FeishuInteractiveBot:
@@ -163,10 +197,13 @@ class FeishuInteractiveBot:
     def __init__(self, runtime: BotRuntime, deduper: MessageDeduper | None = None) -> None:
         self.runtime = runtime
         self.deduper = deduper or MessageDeduper()
+        self.card_action_deduper = MessageDeduper()
         self._model_card_form_state: dict[str, dict[str, Any]] = {}
         self._model_card_form_lock = threading.RLock()
         self._deal_reason_form_state: dict[str, str] = {}
         self._deal_reason_form_lock = threading.RLock()
+        self._draft_refreshing: set[str] = set()
+        self._draft_refresh_lock = threading.RLock()
 
     def start_blocking(self) -> None:
         if not (config.FEISHU_APP_ID and config.FEISHU_APP_SECRET):
@@ -310,7 +347,7 @@ class FeishuInteractiveBot:
             self._reply_text(reply_to_message_id, "该预览已失效，请以最新预览为准。")
             return True
         if original_draft.is_expired:
-            self.runtime.draft_store.cancel(original_draft.draft_id)
+            self.runtime.draft_store.cancel(original_draft.draft_id, reason="expired")
             if original_draft.preview_message_id:
                 disable_draft_card(
                     original_draft.preview_message_id,
@@ -325,7 +362,16 @@ class FeishuInteractiveBot:
     def _handle_new_draft(self, text: str, reply_to_message_id: str) -> None:
         processing = self._start_draft_processing(reply_to_message_id, "正在理解偏好/库存修改")
         try:
-            draft = build_message_draft(text, self.runtime.draft_store)
+            stream_callback = self._draft_stream_callback(processing)
+            if stream_callback:
+                outcome = build_message_draft_outcome(
+                    text,
+                    self.runtime.draft_store,
+                    stream_callback=stream_callback,
+                )
+            else:
+                outcome = build_message_draft_outcome(text, self.runtime.draft_store)
+            draft = outcome.draft
         except Exception as e:
             self._stop_draft_processing(processing)
             logger.error(f"配置草案生成失败: {e}", exc_info=True)
@@ -338,6 +384,10 @@ class FeishuInteractiveBot:
             return
         self._stop_draft_processing(processing)
         if not draft:
+            if isinstance(outcome, DraftBuildOutcome) and outcome.status == "noop":
+                message = outcome.message or "当前配置已经覆盖这项需求，无需重复修改。"
+                self._finish_draft_processing_noop(processing, message, reply_to_message_id)
+                return
             self._finish_draft_processing_failure(
                 processing,
                 "草案生成失败：没能理解这次偏好/库存修改。",
@@ -355,7 +405,17 @@ class FeishuInteractiveBot:
     ) -> None:
         processing = self._start_draft_processing(reply_to_message_id, "正在根据修改意见生成新预览")
         try:
-            revised = build_revision_draft(text, original_draft, self.runtime.draft_store)
+            stream_callback = self._draft_stream_callback(processing)
+            if stream_callback:
+                outcome = build_revision_draft_outcome(
+                    text,
+                    original_draft,
+                    self.runtime.draft_store,
+                    stream_callback=stream_callback,
+                )
+            else:
+                outcome = build_revision_draft_outcome(text, original_draft, self.runtime.draft_store)
+            revised = outcome.draft
         except Exception as e:
             self._stop_draft_processing(processing)
             logger.error(f"配置草案修订失败: {e}", exc_info=True)
@@ -368,6 +428,10 @@ class FeishuInteractiveBot:
             return
         self._stop_draft_processing(processing)
         if not revised:
+            if outcome.status == "noop":
+                message = outcome.message or "当前草案已经符合修改意见，无需生成新预览。"
+                self._finish_draft_processing_noop(processing, message, reply_to_message_id)
+                return
             self._finish_draft_processing_failure(
                 processing,
                 "没能理解修改意见。",
@@ -380,7 +444,7 @@ class FeishuInteractiveBot:
             reply_to_message_id,
             processing,
         ):
-            self.runtime.draft_store.cancel(original_draft.draft_id)
+            self.runtime.draft_store.cancel(original_draft.draft_id, reason="superseded_by_revision")
             if original_draft.preview_message_id:
                 disable_draft_card(original_draft.preview_message_id, "已生成新的修改预览", original_draft)
             return
@@ -403,7 +467,7 @@ class FeishuInteractiveBot:
         elif not preview_sent and processing.streaming:
             preview_sent = self._finish_streaming_preview(draft, processing)
         if not preview_sent:
-            self.runtime.draft_store.cancel(draft.draft_id)
+            self.runtime.draft_store.cancel(draft.draft_id, reason="preview_send_failed")
             return False
         if draft.preview_message_id:
             self.runtime.draft_store.update(draft)
@@ -457,10 +521,12 @@ class FeishuInteractiveBot:
                 message_id=message_id,
                 card_id=card_id,
                 stop_event=threading.Event(),
+                stage=stage,
+                wake_event=threading.Event(),
             )
             progress.thread = threading.Thread(
                 target=self._run_draft_processing_progress,
-                args=(progress, stage, time.monotonic()),
+                args=(progress,),
                 name="feishu-draft-progress-worker",
                 daemon=True,
             )
@@ -475,25 +541,95 @@ class FeishuInteractiveBot:
     def _run_draft_processing_progress(
         self,
         processing: DraftProgressCard,
-        stage: str,
-        started_at: float,
     ) -> None:
-        """在草案生成结束前追加流式阶段文本。"""
+        """合并模型增量并按固定频率刷新 CardKit 文本。"""
         stop_event = processing.stop_event
-        if stop_event is None or not processing.streaming:
+        wake_event = processing.wake_event
+        if stop_event is None or wake_event is None or not processing.streaming:
             return
-        lines = [stage, "请求已提交，正在等待模型生成预览"]
-        self._update_streaming_progress(processing, "\n\n".join(lines))
-        for threshold in (15, 30, 60, 120, 300):
-            remaining = max(0.0, threshold - (time.monotonic() - started_at))
-            if stop_event.wait(remaining):
+        last_content = ""
+        last_updated_at = 0.0
+        while True:
+            wake_event.wait()
+            wake_event.clear()
+            stopping = stop_event.is_set()
+            if not stopping and last_updated_at:
+                remaining = DRAFT_STREAMING_UPDATE_INTERVAL_SECONDS - (time.monotonic() - last_updated_at)
+                if remaining > 0 and stop_event.wait(remaining):
+                    stopping = True
+            content = self._render_draft_stream_content(processing)
+            if content and content != last_content:
+                self._update_streaming_progress(processing, content, allow_stopped=stopping)
+                last_content = content
+                last_updated_at = time.monotonic()
+            if stopping:
                 return
-            lines.append(f"已等待 {threshold} 秒，模型仍在生成预览")
-            self._update_streaming_progress(processing, "\n\n".join(lines))
 
-    def _update_streaming_progress(self, processing: DraftProgressCard, content: str) -> bool:
+    def _draft_stream_callback(self, processing: DraftProgressCard) -> Callable[[DraftStreamEvent], None] | None:
+        if not processing.streaming:
+            return None
+
+        def callback(event: DraftStreamEvent) -> None:
+            self._record_draft_stream_event(processing, event)
+
+        return callback
+
+    def _record_draft_stream_event(self, processing: DraftProgressCard, event: DraftStreamEvent) -> None:
+        stop_event = processing.stop_event
+        wake_event = processing.wake_event
+        if stop_event is None or wake_event is None or stop_event.is_set():
+            return
+        with processing.buffer_lock:
+            if event.kind == "attempt_start":
+                processing.attempt_status = event.text
+                processing.reasoning_text = ""
+                processing.content_text = ""
+                processing.reasoning_seen = False
+                processing.reasoning_truncated = False
+                processing.content_truncated = False
+            elif event.kind == "reasoning_delta":
+                processing.reasoning_seen = True
+                processing.content_text = ""
+                processing.content_truncated = False
+                processing.reasoning_text, truncated = _append_draft_stream_text(
+                    processing.reasoning_text,
+                    event.text,
+                )
+                processing.reasoning_truncated = processing.reasoning_truncated or truncated
+            elif event.kind == "content_delta" and not processing.reasoning_seen:
+                processing.content_text, truncated = _append_draft_stream_text(
+                    processing.content_text,
+                    event.text,
+                )
+                processing.content_truncated = processing.content_truncated or truncated
+        wake_event.set()
+
+    def _render_draft_stream_content(self, processing: DraftProgressCard) -> str:
+        with processing.buffer_lock:
+            lines = [processing.stage]
+            if processing.attempt_status:
+                lines.append(processing.attempt_status)
+            if processing.reasoning_seen and processing.reasoning_text:
+                text = processing.reasoning_text
+                if processing.reasoning_truncated:
+                    text = DRAFT_STREAMING_OMITTED_TEXT + text
+                lines.extend(["**模型思考**", text])
+            elif processing.content_text:
+                text = processing.content_text
+                if processing.content_truncated:
+                    text = DRAFT_STREAMING_OMITTED_TEXT + text
+                lines.extend(["**模型原始输出**", text])
+            return "\n\n".join(line for line in lines if line)
+
+    def _update_streaming_progress(
+        self,
+        processing: DraftProgressCard,
+        content: str,
+        *,
+        allow_stopped: bool = False,
+    ) -> bool:
         with processing.lock:
-            if processing.stop_event and processing.stop_event.is_set():
+            if not allow_stopped and processing.stop_event and processing.stop_event.is_set():
                 return False
             processing.sequence += 1
             return update_streaming_draft_content(processing.card_id, content, processing.sequence)
@@ -542,6 +678,8 @@ class FeishuInteractiveBot:
         """停止流式刷新线程；普通静态进度卡无需停止。"""
         if processing.stop_event:
             processing.stop_event.set()
+        if processing.wake_event:
+            processing.wake_event.set()
         if processing.thread:
             processing.thread.join(timeout=1)
 
@@ -552,24 +690,51 @@ class FeishuInteractiveBot:
         reply_to_message_id: str,
         fallback_text: str,
     ) -> None:
+        self._finish_draft_processing_with_card(
+            processing,
+            build_draft_failure_card(card_reason),
+            reply_to_message_id,
+            fallback_text,
+        )
+
+    def _finish_draft_processing_noop(
+        self,
+        processing: DraftProgressCard,
+        message: str,
+        reply_to_message_id: str,
+    ) -> None:
+        self._finish_draft_processing_with_card(
+            processing,
+            build_draft_noop_card(message),
+            reply_to_message_id,
+            message,
+        )
+
+    def _finish_draft_processing_with_card(
+        self,
+        processing: DraftProgressCard,
+        card: dict,
+        reply_to_message_id: str,
+        fallback_text: str,
+    ) -> None:
+        """将草案进度卡收尾为最终卡片，必要时回退为新消息或文本。"""
         if processing.message_id:
-            failure_card = build_draft_failure_card(card_reason)
             if processing.streaming:
                 finish_result = self._finish_streaming_card(
                     processing,
-                    failure_card,
+                    card,
                     lock_timeout=DRAFT_STREAMING_FINALIZE_LOCK_TIMEOUT_SECONDS,
                 )
                 if finish_result is True:
                     return
-                if reply_to_message_id and reply_card(reply_to_message_id, failure_card):
-                    self._schedule_streaming_cleanup(processing, failure_card)
+                if reply_to_message_id and reply_card(reply_to_message_id, card):
+                    self._schedule_streaming_cleanup(processing, card)
                     return
-                if self._finish_streaming_card(processing, failure_card) is True:
+                if self._finish_streaming_card(processing, card) is True:
                     return
-            if not processing.streaming and update_card_message(processing.message_id, failure_card):
+            if not processing.streaming and update_card_message(processing.message_id, card):
                 return
-            if reply_to_message_id and reply_card(reply_to_message_id, failure_card):
+            if reply_to_message_id and reply_card(reply_to_message_id, card):
                 return
         self._reply_text(reply_to_message_id, fallback_text)
 
@@ -638,13 +803,23 @@ class FeishuInteractiveBot:
             value = extract_card_action_value(data)
             action = str(value.get("action") or "")
             operator = _extract_operator(data)
-            card_token = str(getattr(getattr(data.event, "action", None), "token", "") or "")
-            logger.info(f"收到飞书卡片操作: action={action}, operator={operator}, card_token={card_token}")
+            card_event_id = _card_event_id(data)
+            logger.info(
+                f"收到飞书卡片操作: action={action}, operator={operator}, "
+                f"event_id={_mask_card_event_id(card_event_id)}"
+            )
             if not action:
                 return self._handle_card_form_callback(value, operator, reply_to_message_id)
             if not self.runtime.binding_store.is_bound_operator(operator):
                 message = "只有当前绑定用户可以操作卡片"
                 self._reply_text(reply_to_message_id, message)
+                return _card_response(message)
+            if card_event_id and not self.card_action_deduper.claim(card_event_id):
+                message = "操作已处理，请勿重复提交"
+                logger.info(
+                    f"忽略重复飞书卡片操作: action={action}, "
+                    f"event_id={_mask_card_event_id(card_event_id)}"
+                )
                 return _card_response(message)
             if action == "model_refresh":
                 self._forget_model_card_form_state(reply_to_message_id, operator)
@@ -718,14 +893,151 @@ class FeishuInteractiveBot:
     ) -> CardActionDispatchResult:
         draft_id = str(value.get("draft_id") or "")
         draft = self.runtime.draft_store.get(draft_id)
-        ok, message = self.runtime.draft_store.apply(draft_id, operator=operator)
-        if not ok and _is_stale_draft(draft):
+        outcome = self.runtime.draft_store.apply(draft_id, operator=operator)
+        if outcome.status == "needs_refresh" and draft:
+            if not self._claim_draft_refresh(draft_id):
+                message = "当前配置与预览存在冲突，正在刷新预览，请稍候。"
+                return CardActionDispatchResult(message)
+            message = "当前配置与预览存在冲突，正在刷新预览。"
+            self._reply_text(reply_to_message_id, "🔄 " + message)
+            self._start_draft_refresh_worker(draft, operator, reply_to_message_id)
+            return CardActionDispatchResult(message)
+
+        if outcome.ok:
+            self._reply_text(reply_to_message_id, "✅ " + outcome.message)
+            return CardActionDispatchResult(
+                outcome.message,
+                _build_disabled_card_for_action("已确认应用", outcome.draft or draft, value),
+            )
+
+        message = outcome.message
+        if outcome.status in {"missing", "expired"} or _is_stale_draft(draft):
             message = "该预览已失效，请发新消息重新生成。"
-        self._reply_text(reply_to_message_id, ("✅ " if ok else "⚠️ ") + message)
-        if ok or _is_stale_draft(draft):
-            reason = "已确认应用" if ok else "预览已失效"
-            return CardActionDispatchResult(message, _build_disabled_card_for_action(reason, draft, value))
+        self._reply_text(reply_to_message_id, "⚠️ " + message)
+        if outcome.status in {"missing", "expired", "rejected"} or _is_stale_draft(draft):
+            return CardActionDispatchResult(
+                message,
+                _build_disabled_card_for_action("预览已失效", outcome.draft or draft, value),
+            )
         return CardActionDispatchResult(message)
+
+    def _claim_draft_refresh(self, draft_id: str) -> bool:
+        with self._draft_refresh_lock:
+            if draft_id in self._draft_refreshing:
+                return False
+            self._draft_refreshing.add(draft_id)
+            return True
+
+    def _release_draft_refresh(self, draft_id: str) -> None:
+        with self._draft_refresh_lock:
+            self._draft_refreshing.discard(draft_id)
+
+    def _start_draft_refresh_worker(
+        self,
+        draft: ConfigDraft,
+        operator: str,
+        reply_to_message_id: str,
+    ) -> None:
+        try:
+            thread = threading.Thread(
+                target=self._run_draft_refresh,
+                args=(draft, operator, reply_to_message_id),
+                name="preference-draft-refresh-worker",
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            self._release_draft_refresh(draft.draft_id)
+            raise
+
+    def _run_draft_refresh(
+        self,
+        original: ConfigDraft,
+        operator: str,
+        reply_to_message_id: str,
+    ) -> None:
+        new_draft: ConfigDraft | None = None
+        try:
+            outcome = build_rebase_draft_outcome(original, self.runtime.draft_store)
+            new_draft = outcome.draft
+
+            current = self.runtime.draft_store.get(original.draft_id)
+            if not current or current.status != "pending":
+                if new_draft:
+                    self.runtime.draft_store.cancel(
+                        new_draft.draft_id,
+                        operator="system",
+                        reason="original_draft_not_pending",
+                    )
+                return
+
+            if outcome.status == "noop":
+                reason = outcome.message or "当前配置已覆盖原修改意图"
+                if not original.preview_message_id or not disable_draft_card(
+                    original.preview_message_id,
+                    f"当前配置已覆盖：{reason}",
+                    original,
+                ):
+                    self._reply_text(reply_to_message_id, "⚠️ 预览刷新失败，原草案仍可重试。")
+                    return
+                self.runtime.draft_store.cancel(
+                    original.draft_id,
+                    operator=operator,
+                    reason="already_covered_after_rebase",
+                )
+                self._reply_text(reply_to_message_id, f"ℹ️ 当前配置已覆盖：{reason}")
+                return
+
+            if not new_draft:
+                self._reply_text(
+                    reply_to_message_id,
+                    f"⚠️ 预览刷新失败，原草案仍可重试：{outcome.message or '模型未生成有效草案'}",
+                )
+                return
+
+            if not original.preview_message_id or not update_rebased_draft_preview(
+                original.preview_message_id,
+                new_draft,
+            ):
+                self.runtime.draft_store.cancel(
+                    new_draft.draft_id,
+                    operator="system",
+                    reason="preview_update_failed",
+                )
+                self._reply_text(reply_to_message_id, "⚠️ 预览刷新失败，原草案仍可重试。")
+                return
+
+            # 用户可能在 LLM 生成或卡片更新期间取消旧草案。更新后再检查一次，
+            # 确保这种竞态不会留下一个用户没有确认过的新 pending 草案。
+            current = self.runtime.draft_store.get(original.draft_id)
+            if not current or current.status != "pending":
+                self.runtime.draft_store.cancel(
+                    new_draft.draft_id,
+                    operator="system",
+                    reason="original_draft_not_pending",
+                )
+                if original.preview_message_id:
+                    disable_draft_card(original.preview_message_id, "原草案已取消，刷新结果已丢弃", original)
+                return
+
+            self.runtime.draft_store.update(new_draft)
+            self.runtime.draft_store.cancel(
+                original.draft_id,
+                operator=operator,
+                reason="superseded_by_rebase",
+            )
+            self._reply_text(reply_to_message_id, "✅ 预览已刷新，请检查后再次点击采纳。")
+        except Exception as e:
+            logger.error(f"配置草案冲突刷新失败: {e}", exc_info=True)
+            if new_draft and new_draft.status == "pending":
+                self.runtime.draft_store.cancel(
+                    new_draft.draft_id,
+                    operator="system",
+                    reason="rebase_failed",
+                )
+            self._reply_text(reply_to_message_id, "⚠️ 预览刷新失败，原草案仍可重试。")
+        finally:
+            self._release_draft_refresh(original.draft_id)
 
     def _cancel_draft_card_action(
         self,
@@ -736,7 +1048,7 @@ class FeishuInteractiveBot:
         draft_id = str(value.get("draft_id") or "")
         draft = self.runtime.draft_store.get(draft_id)
         if draft and draft.status == "pending":
-            draft = self.runtime.draft_store.cancel(draft_id, operator=operator)
+            draft = self.runtime.draft_store.cancel(draft_id, operator=operator, reason="user_cancelled")
             message = "已取消草案"
             reason = "已取消"
         else:
@@ -754,7 +1066,7 @@ class FeishuInteractiveBot:
         draft_id = str(value.get("draft_id") or "")
         draft = self.runtime.draft_store.get(draft_id) if draft_id else None
         if draft and draft.status == "pending":
-            self.runtime.draft_store.cancel(draft_id, operator=operator)
+            self.runtime.draft_store.cancel(draft_id, operator=operator, reason="user_cancelled")
             message = "已忽略本次仲裁建议"
             reason = "已忽略"
         else:
@@ -896,10 +1208,24 @@ class FeishuInteractiveBot:
         try:
             processing = self._start_draft_processing(reply_to_message_id, "正在生成商品快捷操作预览")
             try:
-                draft = build_deal_action_draft(action, value, self.runtime.draft_store)
+                stream_callback = self._draft_stream_callback(processing)
+                if stream_callback:
+                    outcome = build_deal_action_draft_outcome(
+                        action,
+                        value,
+                        self.runtime.draft_store,
+                        stream_callback=stream_callback,
+                    )
+                else:
+                    outcome = build_deal_action_draft_outcome(action, value, self.runtime.draft_store)
+                draft = outcome.draft
             finally:
                 self._stop_draft_processing(processing)
             if not draft:
+                if outcome.status == "noop":
+                    message = outcome.message or "当前配置已经覆盖该快捷操作，无需修改。"
+                    self._finish_draft_processing_noop(processing, message, reply_to_message_id)
+                    return
                 self._finish_draft_processing_failure(
                     processing,
                     "无法生成配置修改预览。",
@@ -1176,6 +1502,23 @@ def _card_open_message_id(data) -> str:
     if not isinstance(context, (str, int)):
         return ""
     return str(context or "")
+
+
+def _card_event_id(data) -> str:
+    event_id = getattr(getattr(data, "header", None), "event_id", "")
+    if isinstance(event_id, str) and event_id.strip():
+        return event_id.strip()
+    legacy_uuid = getattr(data, "uuid", "")
+    return legacy_uuid.strip() if isinstance(legacy_uuid, str) else ""
+
+
+def _mask_card_event_id(event_id: str) -> str:
+    """只为日志保留事件 ID 的有限首尾信息。"""
+    if len(event_id) < 2:
+        return "*" * len(event_id)
+    if len(event_id) <= 8:
+        return f"{event_id[:1]}******{event_id[-1:]}"
+    return f"{event_id[:4]}******{event_id[-4:]}"
 
 
 def _extract_sender_open_id(data) -> str:

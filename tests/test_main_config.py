@@ -15,7 +15,7 @@ from smzdm_notice.core.calibration import MemoryAnalysis
 from smzdm_notice.core.memory import DealMemoryStore
 from smzdm_notice.feishu.notifier import DealSendResult
 from smzdm_notice.llm.models import ArbiterInfo, FilterDiagnostics, FilterItemsResult, FilterResult
-from smzdm_notice.preferences.models import ConfigDraft
+from smzdm_notice.preferences.models import ConfigDraft, DraftBuildOutcome
 from smzdm_notice.preferences.store import DraftStore
 from smzdm_notice.smzdm.ranking import RankingItem
 
@@ -266,7 +266,10 @@ class MainMemoryRuleDraftTests(unittest.TestCase):
                 return True
 
             with (
-                patch("smzdm_notice.preferences.builder.build_message_draft", return_value=draft),
+                patch(
+                    "smzdm_notice.runtime.build_memory_rule_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=draft),
+                ),
                 patch("smzdm_notice.feishu.notifier.send_draft_preview", side_effect=send_preview),
             ):
                 main._suggest_memory_rule(
@@ -286,7 +289,10 @@ class MainMemoryRuleDraftTests(unittest.TestCase):
             draft = main._draft_store.create(self._new_memory_rule_draft())
 
             with (
-                patch("smzdm_notice.preferences.builder.build_message_draft", return_value=draft),
+                patch(
+                    "smzdm_notice.runtime.build_memory_rule_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=draft),
+                ),
                 patch("smzdm_notice.feishu.notifier.send_draft_preview", return_value=False),
                 patch("smzdm_notice.runtime.logger.warning") as warning,
             ):
@@ -296,9 +302,32 @@ class MainMemoryRuleDraftTests(unittest.TestCase):
                 )
 
             reloaded_store = self._new_draft_store(root)
-            self.assertEqual(reloaded_store.get(draft.draft_id).preview_message_id, "")
+            stored = reloaded_store.get(draft.draft_id)
+            self.assertEqual(stored.preview_message_id, "")
+            self.assertEqual(stored.status, "cancelled")
+            self.assertEqual(stored.metadata["cancel_reason"], "preview_send_failed")
             self.assertIsNone(reloaded_store.get_any_by_preview_message_id("om_memory_rule"))
             warning.assert_called_once()
+
+    def test_memory_rule_noop_is_success_without_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main._draft_store = self._new_draft_store(root)
+
+            with (
+                patch(
+                    "smzdm_notice.runtime.build_memory_rule_draft_outcome",
+                    return_value=DraftBuildOutcome("noop", message="现有偏好已经覆盖"),
+                ),
+                patch("smzdm_notice.feishu.notifier.send_draft_preview") as send_preview,
+            ):
+                handled = main._suggest_memory_rule(
+                    {"rule": "咖啡器具可优先推荐", "reason": "好价 5，不值 0"},
+                    "咖啡器具反馈稳定",
+                )
+
+            self.assertTrue(handled)
+            send_preview.assert_not_called()
 
 
 class MainConfigParsingTests(unittest.TestCase):
@@ -370,6 +399,17 @@ class MainConfigSummaryTests(unittest.TestCase):
         summary = self._summary_with_prefilter(PREFILTER_ENABLED=False)
 
         self.assertIn("预筛选: 未启用", summary)
+
+    def test_config_summary_separates_llm_route_from_monitor_list(self) -> None:
+        summary = self._summary_with_prefilter()
+
+        self.assertIn(f"- 🔢 每榜 Top: {main.config.TOP_N}\n\n**LLM 路由**", summary)
+
+    def test_config_summary_hides_preference_content(self) -> None:
+        summary = self._summary_with_prefilter()
+
+        self.assertIn("- 🎯 用户偏好: 已加载", summary)
+        self.assertNotIn("偏好正文", summary)
 
     def test_config_summary_shows_regular_prefilter_thresholds(self) -> None:
         summary = self._summary_with_prefilter(
@@ -548,7 +588,7 @@ class MainArbitrationDraftTests(unittest.TestCase):
     def tearDown(self) -> None:
         main._draft_store = None
 
-    def test_poll_stores_arbitration_draft_before_sending_card(self) -> None:
+    def test_poll_stores_new_schema_arbitration_draft_before_sending_card(self) -> None:
         item = _item()
         info = ArbiterInfo(
             chosen="B",
@@ -558,12 +598,8 @@ class MainArbitrationDraftTests(unittest.TestCase):
             result_a=FilterResult(),
             result_b=FilterResult(),
             items={},
-            config_change_draft={
-                "target_file": "preference.md",
-                "title": "限制黑名单扩展",
-                "summary": "避免误判",
-                "append_text": "- 黑名单只按字面精确匹配。",
-            },
+            change_assessment={"cause": "preference_gap", "should_change_preference": True},
+            preference_change={"rule": "黑名单只按字面精确匹配", "reason": "避免误伤"},
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -572,6 +608,16 @@ class MainArbitrationDraftTests(unittest.TestCase):
                 backup_dir=root / "backups",
                 audit_file=root / "audit.jsonl",
                 root=root,
+            )
+            draft = main._draft_store.create(
+                ConfigDraft(
+                    "arbiter-draft",
+                    "preference.md",
+                    "限制黑名单扩展",
+                    "避免误判",
+                    "- 黑名单只按字面精确匹配。",
+                    "仲裁建议一键采纳",
+                )
             )
             dedup = MagicMock()
             dedup.is_new.return_value = True
@@ -585,8 +631,16 @@ class MainArbitrationDraftTests(unittest.TestCase):
                 stack.enter_context(patch("smzdm_notice.runtime._maybe_send_daily_digest"))
                 stack.enter_context(patch("smzdm_notice.runtime._check_heartbeat"))
 
-                def send_arbitration_side_effect(_info, draft):
-                    draft.preview_message_id = "om_arbiter"
+                stack.enter_context(
+                    patch(
+                        "smzdm_notice.runtime.build_arbitration_candidate_draft_outcome",
+                        return_value=DraftBuildOutcome("draft", draft=draft),
+                    )
+                )
+
+                def send_arbitration_side_effect(_info, sent_draft, draft_outcome=None):
+                    self.assertEqual(draft_outcome.status, "draft")
+                    sent_draft.preview_message_id = "om_arbiter"
                     return True
 
                 send_arbitration = stack.enter_context(
@@ -601,6 +655,38 @@ class MainArbitrationDraftTests(unittest.TestCase):
         self.assertEqual(sent_draft.target_file, "preference.md")
         self.assertIn("字面精确匹配", sent_draft.append_text)
         self.assertEqual(main._draft_store.get(sent_draft.draft_id).preview_message_id, "om_arbiter")
+
+    def test_arbitration_preview_failure_cancels_generated_draft(self) -> None:
+        info = ArbiterInfo(
+            chosen="B",
+            reason="B 更准确",
+            analysis="缺少一条长期偏好。",
+            suggestion="补充长期偏好。",
+            result_a=FilterResult(),
+            result_b=FilterResult(),
+            items={},
+            change_assessment={"cause": "preference_gap", "should_change_preference": True},
+            preference_change={"rule": "黑名单只精确匹配", "reason": "避免误伤"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main._draft_store = DraftStore(root / "drafts.json", root / "backups", root / "audit.jsonl", root=root)
+            draft = main._draft_store.create(
+                ConfigDraft("arbiter-failed", "preference.md", "t", "s", "- 黑名单只精确匹配", "test")
+            )
+
+            with (
+                patch(
+                    "smzdm_notice.runtime.build_arbitration_candidate_draft_outcome",
+                    return_value=DraftBuildOutcome("draft", draft=draft),
+                ),
+                patch("smzdm_notice.runtime.send_arbitration", return_value=False),
+            ):
+                main._handle_arbitration(info)
+
+            stored = main._draft_store.get(draft.draft_id)
+            self.assertEqual(stored.status, "cancelled")
+            self.assertEqual(stored.metadata["cancel_reason"], "preview_send_failed")
 
     def test_maintain_config_drafts_expires_and_compacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -946,11 +1032,56 @@ class MainPollFailureTests(unittest.TestCase):
                 "smzdm_notice.runtime._run_poll_pipeline_unlocked",
                 return_value=main.PollOutcome.failure("llm_failed", "429"),
             ),
+            patch("smzdm_notice.runtime._maybe_send_daily_digest"),
         ):
             main._poll_once(MagicMock(), MagicMock())
 
         tracker.record.assert_called_once()
         self.assertEqual(tracker.record.call_args.args[0].reason, "llm_failed")
+
+    def test_poll_once_runs_daily_maintenance_for_every_returned_outcome(self) -> None:
+        outcomes = [
+            main.PollOutcome.success(),
+            main.PollOutcome.failure("ranking_fetch_failed", "network"),
+            main.PollOutcome.failure("llm_failed", "429"),
+        ]
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                near_miss_mgr = MagicMock()
+                with (
+                    patch("smzdm_notice.runtime.llm_routing.get_snapshot", return_value=object()),
+                    patch("smzdm_notice.runtime._run_poll_pipeline_unlocked", return_value=outcome),
+                    patch("smzdm_notice.runtime._maybe_send_daily_digest") as daily_maintenance,
+                ):
+                    main._poll_once(MagicMock(), near_miss_mgr)
+
+                daily_maintenance.assert_called_once_with(near_miss_mgr)
+
+    def test_poll_once_skips_daily_maintenance_while_stopping(self) -> None:
+        main._stop_event.set()
+        with (
+            patch("smzdm_notice.runtime.llm_routing.get_snapshot", return_value=object()),
+            patch("smzdm_notice.runtime._run_poll_pipeline_unlocked", return_value=main.PollOutcome.skipped("stopped")),
+            patch("smzdm_notice.runtime._maybe_send_daily_digest") as daily_maintenance,
+        ):
+            main._poll_once(MagicMock(), MagicMock())
+
+        daily_maintenance.assert_not_called()
+
+    def test_poll_once_isolates_daily_maintenance_failure(self) -> None:
+        tracker = MagicMock()
+        main._poll_failure_tracker = tracker
+        with (
+            patch("smzdm_notice.runtime.llm_routing.get_snapshot", return_value=object()),
+            patch("smzdm_notice.runtime._run_poll_pipeline_unlocked", return_value=main.PollOutcome.success()),
+            patch("smzdm_notice.runtime._maybe_send_daily_digest", side_effect=RuntimeError("digest failed")),
+            patch("smzdm_notice.runtime.logger.error") as log_error,
+        ):
+            main._poll_once(MagicMock(), MagicMock())
+
+        tracker.record.assert_called_once()
+        self.assertGreater(main._last_poll_finished_at, 0)
+        self.assertIn("digest failed", log_error.call_args.args[0])
 
 
 if __name__ == "__main__":

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
-import re
+import os
 import shutil
+import tempfile
 import threading
 import time
+from contextlib import suppress
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -14,40 +16,17 @@ from pathlib import Path
 from loguru import logger
 
 from smzdm_notice.core import config
-from smzdm_notice.preferences.models import ALLOWED_TARGETS, TERMINAL_DRAFT_RETENTION_SECONDS, ConfigDraft
+from smzdm_notice.preferences.models import (
+    ALLOWED_TARGETS,
+    TERMINAL_DRAFT_RETENTION_SECONDS,
+    ConfigDraft,
+    DraftApplyOutcome,
+)
+from smzdm_notice.preferences.validation import content_hash, validate_draft_data
 
 # 草案状态、配置文件写入和审计日志需要同一把锁保护，避免飞书按钮、
 # 消息回复和轮询清理并发时出现“状态已变但文件未写”的交错。
 CONFIG_FILE_LOCK = threading.RLock()
-
-
-def _collapse_blank_lines(text: str) -> str:
-    return re.sub(r"\n{4,}", "\n\n\n", text)
-
-
-def _expand_search_context(original: str, search: str) -> str | None:
-    """把短 search_text 扩展到相邻行，帮助唯一定位 replace/delete 目标。"""
-    idx = original.find(search)
-    if idx < 0:
-        return None
-    lines = original.splitlines(keepends=True)
-    char_pos = 0
-    start_line = 0
-    for i, line in enumerate(lines):
-        if char_pos + len(line) > idx:
-            start_line = i
-            break
-        char_pos += len(line)
-    end_line = start_line
-    char_pos = 0
-    for i, line in enumerate(lines):
-        if char_pos + len(line) >= idx + len(search):
-            end_line = i
-            break
-        char_pos += len(line)
-    ctx_start = max(0, start_line - 1)
-    ctx_end = min(len(lines), end_line + 2)
-    return "".join(lines[ctx_start:ctx_end])
 
 
 class DraftStore:
@@ -80,11 +59,18 @@ class DraftStore:
         try:
             data = json.loads(self.draft_file.read_text(encoding="utf-8"))
             self._drafts = {
-                draft_id: ConfigDraft(**draft) for draft_id, draft in data.items() if isinstance(draft, dict)
+                draft_id: self._load_draft(draft) for draft_id, draft in data.items() if isinstance(draft, dict)
             }
         except (OSError, TypeError, json.JSONDecodeError) as e:
             logger.warning(f"草案文件读取失败，将重新创建: {e}")
             self._drafts = {}
+
+    @staticmethod
+    def _load_draft(data: dict) -> ConfigDraft:
+        """读取草案时丢弃已废弃的整文件版本字段。"""
+        normalized = dict(data)
+        normalized.pop("base_content_hash", None)
+        return ConfigDraft(**normalized)
 
     def _save(self) -> None:
         self.draft_file.parent.mkdir(parents=True, exist_ok=True)
@@ -127,15 +113,19 @@ class DraftStore:
 
     def expire_pending(self) -> list[ConfigDraft]:
         """取消所有过期的 pending 草案，返回被清理的列表。"""
-        # 这里只改变草案状态；调用方拿到返回列表后负责禁用对应飞书卡片。
+        # 调用方拿到返回列表后负责禁用对应飞书卡片；取消原因和审计由存储层
+        # 同步落盘，避免定时清理与用户点击应用产生不同的历史语义。
         expired = []
         with self._lock:
             for draft in self._drafts.values():
                 if draft.status == "pending" and draft.is_expired:
                     draft.status = "cancelled"
+                    draft.metadata["cancel_reason"] = "expired"
                     expired.append(draft)
             if expired:
                 self._save()
+                for draft in expired:
+                    self._append_audit(draft, "cancelled", "system")
         return expired
 
     def compact(self, retention_seconds: int = TERMINAL_DRAFT_RETENTION_SECONDS) -> list[ConfigDraft]:
@@ -153,113 +143,173 @@ class DraftStore:
                 self._save()
         return removed
 
-    def cancel(self, draft_id: str, operator: str = "") -> ConfigDraft | None:
+    def cancel(self, draft_id: str, operator: str = "", *, reason: str) -> ConfigDraft | None:
         with self._lock:
             draft = self._drafts.get(draft_id)
             if not draft:
                 return None
             draft.status = "cancelled"
+            draft.metadata["cancel_reason"] = reason
             self._save()
             self._append_audit(draft, "cancelled", operator)
             return draft
 
-    def apply(self, draft_id: str, operator: str = "") -> tuple[bool, str]:
+    def apply(self, draft_id: str, operator: str = "") -> DraftApplyOutcome:
         with self._lock:
-            draft, early_result = self._prepare_draft_for_apply(draft_id)
+            draft, early_result = self._prepare_draft_for_apply(draft_id, operator=operator)
             if early_result is not None:
                 return early_result
             assert draft is not None
 
+            schema_error = self._draft_schema_error(draft)
+            if schema_error:
+                return self._reject_draft(draft, operator=operator, reason="invalid_schema", message=schema_error)
+            if self.is_legacy_arbitration_draft(draft):
+                return self._reject_draft(
+                    draft,
+                    operator=operator,
+                    reason="legacy_arbitration_protocol",
+                    message="旧版仲裁草案缺少差异归因，只允许查看历史状态，不能执行",
+                )
+
             target_path = self._target_path(draft.target_file)
             if not target_path.exists():
-                return False, f"{draft.target_file} 不存在"
+                return self._reject_draft(
+                    draft,
+                    operator=operator,
+                    reason="target_missing",
+                    message=f"{draft.target_file} 不存在",
+                )
 
             original = target_path.read_text(encoding="utf-8")
+            if draft.edit_mode == "append" and self._contains_append_block(original, draft.append_text):
+                draft.status = "applied"
+                draft.metadata["apply_result"] = "content_already_present"
+                self._save()
+                return DraftApplyOutcome(
+                    status="already_applied",
+                    message=f"{draft.target_file} 已包含相同内容，未重复写入",
+                    draft=draft,
+                )
+            validation = validate_draft_data(
+                {
+                    "target_file": draft.target_file,
+                    "edit_mode": draft.edit_mode,
+                    "append_text": draft.append_text,
+                    "search_text": draft.search_text,
+                    "replace_text": draft.replace_text,
+                },
+                original,
+            )
+            if not validation.ok:
+                return DraftApplyOutcome(
+                    status="needs_refresh",
+                    message=validation.error,
+                    draft=draft,
+                )
+            new_content = validation.new_content
             backup_path = self._backup(target_path)
 
-            new_content, error = self._apply_edit(original, draft)
-            if error:
-                return False, error
-
-            target_path.write_text(new_content, encoding="utf-8")
+            self._atomic_write_text(target_path, new_content)
             draft.status = "applied"
             self._save()
-            self._append_audit(draft, "applied", operator, backup_path)
-            return True, f"已写入 {draft.target_file}，备份：{backup_path.name}"
+            self._append_audit(draft, "applied", operator, backup_path, original, new_content)
+            return DraftApplyOutcome(
+                status="applied",
+                message=f"已写入 {draft.target_file}，备份：{backup_path.name}",
+                draft=draft,
+            )
+
+    @staticmethod
+    def _contains_append_block(original: str, append_text: str) -> bool:
+        """按完整行匹配追加块，仅忽略候选块首尾的空行。"""
+        candidate_lines = append_text.splitlines()
+        while candidate_lines and not candidate_lines[0].strip():
+            candidate_lines.pop(0)
+        while candidate_lines and not candidate_lines[-1].strip():
+            candidate_lines.pop()
+        if not candidate_lines:
+            return False
+
+        original_lines = original.splitlines()
+        block_size = len(candidate_lines)
+        return any(
+            original_lines[index : index + block_size] == candidate_lines
+            for index in range(len(original_lines) - block_size + 1)
+        )
 
     def _prepare_draft_for_apply(
         self,
         draft_id: str,
-    ) -> tuple[ConfigDraft | None, tuple[bool, str] | None]:
+        *,
+        operator: str,
+    ) -> tuple[ConfigDraft | None, DraftApplyOutcome | None]:
         """在持锁状态下检查草案状态，并完成幂等状态更新。"""
         draft = self._drafts.get(draft_id)
         if not draft:
-            return None, (False, "草案不存在或已过期")
+            return None, DraftApplyOutcome(status="missing", message="草案不存在或已过期")
         if draft.status == "applied":
-            return draft, (True, "草案已应用过")
+            return draft, DraftApplyOutcome(status="already_applied", message="草案已应用过", draft=draft)
         if draft.status != "pending":
-            return draft, (False, f"草案状态不是 pending: {draft.status}")
+            return draft, DraftApplyOutcome(
+                status="rejected",
+                message=f"草案状态不是 pending: {draft.status}",
+                draft=draft,
+            )
         if draft.is_expired:
             draft.status = "cancelled"
+            draft.metadata["cancel_reason"] = "expired"
             self._save()
-            return draft, (False, "草案已超过 24 小时自动失效")
-        if self._is_signature_applied(draft.signature):
-            draft.status = "applied"
-            self._save()
-            return draft, (True, "相同修改已采纳过，已标记为完成")
+            self._append_audit(draft, "cancelled", operator)
+            return draft, DraftApplyOutcome(
+                status="expired",
+                message="草案已超过 24 小时自动失效",
+                draft=draft,
+            )
         return draft, None
 
-    def _apply_edit(self, original: str, draft: ConfigDraft) -> tuple[str, str | None]:
-        mode = draft.edit_mode or "append"
-        if mode == "append":
-            return self._apply_append(original, draft), None
-        if mode == "replace":
-            return self._apply_replace(original, draft)
-        if mode == "delete":
-            return self._apply_delete(original, draft)
-        return original, f"未知的 edit_mode: {mode}"
+    @staticmethod
+    def _draft_schema_error(draft: ConfigDraft) -> str:
+        if draft.target_file not in ALLOWED_TARGETS:
+            return "目标文件无效"
+        if draft.edit_mode not in {"append", "replace", "delete"}:
+            return f"未知 edit_mode: {draft.edit_mode}"
+        if draft.edit_mode == "append" and not draft.append_text.strip():
+            return "append_text 不能为空"
+        if draft.edit_mode in {"replace", "delete"} and not draft.search_text.strip():
+            return "search_text 不能为空"
+        return ""
 
-    def _apply_append(self, original: str, draft: ConfigDraft) -> str:
-        append_text = draft.append_text.strip()
-        if not append_text:
-            return original
-        if not original.strip():
-            return f"{append_text}\n"
-        return _collapse_blank_lines(f"{original.rstrip()}\n\n{append_text}\n")
+    @staticmethod
+    def is_legacy_arbitration_draft(draft: ConfigDraft) -> bool:
+        metadata = draft.metadata if isinstance(draft.metadata, dict) else {}
+        snapshot = metadata.get("arbitration_card")
+        is_arbitration = metadata.get("card_kind") == "arbitration" or isinstance(snapshot, dict)
+        if not is_arbitration:
+            return False
+        if not isinstance(snapshot, dict):
+            return True
+        assessment = snapshot.get("change_assessment")
+        return not (
+            isinstance(assessment, dict)
+            and isinstance(assessment.get("cause"), str)
+            and bool(assessment["cause"].strip())
+            and isinstance(assessment.get("should_change_preference"), bool)
+        )
 
-    def _apply_replace(self, original: str, draft: ConfigDraft) -> tuple[str, str | None]:
-        search = draft.search_text
-        if search not in original:
-            return original, f"在 {draft.target_file} 中未找到目标文本，请检查后重试"
-        count = original.count(search)
-        if count > 1:
-            # 模型有时会给出 1-3 行短 search_text。若短文本多处出现，
-            # 尝试带上相邻行后再唯一匹配；仍不唯一就拒绝，防止误改。
-            expanded = _expand_search_context(original, search)
-            if expanded and original.count(expanded) == 1:
-                new_content = original.replace(expanded, draft.replace_text, 1)
-                return new_content, None
-            return original, f"在 {draft.target_file} 中找到 {count} 处匹配，为安全起见请提供更精确的文本"
-        new_content = original.replace(search, draft.replace_text, 1)
-        return new_content, None
-
-    def _apply_delete(self, original: str, draft: ConfigDraft) -> tuple[str, str | None]:
-        search = draft.search_text
-        if search not in original:
-            return original, f"在 {draft.target_file} 中未找到目标文本，请检查后重试"
-        count = original.count(search)
-        if count > 1:
-            # 操作 delete 和 replace 使用同一套唯一定位策略，宁可让用户补充说明，
-            # 也不在多处匹配时猜测删除哪一段。
-            expanded = _expand_search_context(original, search)
-            if expanded and original.count(expanded) == 1:
-                new_content = original.replace(expanded, "", 1)
-                new_content = _collapse_blank_lines(new_content)
-                return new_content, None
-            return original, f"在 {draft.target_file} 中找到 {count} 处匹配，为安全起见请提供更精确的文本"
-        new_content = original.replace(search, "", 1)
-        new_content = _collapse_blank_lines(new_content)
-        return new_content, None
+    def _reject_draft(
+        self,
+        draft: ConfigDraft,
+        *,
+        operator: str,
+        reason: str,
+        message: str,
+    ) -> DraftApplyOutcome:
+        draft.status = "cancelled"
+        draft.metadata["cancel_reason"] = reason
+        self._save()
+        self._append_audit(draft, "cancelled", operator)
+        return DraftApplyOutcome(status="rejected", message=message, draft=draft)
 
     def _target_path(self, target_file: str) -> Path:
         if target_file not in ALLOWED_TARGETS:
@@ -273,12 +323,32 @@ class DraftStore:
         shutil.copy2(target_path, backup_path)
         return backup_path
 
+    @staticmethod
+    def _atomic_write_text(target_path: Path, content: str) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        original_mode = target_path.stat().st_mode if target_path.exists() else None
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{target_path.name}.", dir=target_path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if original_mode is not None:
+                os.chmod(tmp_name, original_mode)
+            os.replace(tmp_name, target_path)
+        except Exception:
+            with suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+
     def _append_audit(
         self,
         draft: ConfigDraft,
         action: str,
         operator: str,
         backup_path: Path | None = None,
+        original_content: str = "",
+        new_content: str = "",
     ) -> None:
         self.audit_file.parent.mkdir(parents=True, exist_ok=True)
         event = {
@@ -291,8 +361,11 @@ class DraftStore:
             "source": draft.source,
             "signature": draft.signature,
             "edit_mode": draft.edit_mode,
+            "append_text": draft.append_text,
             "search_text": draft.search_text,
             "replace_text": draft.replace_text,
+            "before_content_hash": content_hash(original_content) if original_content else "",
+            "after_content_hash": content_hash(new_content) if new_content else "",
             "backup": str(backup_path) if backup_path else "",
             "metadata": draft.metadata,
         }
@@ -301,16 +374,30 @@ class DraftStore:
         with self.audit_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
-    def _is_signature_applied(self, signature: str) -> bool:
-        if not self.audit_file.exists():
+    def has_recent_suggestion(
+        self,
+        suggestion_hash: str,
+        *,
+        cancelled_within_seconds: int = 30 * 86400,
+    ) -> bool:
+        """检查建议是否已采纳，或近期被用户明确取消。"""
+        if not suggestion_hash or not self.audit_file.exists():
             return False
+        now = datetime.now().timestamp()
         try:
-            for line in self.audit_file.read_text(encoding="utf-8").splitlines():
+            for line in reversed(self.audit_file.read_text(encoding="utf-8").splitlines()):
                 if not line.strip():
                     continue
                 event = json.loads(line)
-                if event.get("action") == "applied" and event.get("signature") == signature:
+                metadata = event.get("metadata") or {}
+                if metadata.get("suggestion_hash") != suggestion_hash:
+                    continue
+                if event.get("action") == "applied":
                     return True
-        except (OSError, json.JSONDecodeError):
+                if event.get("action") != "cancelled" or metadata.get("cancel_reason") != "user_cancelled":
+                    continue
+                event_time = datetime.fromisoformat(str(event.get("time"))).timestamp()
+                return now - event_time <= cancelled_within_seconds
+        except (OSError, ValueError, json.JSONDecodeError):
             return False
         return False
