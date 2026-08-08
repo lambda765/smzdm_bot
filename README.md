@@ -268,14 +268,16 @@ smzdm-notice setup
 
 1. 创建企业自建应用，添加「机器人」能力
 2. 复制 App ID 和 App Secret，填入 `.env`
-3. 申请权限：`im:message:send_as_bot`、`im:resource`、`im:message.reactions:write`、`cardkit:card:write`、私聊 `im:message.p2p_msg:readonly`、群聊 `im:message.group_at_msg:readonly`
+3. 申请权限：`im:message:send_as_bot`、`im:resource`、`im:message.reactions:write`、私聊 `im:message.p2p_msg:readonly`、群聊 `im:message.group_at_msg:readonly`；流式更新还必须开通 `cardkit:card:write`
 4. 事件与回调选择「使用长连接接收事件」，订阅 `im.message.receive_v1`
 5. 卡片回调开启「卡片回传交互」，SDK key 为 `card.action.trigger`
 6. 保存并发布应用
 
 启动后在飞书私聊或群聊 @机器人 发送 `/bind` 完成绑定。绑定前不会轮询。
 
-卡片使用 JSON 2.0，建议接收端使用飞书 7.20 或以上版本。`cardkit:card:write` 用于创建和更新配置草案的流式进度卡片；未授权或调用失败时会自动发送普通 2.0 卡片。
+卡片使用 JSON 2.0，建议接收端使用飞书 7.20 或以上版本。
+
+> **流式更新必需权限：** 在飞书开放平台的「权限管理」中开通「创建与更新卡片」（`cardkit:card:write`）。新增权限后需要重新发布应用版本，并确认租户管理员已完成授权，然后重启本服务。该权限用于创建 CardKit 卡片实体、实时更新模型输出并在完成后替换为可交互预览；未授权或 CardKit 调用失败时，机器人会自动回退到静态普通 2.0 卡片，不展示流式内容。
 
 ### 运行
 
