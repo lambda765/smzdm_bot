@@ -442,6 +442,11 @@ class NotifierBindingTests(unittest.TestCase):
         reason_inputs = [component for component in components if component.get("tag") == "input"]
         self.assertEqual(len(reason_inputs), 1)
         self.assertEqual(reason_inputs[0]["default_value"], "价格一般 非刚需")
+        self.assertEqual(
+            reason_inputs[0]["placeholder"]["content"],
+            "填写不值理由（可选）",
+        )
+        self.assertEqual(reason_inputs[0]["width"], "fill")
         self.assertEqual(_callback_value(reason_inputs[0])["article_id"], item.article_id)
         self.assertEqual(_callback_value(reason_inputs[0])["field"], notifier.NOT_WORTH_REASON_FIELD)
         self.assertTrue(
@@ -452,10 +457,42 @@ class NotifierBindingTests(unittest.TestCase):
             for component in components
             if _callback_value(component).get("action") == "deal_not_worth_reason"
         ]
-        self.assertEqual(save_buttons[0]["action_type"], "form_submit")
-        self.assertNotIn("form_action_type", save_buttons[0])
+        self.assertEqual(save_buttons[0]["form_action_type"], "submit")
+        self.assertEqual(save_buttons[0]["name"], save_buttons[0]["element_id"])
+        self.assertNotIn("action_type", save_buttons[0])
+        row_components = forms[0]["elements"]
+        self.assertEqual(
+            [component["tag"] for component in row_components],
+            ["button", "input", "button", "button"],
+        )
+        self.assertEqual(_callback_value(row_components[0])["action"], "deal_not_worth")
+        self.assertIs(row_components[1], reason_inputs[0])
+        self.assertEqual(_callback_value(row_components[2])["action"], "deal_not_worth_reason")
+        self.assertEqual(row_components[3]["text"]["content"], "查看详情")
         markdown = "\n".join(element.get("content", "") for element in _elements(updated_cards[0]))
         self.assertIn("价格一般 非刚需", markdown)
+
+    def test_update_deal_card_feedback_state_does_not_cache_failed_patch(self) -> None:
+        with (
+            patch("smzdm_notice.feishu.notifier.get_feishu_image_key", return_value=""),
+            patch("smzdm_notice.feishu.notifier._send_card_message_id", return_value="om_deal_failed_patch"),
+            patch("smzdm_notice.feishu.notifier.update_card_message", return_value=False),
+        ):
+            item = _item()
+            self.assertTrue(notifier.send_deals([(item, "LLM 推荐")]))
+            original = notifier._DEAL_CARD_CACHE["om_deal_failed_patch"]
+
+            result = notifier.update_deal_card_feedback_state(
+                "om_deal_failed_patch",
+                item.article_id,
+                selected="deal_not_worth",
+            )
+
+        self.assertIsNone(result)
+        self.assertIs(notifier._DEAL_CARD_CACHE["om_deal_failed_patch"], original)
+        self.assertFalse(
+            any(component.get("tag") == "form" for component in _components(original))
+        )
 
     def test_send_deals_splits_large_result_within_card_budgets_and_preserves_order(self) -> None:
         items: list[tuple[RankingItem, str]] = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -405,6 +406,13 @@ class LlmPromptTests(unittest.TestCase):
         self.assertIn("所有必填字段均存在且为字符串", SYSTEM_PROMPT)
         self.assertIn("decision_context 都是对象而不是 null", SYSTEM_PROMPT)
         self.assertIn("JSON 没有注释、占位项或尾逗号", SYSTEM_PROMPT)
+
+    def test_system_prompt_does_not_seed_fake_candidate_ids(self) -> None:
+        self.assertIsNone(re.search(r'"id"\s*:\s*"\d+"', SYSTEM_PROMPT))
+        self.assertIn("每个 id 都必须从当前商品列表中逐字符原样复制", SYSTEM_PROMPT)
+        self.assertIn("不得自行生成、补全、拼接、改写或猜测 id", SYSTEM_PROMPT)
+        self.assertIn("不提供非空结果示例", SYSTEM_PROMPT)
+        self.assertIn("每个 id 都与当前商品列表中的某个 id 完全一致", SYSTEM_PROMPT)
 
     def test_system_prompt_keeps_generic_examples_without_user_specific_categories(self) -> None:
         self.assertIn("本系统 Prompt 只定义稳定筛选方法", SYSTEM_PROMPT)

@@ -64,7 +64,7 @@ def button(
     url: str = "",
     component_id: str = "",
     confirm: Card | None = None,
-    action_type: str = "",
+    form_action_type: str = "",
 ) -> Card:
     component: Card = {
         "tag": "button",
@@ -79,8 +79,11 @@ def button(
         component["behaviors"] = [open_url_behavior(url)]
     if confirm:
         component["confirm"] = confirm
-    if action_type:
-        component["action_type"] = action_type
+    if form_action_type:
+        component["form_action_type"] = form_action_type
+        # JSON 2.0 表单通过 name 识别 submit/reset 按钮。复用已经满足
+        # 全卡唯一约束的 element_id，避免维护第二套组件标识。
+        component["name"] = component["element_id"]
     return component
 
 

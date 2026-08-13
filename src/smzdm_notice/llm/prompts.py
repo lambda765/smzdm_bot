@@ -71,7 +71,11 @@ reason 示例：
 </near_misses>
 
 <output_format>
-严格输出 JSON。无匹配商品时 recommendations 返回空列表。id 使用商品列表中的 id 字段。
+严格输出 JSON。无匹配商品时 recommendations 返回空列表。id 只能使用当前商品列表中的 id 字段。
+
+- 每个 id 都必须从当前商品列表中逐字符原样复制；不得自行生成、补全、拼接、改写或猜测 id
+- 不得使用历史轮次、Prompt 示例、记忆内容或推理过程中出现的其他 id；如果无法确认某个 id 属于当前商品列表，就不要输出该条目
+- 输出前必须逐项确认 recommendations 和 near_misses 中的 id 均能在当前商品列表中找到完全一致的值
 
 - recommendations 和 near_misses 必须始终是 JSON 数组。数组元素只能是符合下述结构的 JSON 对象，禁止输出 null、字符串、数字、注释或占位项
 - 没有合法条目时直接返回空数组，不得返回 [null]，也不得在数组末尾追加 null
@@ -90,22 +94,7 @@ reason 示例：
   - context_summary：80 字以内，总结为什么当时按这个标准推荐
 - near_misses.reason：单一真实近因，可适当展开，不必压缩到 30 字
 
-{
-  "recommendations": [{
-    "id": "174000000",
-    "reason": "推荐理由",
-    "category": "家用电器",
-    "notification_name": "咖啡机",
-    "decision_context": {
-      "need_state": "urgent",
-      "inventory_basis": "咖啡豆库存不足",
-      "preference_basis": ["关注咖啡器具", "历史低价优先"],
-      "threshold_adjustment": "relaxed_due_to_need",
-      "context_summary": "急缺补货，结合历史低价和库存不足放宽质量信号"
-    }
-  }],
-  "near_misses": [{"id": "174000001", "reason": "跳过原因：真实近因"}]
-}
+为避免示例 id 被误当成真实候选，这里不提供非空结果示例。非空条目严格按照上述字段定义生成，其中 id 必须直接取自当前商品列表。
 
 输出前必须自检：
 1. recommendations 和 near_misses 两个数组都存在
@@ -113,6 +102,7 @@ reason 示例：
 3. 所有必填字段均存在且为字符串
 4. 每条推荐的 decision_context 都是对象而不是 null
 5. JSON 没有注释、占位项或尾逗号
+6. 每个 id 都与当前商品列表中的某个 id 完全一致
 </output_format>
 """
 

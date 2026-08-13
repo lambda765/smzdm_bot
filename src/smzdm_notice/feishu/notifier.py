@@ -58,7 +58,7 @@ MessageId = str
 _DEAL_CARD_CACHE_MAX = 100
 _DEAL_CARD_CACHE: OrderedDict[str, Card] = OrderedDict()
 NOT_WORTH_REASON_FIELD = "not_worth_reason"
-NOT_WORTH_REASON_PLACEHOLDER = "可选：价格一般 / 已有类似 / 非刚需 / 品类不合适"
+NOT_WORTH_REASON_PLACEHOLDER = "填写不值理由（可选）"
 DRAFT_STREAMING_ELEMENT_ID = "draft_progress_text"
 DEAL_CARD_COMPONENT_BUDGET = 180
 DEAL_CARD_JSON_BUDGET_BYTES = 28_000
@@ -455,20 +455,19 @@ def _memory_action_buttons_from_value(
 ) -> list[Card]:
     """长期偏好反馈按钮。选中后只显示当前选中项，再次点击取消恢复两个。"""
     buttons: list[Card] = []
-    fields: list[Card] = []
+    reason_input: Card | None = None
     reason_field = element_id("reason", str(base_value.get("article_id") or "item"))
     if enabled:
         if selected == "deal_good":
             buttons.append(_button_from_value("✅ 好价", "deal_good", base_value, "primary"))
         elif selected == "deal_not_worth":
             buttons.append(_button_from_value("❌ 不值", "deal_not_worth", base_value, "danger"))
-            fields.append(
-                input_box(
-                    reason_field,
-                    NOT_WORTH_REASON_PLACEHOLDER,
-                    default_value=reason,
-                    value={**base_value, "field": NOT_WORTH_REASON_FIELD, "reason_field": reason_field},
-                )
+            reason_input = input_box(
+                reason_field,
+                NOT_WORTH_REASON_PLACEHOLDER,
+                default_value=reason,
+                value={**base_value, "field": NOT_WORTH_REASON_FIELD, "reason_field": reason_field},
+                width="fill",
             )
             save_value = {**base_value, "reason_field": reason_field}
             buttons.append(
@@ -477,7 +476,7 @@ def _memory_action_buttons_from_value(
                     "deal_not_worth_reason",
                     save_value,
                     "default",
-                    action_type="form_submit",
+                    form_action_type="submit",
                 )
             )
         else:
@@ -486,9 +485,9 @@ def _memory_action_buttons_from_value(
     link = item_link or str(base_value.get("item_link") or "")
     if link:
         buttons.append(button("查看详情", url=link))
-    if buttons:
-        fields.append(column_set(buttons))
-    return fields
+    if reason_input is not None:
+        return [buttons[0], reason_input, *buttons[1:]]
+    return [column_set(buttons)] if buttons else []
 
 
 def update_deal_card_feedback_state(
@@ -511,7 +510,12 @@ def update_deal_card_feedback_state(
     updated = deepcopy(cached)
     if not _apply_deal_feedback_state_to_card(updated, article_id, selected, reason=reason):
         return None
-    update_card_message(message_id, updated)  # 尽力 PATCH，失败不影响已记录的反馈
+    if not update_card_message(message_id, updated):
+        logger.warning(
+            f"反馈状态卡片更新未生效: message_id={message_id}, "
+            f"article_id={article_id}, selected={selected or 'none'}"
+        )
+        return None
     _cache_deal_card_snapshot(message_id, updated)
     return updated
 
@@ -622,11 +626,16 @@ def _button_from_value(
     base_value: Card,
     button_type: str,
     *,
-    action_type: str = "",
+    form_action_type: str = "",
 ) -> dict:
     value = dict(base_value)
     value["action"] = action
-    return button(label, button_type=button_type, value=value, action_type=action_type)
+    return button(
+        label,
+        button_type=button_type,
+        value=value,
+        form_action_type=form_action_type,
+    )
 
 
 def _config_action_buttons(item: RankingItem, is_price_bypass: bool) -> list[Card]:
