@@ -17,6 +17,14 @@ class ModelRouteUpdateResult:
     message: str
 
 
+@dataclass(frozen=True)
+class ResolvedModelTest:
+    """一次模型测试实际使用的作用范围与完整请求配置。"""
+
+    target: str
+    config: ResolvedLLMConfig
+
+
 def apply_model_route_card_action(action: str, value: dict) -> ModelRouteUpdateResult:
     """持久化一次模型管理卡片路由操作。"""
     target = model_card_target(value)
@@ -32,22 +40,27 @@ def apply_model_route_card_action(action: str, value: dict) -> ModelRouteUpdateR
     return handler(value, target)
 
 
-def resolve_model_test_config(value: dict) -> ResolvedLLMConfig:
+def resolve_model_test_config(value: dict) -> ResolvedModelTest:
     """从卡片字段解析模型测试目标，不修改路由配置。"""
-    connection = optional_model_card_field_value(value, "connection")
-    model_id = optional_model_card_field_value(value, "model_id")
-    if connection and model_id:
-        return llm_routing.test_config_for_connection(connection, model_id)
     target = model_card_target(value)
-    if target != "default":
-        return llm_routing.test_config_for_agent(target)
-    defaults = llm_routing.model_card_state().get("defaults", {})
-    if not isinstance(defaults, dict):
-        raise ValueError("默认 LLM 配置不可用")
-    return llm_routing.test_config_for_connection(
-        str(defaults.get("connection") or ""),
-        str(defaults.get("model_id") or ""),
+    base = (
+        llm_routing.test_config_for_agent(target)
+        if target != "default"
+        else llm_routing.test_config_for_connection(
+            _default_model_field("connection"),
+            _default_model_field("model_id"),
+        )
     )
+    connection = _test_form_field(value, "connection", base.connection, "请选择 connection 后再测试")
+    model_id = _test_form_field(value, "model_id", base.model_id, "请输入 model_id 后再测试")
+    temperature = _optional_test_temperature(value)
+    config = llm_routing.test_config_for_connection(
+        connection,
+        model_id,
+        target=target,
+        temperature=temperature,
+    )
+    return ResolvedModelTest(target=target, config=config)
 
 
 def model_card_target(value: dict) -> str:
@@ -120,3 +133,44 @@ def _required_field(value: dict, key: str, message: str) -> str:
     if not clean:
         raise ValueError(message)
     return clean
+
+
+def _default_model_field(key: str) -> str:
+    defaults = llm_routing.model_card_state().get("defaults", {})
+    if not isinstance(defaults, dict):
+        raise ValueError("默认 LLM 配置不可用")
+    value = str(defaults.get(key) or "").strip()
+    if not value:
+        raise ValueError(f"默认 LLM 配置缺少 {key}")
+    return value
+
+
+def _test_form_field(value: dict, key: str, fallback: str, empty_message: str) -> str:
+    field_value = optional_model_card_field_value(value, key)
+    if field_value:
+        return field_value
+    if _has_model_card_field(value, key):
+        raise ValueError(empty_message)
+    return fallback
+
+
+def _optional_test_temperature(value: dict) -> float | None:
+    raw = optional_model_card_field_value(value, "temperature")
+    if not raw:
+        return None
+    try:
+        temperature = float(raw)
+    except ValueError as e:
+        raise ValueError("temperature 必须是数字") from e
+    if not 0 <= temperature <= 5:
+        raise ValueError("temperature 必须在 0 到 5 之间")
+    return temperature
+
+
+def _has_model_card_field(value: dict, key: str) -> bool:
+    if key in value:
+        return True
+    return any(
+        isinstance(value.get(group), dict) and key in value[group]
+        for group in ("form_values", "form_value", "form", "input_values")
+    )

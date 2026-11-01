@@ -41,6 +41,7 @@ class ResolvedLLMConfig:
     temperature: float | None
     response_format: dict[str, Any] | None
     extra_body: dict[str, Any]
+    total_timeout_seconds: float | None = None
 
     @property
     def base_url_host(self) -> str:
@@ -168,10 +169,7 @@ def model_card_state(snapshot: RoutingSnapshot | None = None) -> dict[str, Any]:
             _connection_card_info(name, _object(connections[name], f"connections.{name}"))
             for name in sorted(connections)
         ],
-        "agents": [
-            _agent_card_state(snap, agents, agent)
-            for agent in AGENTS
-        ],
+        "agents": [_agent_card_state(snap, agents, agent) for agent in AGENTS],
     }
 
 
@@ -282,12 +280,36 @@ def test_config_for_agent(agent: str) -> ResolvedLLMConfig:
     return resolve(_validate_agent(agent))
 
 
-def test_config_for_connection(connection: str, model_id: str) -> ResolvedLLMConfig:
+def test_config_for_connection(
+    connection: str,
+    model_id: str,
+    *,
+    target: str = "default",
+    temperature: float | None = None,
+) -> ResolvedLLMConfig:
+    """构造不落盘的模型测试配置。
+
+    测试以 target 的有效覆盖项为基底，再叠加卡片当前选择的连接、模型和
+    可选 temperature。这样既能测试尚未保存的表单值，也会保留 agent 的
+    response_format、extra_body、timeout_seconds 和 max_retries 等配置。
+    """
     connection = _clean_required(connection, "connection")
     model_id = _clean_required(model_id, "model_id")
     snap = get_snapshot()
     raw = deepcopy(snap.raw)
-    raw.setdefault("agents", {})["_test"] = {"connection": connection, "model_id": model_id}
+    if target == "default":
+        test_agent: dict[str, Any] = {}
+    else:
+        target = _validate_agent(target)
+        agents = _object(raw.get("agents", {}), "agents")
+        test_agent = deepcopy(_object(agents.get(target, {}), f"agents.{target}"))
+    test_agent["connection"] = connection
+    test_agent["model_id"] = model_id
+    if temperature is not None:
+        _validate_temperature(temperature)
+        request = _object(test_agent.setdefault("request", {}), "test request")
+        request["temperature"] = temperature
+    raw.setdefault("agents", {})["_test"] = test_agent
     return _resolve_agent(raw, "_test", allow_test_agent=True)
 
 
@@ -331,7 +353,7 @@ def _resolve_agent(
     继承优先级如下，agent 级覆盖优先：
       connection/model_id: agent_cfg → defaults
       request（temperature、response_format、extra_body）：通过 _merge_request 合并
-      timeout_seconds/max_retries: agent_cfg → connection → defaults（通过 _first_config_value）
+      timeout_seconds/total_timeout_seconds/max_retries: agent_cfg → connection → defaults（通过 _first_config_value）
     """
     if not allow_test_agent:
         agent = _validate_agent(agent)
@@ -375,6 +397,15 @@ def _resolve_agent(
         model_id=model_id,
         timeout_seconds=_float_value(
             _first_config_value(agent_cfg, conn, defaults, key="timeout_seconds", default=300.0)
+        ),
+        total_timeout_seconds=_float_value(
+            _first_config_value(
+                agent_cfg,
+                conn,
+                defaults,
+                key="total_timeout_seconds",
+                default=600.0 if agent == "filter" else 300.0,
+            )
         ),
         max_retries=_int_value(_first_config_value(agent_cfg, conn, defaults, key="max_retries", default=2)),
         temperature=_optional_float(request.get("temperature")),
@@ -429,6 +460,10 @@ def _validate_resolved_agent(resolved: ResolvedLLMConfig) -> None:
         raise LLMRoutingError(f"{resolved.agent} 使用的 base_url 未配置")
     if resolved.provider != "openai_compatible":
         raise LLMRoutingError(f"{resolved.agent} provider 不支持: {resolved.provider}")
+    if resolved.total_timeout_seconds is not None and (
+        not math.isfinite(resolved.total_timeout_seconds) or resolved.total_timeout_seconds <= 0
+    ):
+        raise LLMRoutingError(f"{resolved.agent} total_timeout_seconds 必须为有限正数")
     if resolved.temperature is not None:
         _validate_temperature(resolved.temperature)
 

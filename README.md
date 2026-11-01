@@ -241,11 +241,17 @@ smzdm-notice setup
 
 **LLM 多模型路由：** `setup` 会生成 `llm_models.json` 并默认启用多模型路由。JSON 中只保存 `api_key_env`，真实密钥继续放 `.env`，例如 `LLM_DEEPSEEK_API_KEY=...`。运行时必须有 `llm_models.json`。
 
-配置分三层：`connections` 保存 OpenAI 兼容接口连接，`defaults` 保存默认 connection/model_id/request 参数，`agents.filter/arbiter/draft` 只写覆盖项；未配置的 agent（包括 `draft`）会继承 defaults。`timeout_seconds/max_retries` 可写在 defaults、connection 或 agent 上，优先级为 agent > connection > defaults。运行时内置默认 `response_format={"type":"json_object"}`，即使 JSON 里省略该字段也会发送；用户可用非空 `response_format` 对象覆盖。agent request 中字段值为 `null` 表示继承默认值，不会关闭默认 `response_format`。
+配置分三层：`connections` 保存 OpenAI 兼容接口连接，`defaults` 保存默认 connection/model_id/request 参数，`agents.filter/arbiter/draft` 只写覆盖项；未配置的 agent（包括 `draft`）会继承 defaults。`timeout_seconds/total_timeout_seconds/max_retries` 可写在 defaults、connection 或 agent 上，优先级为 agent > connection > defaults。运行时内置默认 `response_format={"type":"json_object"}`，即使 JSON 里省略该字段也会发送；用户可用非空 `response_format` 对象覆盖。agent request 中字段值为 `null` 表示继承默认值，不会关闭默认 `response_format`。
+
+筛选与仲裁使用异步流式请求，双路 A/B 并行，共享 `agents.filter.total_timeout_seconds=600` 秒总期限；必要时仲裁另有 `agents.arbiter.total_timeout_seconds=300` 秒。旧配置省略总期限时采用这两个默认值。每阶段的请求、读取、重试和冷却均计入总期限，重试不重新计时；`timeout_seconds=300` 限制连续无数据等待。LLM 决策阶段最多 15 分钟，不含抓取、后续草案生成及飞书投递。只有正常结束且 JSON 和业务结构完整的结果才可用于推荐；断流与非法 JSON 最多重试一次，截断、拒绝及结构错误明确失败，不回退非流式。一路失败沿用另一有效结果，仲裁失败取交集。
+
+筛选与仲裁都关闭 SDK 自动重试，应用层按 `max_retries=1` 最多重试一次（为 0 时不重试）。连接共享 429 冷却，优先读取 `retry-after-ms` 或 `Retry-After`，缺失或无效时默认 60 秒；每路累计冷却等待最多 60 秒，另加随机退避。服务端要求超过 60 秒时立即结束该路并保留冷却状态。日志包含轮次、角色、首包/首个正文时间、每 30 秒进度、结束原因、请求 ID、token 用量及耗时，不记录推理正文。草案和模型卡片测试保留各自的 SDK 行为。直接编辑 JSON 后需重启加载；飞书模型卡片保存的路由变更会在下一次调用生效。
 
 `request.extra_body` 会按默认或 agent 覆盖原样透传给 OpenAI SDK，项目不校验 provider 字段含义。不同 provider 支持字段不同，例如 BigModel/智谱可用 `{"do_sample":false}` 降低随机漂移，或用 `{"thinking":{"type":"disabled"}}` 关闭 thinking；vLLM/SGLang 常见写法是 `{"chat_template_kwargs":{"enable_thinking":false}}`。
 
 飞书发送 `/model` 会打开 LLM 模型路由管理卡片，可在卡片中查看当前默认配置和 `filter/arbiter/draft` 的最终路由，选择作用范围、选择已加载 connection、输入 model_id、设置 temperature、reset agent 覆盖并做测试调用。
+
+「发送测试」会立即确认提交，并在后台使用卡片当前参数执行一次最小生成；完成后会在原卡片下回复实际使用的 connection、API host、model_id、temperature、timeout、重试次数、请求选项、总耗时及成功预览或分类错误。测试沿用目标路由的 `timeout_seconds/max_retries`，不会把单次时限强制缩短为 30 秒；同一操作者在同一卡片上的相同参数测试完成前不会重复发起。服务日志会用测试 ID 记录提交、开始、完成、错误分类和结果投递状态，但不会记录 API Key 或完整模型输出。
 
 热切只修改已加载 connection 下的 `defaults` 或 `agents` 覆盖项；新增或修改 `base_url/provider/api_key_env`、修改 `.env` 密钥后需要重启。写回使用唯一临时文件和原子替换；多实例同时热切时以后写入者为准。
 

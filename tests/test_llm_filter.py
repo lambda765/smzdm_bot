@@ -1,31 +1,61 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+import pytest
 from openai import APITimeoutError, BadRequestError, RateLimitError
+from stream_fakes import text_stream
 
 from smzdm_notice.llm import clients as llm_clients
-from smzdm_notice.llm.arbitration import ArbitrationRequest, arbitrate, resolve_dual_result
+from smzdm_notice.llm import filter_retry
+from smzdm_notice.llm.arbitration import ArbitrationRequest
+from smzdm_notice.llm.arbitration import arbitrate as arbitrate_async
+from smzdm_notice.llm.arbitration import resolve_dual_result as resolve_dual_result_async
 from smzdm_notice.llm.categories import UNCATEGORIZED_CATEGORY, sanitize_category
 from smzdm_notice.llm.clients import _clear_client_cache, get_client_for_config
 from smzdm_notice.llm.filter import (
     _build_prompt_context,
     _match_result,
     _parse_response,
-    _single_llm_call,
     filter_items,
+)
+from smzdm_notice.llm.filter import (
+    _single_llm_call as single_llm_call_async,
 )
 from smzdm_notice.llm.models import FilterResult, LLMCallOutcome, LLMCallResult, Recommendation
 from smzdm_notice.llm.prompts import ARBITER_SYSTEM_PROMPT, SYSTEM_PROMPT
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
+from smzdm_notice.llm.streaming import AsyncClientPool
 from smzdm_notice.smzdm.ranking import RankingItem
+
+
+def _single_llm_call(*args, **kwargs):
+    return asyncio.run(single_llm_call_async(*args, **kwargs))
+
+
+def arbitrate(*args, **kwargs):
+    return asyncio.run(arbitrate_async(*args, **kwargs))
+
+
+def resolve_dual_result(*args, **kwargs):
+    async def run():
+        async with AsyncClientPool() as clients:
+            return await resolve_dual_result_async(*args, **kwargs, clients=clients, round_id="test")
+
+    return asyncio.run(run())
+
+
+@pytest.fixture(autouse=True)
+def isolated_filter_cooldown(monkeypatch):
+    monkeypatch.setattr(filter_retry, "_COOLDOWN", filter_retry.ConnectionCooldown())
 
 
 def _item(
@@ -61,7 +91,7 @@ def _openai_response(status_code: int) -> httpx.Response:
 def _failing_client(error: Exception) -> SimpleNamespace:
     class FailingCompletions:
         # 为匹配 OpenAI SDK create 签名，这里保留关键字参数；测试替身只需抛出固定异常。
-        def create(self, **_kwargs):
+        async def create(self, **_kwargs):
             raise error
 
     return SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
@@ -117,9 +147,9 @@ def _routing_snapshot() -> RoutingSnapshot:
 def _successful_client(captured: dict, content: str | None = None) -> SimpleNamespace:
     payload = content or json.dumps({"recommendations": [], "near_misses": []}, ensure_ascii=False)
 
-    def create_completion(**kwargs):
+    async def create_completion(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=payload))])
+        return text_stream(payload)
 
     return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
 
@@ -127,7 +157,7 @@ def _successful_client(captured: dict, content: str | None = None) -> SimpleName
 def _filter_items_with_mocked_call(*outcomes: LLMCallOutcome, dual_filter: bool = False):
     with (
         patch("smzdm_notice.core.config.LLM_DUAL_FILTER", dual_filter),
-        patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+        patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=object()),
         patch("smzdm_notice.llm.filter._single_llm_call", side_effect=list(outcomes)),
         patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
         patch.dict("os.environ", {"LLM_TEST_API_KEY": "key"}, clear=False),
@@ -161,8 +191,12 @@ class RecommendationOrderingTests(unittest.TestCase):
         self.assertEqual(notification_names, {"3": "蓝莓"})
 
     def test_dual_result_same_items_different_order_uses_a_without_arbitration(self) -> None:
-        result_a = FilterResult(recommendations=[Recommendation(id="1", reason="A1"), Recommendation(id="2", reason="A2")])
-        result_b = FilterResult(recommendations=[Recommendation(id="2", reason="B2"), Recommendation(id="1", reason="B1")])
+        result_a = FilterResult(
+            recommendations=[Recommendation(id="1", reason="A1"), Recommendation(id="2", reason="A2")]
+        )
+        result_b = FilterResult(
+            recommendations=[Recommendation(id="2", reason="B2"), Recommendation(id="1", reason="B1")]
+        )
 
         with patch("smzdm_notice.llm.arbitration._run_arbiter") as run_arbiter:
             final, arbiter_info = resolve_dual_result(
@@ -251,13 +285,19 @@ class LlmClientReuseTests(unittest.TestCase):
 
         with patch("smzdm_notice.llm.clients.OpenAI", side_effect=openai_factory):
             get_client_for_config(
-                _llm_config(connection="filter", api_key="filter-key", base_url="https://filter.example.com", timeout=111.0)
+                _llm_config(
+                    connection="filter", api_key="filter-key", base_url="https://filter.example.com", timeout=111.0
+                )
             )
             get_client_for_config(
-                _llm_config(connection="arbiter", api_key="arbiter-key", base_url="https://arbiter.example.com", timeout=222.0)
+                _llm_config(
+                    connection="arbiter", api_key="arbiter-key", base_url="https://arbiter.example.com", timeout=222.0
+                )
             )
             get_client_for_config(
-                _llm_config(connection="draft", api_key="draft-key", base_url="https://draft.example.com", timeout=333.0)
+                _llm_config(
+                    connection="draft", api_key="draft-key", base_url="https://draft.example.com", timeout=333.0
+                )
             )
 
         self.assertEqual([kwargs["timeout"] for kwargs in created], [111.0, 222.0, 333.0])
@@ -475,9 +515,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         result = _filter_items_with_mocked_call(
             LLMCallOutcome(
                 result=LLMCallResult(
-                    result=FilterResult(
-                        recommendations=[Recommendation(id="1001", reason="A", category="厨房小家电")]
-                    )
+                    result=FilterResult(recommendations=[Recommendation(id="1001", reason="A", category="厨房小家电")])
                 )
             ),
             dual_filter=False,
@@ -559,9 +597,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         result = _filter_items_with_mocked_call(
             LLMCallOutcome(
                 result=LLMCallResult(
-                    result=FilterResult(
-                        recommendations=[Recommendation(id="1001", reason="A", category="厨房小家电")]
-                    )
+                    result=FilterResult(recommendations=[Recommendation(id="1001", reason="A", category="厨房小家电")])
                 )
             ),
             dual_filter=False,
@@ -590,7 +626,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         with (
             patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
             patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=_successful_client(captured, payload)),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=_successful_client(captured, payload)),
         ):
             result = filter_items([_item()], "用户偏好", "库存", routing_snapshot=_routing_snapshot())
 
@@ -621,7 +657,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         with (
             patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
             patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=_successful_client(captured, payload)),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=_successful_client(captured, payload)),
         ):
             result = filter_items([_item()], "用户偏好", "库存", routing_snapshot=_routing_snapshot())
 
@@ -661,7 +697,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         with (
             patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
             patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=_successful_client(captured, payload)),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=_successful_client(captured, payload)),
         ):
             result = filter_items([_item()], "用户偏好", "库存", routing_snapshot=_routing_snapshot())
 
@@ -725,14 +761,14 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         captured = {}
 
         # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
-        def fake_call(_client, _llm_config, user_message):
+        def fake_call(_client, _llm_config, user_message, **_kwargs):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
         with (
             patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
             patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(
@@ -758,7 +794,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         builder_item_ids = []
 
         # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
-        def fake_call(_client, _llm_config, user_message):
+        def fake_call(_client, _llm_config, user_message, **_kwargs):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -774,7 +810,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             patch("smzdm_notice.core.config.PREFILTER_MIN_WORTHY_RATE", 0.0),
             patch("smzdm_notice.core.config.PREFILTER_MIN_COMMENTS", 0),
             patch("smzdm_notice.core.config.PREFILTER_MIN_FAVORITES", 0),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(
@@ -797,7 +833,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         captured = {}
 
         # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
-        def fake_call(_client, _llm_config, user_message):
+        def fake_call(_client, _llm_config, user_message, **_kwargs):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -813,7 +849,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
                 "smzdm_notice.core.config.PREFILTER_MIN_COMMENTS",
                 999,
             ),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(
@@ -832,7 +868,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         captured = {}
 
         # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
-        def fake_call(_client, _llm_config, user_message):
+        def fake_call(_client, _llm_config, user_message, **_kwargs):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -855,7 +891,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             patch("smzdm_notice.core.config.PREFILTER_MIN_WORTHY_RATE", 0.5),
             patch("smzdm_notice.core.config.PREFILTER_MIN_COMMENTS", 10),
             patch("smzdm_notice.core.config.PREFILTER_MIN_FAVORITES", 5),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(items, "用户偏好", "库存", routing_snapshot=_routing_snapshot())
@@ -898,7 +934,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         captured = {}
 
         # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
-        def fake_call(_client, _llm_config, user_message):
+        def fake_call(_client, _llm_config, user_message, **_kwargs):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -918,7 +954,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             patch("smzdm_notice.core.config.PREFILTER_MIN_FAVORITES", 100),
             patch("smzdm_notice.core.config.PREFILTER_BYPASS_MIN_COMMENTS", 100),
             patch("smzdm_notice.core.config.PREFILTER_BYPASS_MIN_WORTHY", 999),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(
@@ -952,7 +988,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         captured = {}
 
         # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
-        def fake_call(_client, _llm_config, user_message):
+        def fake_call(_client, _llm_config, user_message, **_kwargs):
             captured["user_message"] = user_message
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
@@ -972,7 +1008,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
             patch("smzdm_notice.core.config.PREFILTER_MIN_FAVORITES", 100),
             patch("smzdm_notice.core.config.PREFILTER_BYPASS_MIN_COMMENTS", 999),
             patch("smzdm_notice.core.config.PREFILTER_BYPASS_MIN_WORTHY", 100),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(
@@ -993,14 +1029,14 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         captured = {}
 
         # 测试替身需要匹配 _single_llm_call(client, llm_config, user_message) 签名。
-        def fake_call(_client, llm_config, _user_message):
+        def fake_call(_client, llm_config, _user_message, **_kwargs):
             captured["model_id"] = llm_config.model_id
             return LLMCallOutcome(result=LLMCallResult(result=FilterResult()))
 
         with (
             patch("smzdm_notice.core.config.LLM_DUAL_FILTER", False),
             patch("smzdm_notice.core.config.PREFILTER_ENABLED", False),
-            patch("smzdm_notice.llm.filter.get_client_for_config", return_value=object()),
+            patch("smzdm_notice.llm.filter.AsyncClientPool.get", return_value=object()),
             patch("smzdm_notice.llm.filter._single_llm_call", side_effect=fake_call),
         ):
             filter_items(
@@ -1053,7 +1089,7 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_single_llm_call_classifies_retryable_error(self) -> None:
         outcome = _single_llm_call(
             _failing_client(RateLimitError("rate limited", response=_openai_response(429), body=None)),
-            _llm_config(),
+            _llm_config(max_retries=0),
             "user message",
         )
 
@@ -1061,7 +1097,9 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
         self.assertIn("可重试/网络类问题", outcome.error_summary)
 
     def test_single_llm_call_classifies_timeout_error(self) -> None:
-        outcome = _single_llm_call(_failing_client(APITimeoutError(_openai_request())), _llm_config(), "user message")
+        outcome = _single_llm_call(
+            _failing_client(APITimeoutError(_openai_request())), _llm_config(max_retries=0), "user message"
+        )
 
         self.assertIsNone(outcome.result)
         self.assertIn("可重试/网络类问题", outcome.error_summary)
@@ -1079,16 +1117,12 @@ class LlmFilterDiagnosticsTests(unittest.TestCase):
     def test_single_llm_call_uses_resolved_request_options(self) -> None:
         captured = {}
         response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content='{"recommendations": [], "near_misses": []}')
-                )
-            ]
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"recommendations": [], "near_misses": []}'))]
         )
 
-        def create_completion(**kwargs):
+        async def create_completion(**kwargs):
             captured.update(kwargs)
-            return response
+            return text_stream(response.choices[0].message.content)
 
         client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
         llm_config = replace(_llm_config(temperature=0.8), extra_body={"do_sample": False})
@@ -1133,10 +1167,11 @@ class LlmFilterArbitrationTests(unittest.TestCase):
             },
             "preference_change": {"rule": "不推荐体积过大的室内用品", "reason": "居住空间有限"},
         }
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=AsyncMock(return_value=text_stream(json.dumps(payload))))
+            )
         )
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: response)))
 
         info = arbitrate(
             ArbitrationRequest(
@@ -1174,9 +1209,9 @@ class LlmFilterArbitrationTests(unittest.TestCase):
         )
         captured = {}
 
-        def create_completion(**kwargs):
+        async def create_completion(**kwargs):
             captured.update(kwargs)
-            return response
+            return text_stream(response.choices[0].message.content)
 
         client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
 
@@ -1228,12 +1263,9 @@ class LlmFilterArbitrationTests(unittest.TestCase):
                     "change_assessment": assessment,
                     "preference_change": None,
                 }
-                response = SimpleNamespace(
-                    choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
-                )
                 client = SimpleNamespace(
                     chat=SimpleNamespace(
-                        completions=SimpleNamespace(create=lambda response=response, **_kwargs: response)
+                        completions=SimpleNamespace(create=AsyncMock(return_value=text_stream(json.dumps(payload))))
                     )
                 )
 
@@ -1273,12 +1305,9 @@ class LlmFilterArbitrationTests(unittest.TestCase):
                     "prompt_optimization_suggestion": "无需修改",
                     **partial_payload,
                 }
-                response = SimpleNamespace(
-                    choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
-                )
                 client = SimpleNamespace(
                     chat=SimpleNamespace(
-                        completions=SimpleNamespace(create=lambda response=response, **_kwargs: response)
+                        completions=SimpleNamespace(create=AsyncMock(return_value=text_stream(json.dumps(payload))))
                     )
                 )
 
@@ -1309,7 +1338,7 @@ class LlmFilterArbitrationTests(unittest.TestCase):
                 items_by_id={},
                 user_message="用户偏好",
                 client=_failing_client(RateLimitError("rate limited", response=_openai_response(429), body=None)),
-                llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0),
+                llm_config=_llm_config(agent="arbiter", model_id="arbiter-model", temperature=0.0, max_retries=0),
             )
         )
 

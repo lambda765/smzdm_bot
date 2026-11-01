@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -16,6 +17,7 @@ from smzdm_notice.feishu.bot import (
     DraftProgressCard,
     FeishuInteractiveBot,
     MessageDeduper,
+    ModelTestOutcome,
     _append_draft_stream_text,
     _is_allowed_message,
     _mask_card_event_id,
@@ -23,6 +25,7 @@ from smzdm_notice.feishu.bot import (
 )
 from smzdm_notice.feishu.card_payload import extract_card_action_value, extract_message_text, strip_bot_mention
 from smzdm_notice.feishu.commands import COMMAND_SPECS, help_markdown
+from smzdm_notice.feishu.model_actions import ResolvedModelTest, resolve_model_test_config
 from smzdm_notice.feishu.model_cards import build_model_management_card
 from smzdm_notice.feishu.notifier import NOT_WORTH_REASON_FIELD
 from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot
@@ -3195,14 +3198,12 @@ class FeishuModelCommandTests(unittest.TestCase):
             )
         )
 
+        resolved = ResolvedModelTest("filter", _model_test_config(model_id="glm-4-flash"))
         with (
-            patch(
-                "smzdm_notice.feishu.bot.llm_routing.test_config_for_connection",
-                return_value=_model_test_config(),
-            ) as test_config,
-            patch("smzdm_notice.feishu.bot._run_model_test", return_value="OK") as run_test,
+            patch("smzdm_notice.feishu.bot.resolve_model_test_config", return_value=resolved) as resolve_test,
+            patch.object(bot, "_start_model_test_worker") as start_worker,
+            patch("smzdm_notice.feishu.bot._run_model_test") as run_test,
             patch("smzdm_notice.feishu.bot.llm_routing.use_agent_model") as use_agent,
-            patch("smzdm_notice.feishu.bot.llm_routing.model_card_state", return_value=_model_card_state()),
         ):
             result = bot._dispatch_card_action(
                 "model_test",
@@ -3211,10 +3212,12 @@ class FeishuModelCommandTests(unittest.TestCase):
                 "om_card",
             )
 
-        test_config.assert_called_once_with("glm", "glm-4-flash")
-        run_test.assert_called_once()
+        resolve_test.assert_called_once_with({"target": "filter", "connection": "glm", "model_id": "glm-4-flash"})
+        start_worker.assert_called_once()
+        run_test.assert_not_called()
         use_agent.assert_not_called()
-        self.assertEqual(result.message, "OK")
+        self.assertIn("测试已提交", result.message)
+        self.assertIsNone(result.response_card)
 
     def test_model_test_uses_resolved_request_options(self) -> None:
         captured = {}
@@ -3230,14 +3233,241 @@ class FeishuModelCommandTests(unittest.TestCase):
         fake_client.chat.completions.create.side_effect = create_completion
 
         with patch("smzdm_notice.feishu.bot.get_client_for_config", return_value=fake_client):
-            message = _run_model_test(_model_test_config())
+            outcome = _run_model_test(_model_test_config())
 
-        self.assertIn("测试成功", message)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.preview, '{"ok": true}')
         self.assertEqual(captured["model"], "deepseek-chat")
         self.assertEqual(captured["temperature"], 0.7)
         self.assertEqual(captured["response_format"], {"type": "json_object"})
         self.assertEqual(captured["extra_body"], {"do_sample": False})
-        self.assertEqual(captured["timeout"], 30)
+        self.assertEqual(captured["timeout"], 300)
+
+    def test_resolve_model_test_config_applies_card_temperature_and_target(self) -> None:
+        base = _model_test_config(temperature=0.3)
+        selected = _model_test_config(model_id="glm-4-flash", temperature=0.9)
+
+        with (
+            patch("smzdm_notice.feishu.model_actions.llm_routing.test_config_for_agent", return_value=base),
+            patch(
+                "smzdm_notice.feishu.model_actions.llm_routing.test_config_for_connection",
+                return_value=selected,
+            ) as test_config,
+        ):
+            resolved = resolve_model_test_config(
+                {
+                    "target": "filter",
+                    "connection": "glm",
+                    "model_id": "glm-4-flash",
+                    "temperature": "0.9",
+                }
+            )
+
+        self.assertEqual(resolved.target, "filter")
+        self.assertIs(resolved.config, selected)
+        test_config.assert_called_once_with("glm", "glm-4-flash", target="filter", temperature=0.9)
+
+    def test_resolve_model_test_config_rejects_empty_model_before_start(self) -> None:
+        with (
+            patch(
+                "smzdm_notice.feishu.model_actions.llm_routing.test_config_for_agent",
+                return_value=_model_test_config(),
+            ),
+            self.assertRaisesRegex(ValueError, "请输入 model_id 后再测试"),
+        ):
+            resolve_model_test_config({"target": "filter", "connection": "deepseek", "model_id": ""})
+
+    def test_resolve_model_test_config_rejects_invalid_temperature_before_start(self) -> None:
+        with (
+            patch(
+                "smzdm_notice.feishu.model_actions.llm_routing.test_config_for_agent",
+                return_value=_model_test_config(),
+            ),
+            self.assertRaisesRegex(ValueError, "temperature 必须在 0 到 5 之间"),
+        ):
+            resolve_model_test_config(
+                {
+                    "target": "filter",
+                    "connection": "deepseek",
+                    "model_id": "deepseek-chat",
+                    "temperature": "9",
+                }
+            )
+
+    def test_model_test_duplicate_is_rejected_while_first_is_running(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        resolved = ResolvedModelTest("filter", _model_test_config())
+
+        with (
+            patch("smzdm_notice.feishu.bot.resolve_model_test_config", return_value=resolved),
+            patch.object(bot, "_start_model_test_worker") as start_worker,
+        ):
+            first = bot._dispatch_card_action("model_test", {}, "ou_user", "om_card")
+            duplicate = bot._dispatch_card_action("model_test", {}, "ou_user", "om_card")
+
+        self.assertIn("测试已提交", first.message)
+        self.assertIn("相同参数的测试正在进行", duplicate.message)
+        start_worker.assert_called_once()
+
+    def test_model_tests_with_different_parameters_can_run_in_parallel(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        first_config = ResolvedModelTest("filter", _model_test_config(model_id="model-a"))
+        second_config = ResolvedModelTest("filter", _model_test_config(model_id="model-b"))
+
+        with (
+            patch(
+                "smzdm_notice.feishu.bot.resolve_model_test_config",
+                side_effect=[first_config, second_config],
+            ),
+            patch.object(bot, "_start_model_test_worker") as start_worker,
+        ):
+            first = bot._dispatch_card_action("model_test", {}, "ou_user", "om_card")
+            second = bot._dispatch_card_action("model_test", {}, "ou_user", "om_card")
+
+        self.assertIn("测试已提交", first.message)
+        self.assertIn("测试已提交", second.message)
+        self.assertEqual(start_worker.call_count, 2)
+
+    def test_model_test_worker_replies_with_parameters_and_releases_duplicate_guard(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        resolved = ResolvedModelTest("filter", _model_test_config())
+        test_key = ("om_card", "ou_user", "fingerprint")
+        bot._model_tests_in_flight.add(test_key)
+
+        with (
+            patch(
+                "smzdm_notice.feishu.bot._run_model_test",
+                return_value=ModelTestOutcome(True, "success", preview='{"ok": true}'),
+            ),
+            patch.object(bot, "_reply_text", return_value=True) as reply_text,
+            patch("smzdm_notice.feishu.bot.time.monotonic", side_effect=[10.0, 12.5]),
+        ):
+            bot._run_model_test_worker("test1234", resolved, "om_card", test_key)
+
+        message = reply_text.call_args.args[1]
+        self.assertIn("测试 ID: test1234", message)
+        self.assertIn("作用范围: filter", message)
+        self.assertIn("Connection: deepseek", message)
+        self.assertIn("Model ID: deepseek-chat", message)
+        self.assertIn("Temperature: 0.7", message)
+        self.assertIn("Timeout: 300 秒/次", message)
+        self.assertIn("Max retries: 2", message)
+        self.assertIn("总耗时: 2.50 秒", message)
+        self.assertNotIn(test_key, bot._model_tests_in_flight)
+
+    def test_model_test_error_redacts_api_key_and_full_base_url(self) -> None:
+        config = replace(
+            _model_test_config(),
+            api_key="super-secret-api-key",
+            base_url="https://api.deepseek.com/v1?token=private",
+        )
+        fake_client = Mock()
+        fake_client.chat.completions.create.side_effect = RuntimeError(
+            "request to https://api.deepseek.com/v1?token=private failed for super-secret-api-key"
+        )
+
+        with patch("smzdm_notice.feishu.bot.get_client_for_config", return_value=fake_client):
+            outcome = _run_model_test(config)
+
+        self.assertFalse(outcome.ok)
+        self.assertNotIn("super-secret-api-key", outcome.detail)
+        self.assertNotIn("token=private", outcome.detail)
+        self.assertIn("[REDACTED]", outcome.detail)
+        self.assertIn("api.deepseek.com", outcome.detail)
+
+    def test_model_test_error_redacts_secrets_before_truncation(self) -> None:
+        config = replace(_model_test_config(), api_key="super-secret-api-key")
+        fake_client = Mock()
+        fake_client.chat.completions.create.side_effect = RuntimeError(
+            "x" * 490 + config.api_key + " trailing details" * 20
+        )
+        with patch("smzdm_notice.feishu.bot.get_client_for_config", return_value=fake_client):
+            outcome = _run_model_test(config)
+
+        self.assertFalse(outcome.ok)
+        self.assertNotIn("super", outcome.detail)
+        self.assertIn("[REDACTED]", outcome.detail)
+        self.assertEqual(len(outcome.detail), 503)
+
+    def test_model_test_logs_do_not_include_full_model_output(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        resolved = ResolvedModelTest("filter", _model_test_config())
+        test_key = ("om_card", "ou_user", "fingerprint")
+
+        with (
+            patch(
+                "smzdm_notice.feishu.bot._run_model_test",
+                return_value=ModelTestOutcome(True, "success", preview="PRIVATE_MODEL_OUTPUT"),
+            ),
+            patch.object(bot, "_reply_text", return_value=True),
+            patch("smzdm_notice.feishu.bot.time.monotonic", side_effect=[10.0, 11.0]),
+            patch("smzdm_notice.feishu.bot.logger.info") as log_info,
+            patch("smzdm_notice.feishu.bot.logger.warning") as log_warning,
+        ):
+            bot._run_model_test_worker("test1234", resolved, "om_card", test_key)
+
+        rendered_logs = "\n".join(str(call.args[0]) for call in [*log_info.call_args_list, *log_warning.call_args_list])
+        self.assertNotIn("PRIVATE_MODEL_OUTPUT", rendered_logs)
+        self.assertIn("preview_chars=20", rendered_logs)
+
+    def test_model_test_worker_logs_result_delivery_failure(self) -> None:
+        bot = FeishuInteractiveBot(
+            BotRuntime(
+                draft_store=Mock(),
+                binding_store=Mock(),
+                status_provider=lambda: "status",
+                run_once=Mock(return_value=True),
+            )
+        )
+        resolved = ResolvedModelTest("filter", _model_test_config())
+
+        with (
+            patch(
+                "smzdm_notice.feishu.bot._run_model_test",
+                return_value=ModelTestOutcome(False, "网络问题", detail="timeout"),
+            ),
+            patch.object(bot, "_reply_text", return_value=False),
+            patch("smzdm_notice.feishu.bot.time.monotonic", side_effect=[10.0, 11.0]),
+            patch("smzdm_notice.feishu.bot.logger.warning") as log_warning,
+        ):
+            bot._run_model_test_worker(
+                "test1234",
+                resolved,
+                "om_card",
+                ("om_card", "ou_user", "fingerprint"),
+            )
+
+        rendered_logs = "\n".join(str(call.args[0]) for call in log_warning.call_args_list)
+        self.assertIn("category=网络问题", rendered_logs)
+        self.assertIn("结果投递失败", rendered_logs)
 
     def test_build_model_management_card_response_pre_populates_from_form_state(self) -> None:
         form_state = {

@@ -29,14 +29,20 @@
   },
   "agents": {
     "filter": {
+      "timeout_seconds": 300,
+      "max_retries": 1,
       "request": {
         "temperature": 0.3
-      }
+      },
+      "total_timeout_seconds": 600
     },
     "arbiter": {
       "request": {
         "temperature": 0.0
-      }
+      },
+      "total_timeout_seconds": 300,
+      "timeout_seconds": 300,
+      "max_retries": 1
     },
     "draft": {
       "request": {

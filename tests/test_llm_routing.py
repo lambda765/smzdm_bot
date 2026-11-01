@@ -63,6 +63,63 @@ class LlmRoutingTests(unittest.TestCase):
         self.assertEqual(resolved.extra_body["thinking"], {"type": "disabled"})
         self.assertEqual(resolved.extra_body["top_k"], 1)
 
+    def test_connection_test_config_preserves_target_overrides_and_applies_card_values(self) -> None:
+        with self._configured_routing(
+            {
+                "connections": {
+                    "deepseek": {
+                        "provider": "openai_compatible",
+                        "label": "DeepSeek",
+                        "base_url": "https://api.deepseek.com/v1",
+                        "api_key_env": "LLM_DEEPSEEK_API_KEY",
+                    },
+                    "glm": {
+                        "provider": "openai_compatible",
+                        "label": "GLM",
+                        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                        "api_key_env": "LLM_GLM_API_KEY",
+                        "timeout_seconds": 45,
+                        "max_retries": 1,
+                    },
+                },
+                "defaults": {
+                    "connection": "deepseek",
+                    "model_id": "deepseek-chat",
+                    "timeout_seconds": 300,
+                    "max_retries": 2,
+                    "request": {
+                        "response_format": {"type": "json_object"},
+                        "extra_body": {"thinking": {"type": "disabled"}},
+                    },
+                },
+                "agents": {
+                    "filter": {
+                        "request": {"temperature": 0.3, "extra_body": {"top_k": 1}},
+                    },
+                    "arbiter": {},
+                    "draft": {},
+                },
+            },
+            {"LLM_DEEPSEEK_API_KEY": "deepseek-key", "LLM_GLM_API_KEY": "glm-key"},
+        ):
+            resolved = routing.test_config_for_connection(
+                "glm",
+                "glm-4-flash",
+                target="filter",
+                temperature=0.9,
+            )
+
+        self.assertEqual(resolved.connection, "glm")
+        self.assertEqual(resolved.model_id, "glm-4-flash")
+        self.assertEqual(resolved.temperature, 0.9)
+        self.assertEqual(resolved.timeout_seconds, 45)
+        self.assertEqual(resolved.max_retries, 1)
+        self.assertEqual(resolved.response_format, {"type": "json_object"})
+        self.assertEqual(
+            resolved.extra_body,
+            {"thinking": {"type": "disabled"}, "top_k": 1},
+        )
+
     def test_agent_connection_and_model_override_only_affects_that_agent(self) -> None:
         with self._configured_routing(
             {
@@ -216,20 +273,23 @@ class LlmRoutingTests(unittest.TestCase):
         self.assertEqual(resolved.temperature, 0.0)
 
     def test_missing_api_key_env_is_configuration_error(self) -> None:
-        with self.assertRaises(LLMRoutingError), self._configured_routing(
-            {
-                "connections": {
-                    "deepseek": {
-                        "provider": "openai_compatible",
-                        "label": "DeepSeek",
-                        "base_url": "https://api.deepseek.com/v1",
-                        "api_key_env": "LLM_DEEPSEEK_API_KEY",
-                    }
+        with (
+            self.assertRaises(LLMRoutingError),
+            self._configured_routing(
+                {
+                    "connections": {
+                        "deepseek": {
+                            "provider": "openai_compatible",
+                            "label": "DeepSeek",
+                            "base_url": "https://api.deepseek.com/v1",
+                            "api_key_env": "LLM_DEEPSEEK_API_KEY",
+                        }
+                    },
+                    "defaults": {"connection": "deepseek", "model_id": "deepseek-chat"},
+                    "agents": {"filter": {}, "arbiter": {}, "draft": {}},
                 },
-                "defaults": {"connection": "deepseek", "model_id": "deepseek-chat"},
-                "agents": {"filter": {}, "arbiter": {}, "draft": {}},
-            },
-            {},
+                {},
+            ),
         ):
             pass
 
@@ -258,26 +318,29 @@ class LlmRoutingTests(unittest.TestCase):
         self.assertEqual(draft_config.model_id, "deepseek-chat")
 
     def test_draft_override_with_missing_key_is_configuration_error(self) -> None:
-        with self.assertRaises(LLMRoutingError), self._configured_routing(
-            {
-                "connections": {
-                    "deepseek": {
-                        "provider": "openai_compatible",
-                        "label": "DeepSeek",
-                        "base_url": "https://api.deepseek.com/v1",
-                        "api_key_env": "LLM_DEEPSEEK_API_KEY",
+        with (
+            self.assertRaises(LLMRoutingError),
+            self._configured_routing(
+                {
+                    "connections": {
+                        "deepseek": {
+                            "provider": "openai_compatible",
+                            "label": "DeepSeek",
+                            "base_url": "https://api.deepseek.com/v1",
+                            "api_key_env": "LLM_DEEPSEEK_API_KEY",
+                        },
+                        "draft": {
+                            "provider": "openai_compatible",
+                            "label": "Draft",
+                            "base_url": "https://draft.example.com/v1",
+                            "api_key_env": "LLM_DRAFT_API_KEY",
+                        },
                     },
-                    "draft": {
-                        "provider": "openai_compatible",
-                        "label": "Draft",
-                        "base_url": "https://draft.example.com/v1",
-                        "api_key_env": "LLM_DRAFT_API_KEY",
-                    },
+                    "defaults": {"connection": "deepseek", "model_id": "deepseek-chat"},
+                    "agents": {"filter": {}, "arbiter": {}, "draft": {"connection": "draft"}},
                 },
-                "defaults": {"connection": "deepseek", "model_id": "deepseek-chat"},
-                "agents": {"filter": {}, "arbiter": {}, "draft": {"connection": "draft"}},
-            },
-            {"LLM_DEEPSEEK_API_KEY": "key"},
+                {"LLM_DEEPSEEK_API_KEY": "key"},
+            ),
         ):
             pass
 
@@ -720,3 +783,34 @@ class _RoutingContext:
         routing._clear_routing_state()
         if self.tmp:
             self.tmp.cleanup()
+
+
+def test_total_timeout_inheritance_defaults_and_validation():
+    from copy import deepcopy
+
+    raw = {
+        "connections": {
+            "test": {
+                "provider": "openai_compatible",
+                "base_url": "https://example.com/v1",
+                "api_key_env": "TEST_KEY",
+            }
+        },
+        "defaults": {"connection": "test", "model_id": "model"},
+        "agents": {"filter": {}, "arbiter": {}},
+    }
+    env = {"TEST_KEY": "key"}
+    assert routing._resolve_agent(raw, "filter", env=env).total_timeout_seconds == 600
+    assert routing._resolve_agent(raw, "arbiter", env=env).total_timeout_seconds == 300
+    raw["defaults"]["total_timeout_seconds"] = 450
+    assert routing._resolve_agent(raw, "filter", env=env).total_timeout_seconds == 450
+    raw["connections"]["test"]["total_timeout_seconds"] = 500
+    assert routing._resolve_agent(raw, "filter", env=env).total_timeout_seconds == 500
+    raw["agents"]["filter"]["total_timeout_seconds"] = 600
+    assert routing._resolve_agent(raw, "filter", env=env).total_timeout_seconds == 600
+    routing.validate_raw(raw, env=env)
+    for value in (0, -1, float("nan"), float("inf"), "not a number"):
+        invalid = deepcopy(raw)
+        invalid["agents"]["filter"]["total_timeout_seconds"] = value
+        with unittest.TestCase().assertRaises(LLMRoutingError):
+            routing.validate_raw(invalid, env=env)

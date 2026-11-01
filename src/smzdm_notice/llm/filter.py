@@ -2,27 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime
+from time import monotonic
 from typing import Protocol, cast
+from uuid import uuid4
 
 from loguru import logger
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from smzdm_notice.llm.arbitration import resolve_dual_result
 from smzdm_notice.llm.categories import sanitize_category
-from smzdm_notice.llm.clients import get_client_for_config
 from smzdm_notice.llm.errors import (
     GENERAL_OPENAI_ERRORS,
     NON_RETRYABLE_OPENAI_ERRORS,
     RETRYABLE_OPENAI_ERRORS,
     error_summary,
 )
-from smzdm_notice.llm.json_utils import extract_json_object
+from smzdm_notice.llm.filter_retry import FilterCooldownError
 from smzdm_notice.llm.models import (
     FilterDiagnostics,
     FilterItemsResult,
@@ -31,7 +32,15 @@ from smzdm_notice.llm.models import (
     LLMCallResult,
 )
 from smzdm_notice.llm.prompts import SYSTEM_PROMPT
-from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot, build_chat_completion_kwargs, resolve
+from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot, resolve
+from smzdm_notice.llm.streaming import (
+    AsyncClientPool,
+    DecisionTimeoutError,
+    InvalidResultError,
+    complete_json_object,
+    stream_result,
+    total_timeout,
+)
 from smzdm_notice.smzdm.ranking import RankingItem
 
 
@@ -80,10 +89,35 @@ def filter_items(
         f"发送 {len(prompt_context.item_map)} 条商品到 LLM ({llm_config.connection}/{llm_config.model_id}) 进行筛选..."
     )
 
-    client = get_client_for_config(llm_config)
-    if not config.LLM_DUAL_FILTER:
-        return _filter_with_single_call(client, llm_config, prompt_context)
-    return _filter_with_dual_calls(client, llm_config, prompt_context, routing_snapshot)
+    return asyncio.run(_filter_async(llm_config, prompt_context, routing_snapshot, config.LLM_DUAL_FILTER))
+
+
+async def _filter_async(
+    llm_config: ResolvedLLMConfig,
+    prompt_context: FilterPromptContext,
+    routing_snapshot: RoutingSnapshot | None,
+    dual_filter: bool,
+) -> FilterItemsResult:
+    round_id = uuid4().hex[:12]
+    started = monotonic()
+    deadline = started + total_timeout(llm_config)
+    logger.info(f"LLM round={round_id} decision_started filter_budget={total_timeout(llm_config):g}s")
+    try:
+        async with AsyncClientPool() as clients:
+            client = clients.get(llm_config)
+            if not dual_filter:
+                return await _filter_with_single_call(client, llm_config, prompt_context, deadline, round_id)
+            return await _filter_with_dual_calls(
+                client,
+                llm_config,
+                prompt_context,
+                clients,
+                deadline,
+                round_id,
+                routing_snapshot,
+            )
+    finally:
+        logger.info(f"LLM round={round_id} decision_end elapsed={monotonic() - started:.3f}s")
 
 
 def _build_prompt_context(
@@ -130,12 +164,20 @@ def _build_prompt_context(
     return FilterPromptContext(user_message, item_map, items_summary, arbiter_items)
 
 
-def _filter_with_single_call(
-    client: OpenAI,
+async def _filter_with_single_call(
+    client: AsyncOpenAI,
     llm_config: ResolvedLLMConfig,
     prompt_context: FilterPromptContext,
+    deadline: float,
+    round_id: str,
 ) -> FilterItemsResult:
-    call_outcome = _single_llm_call(client, llm_config, prompt_context.user_message)
+    call_outcome = await _single_llm_call(
+        client,
+        llm_config,
+        prompt_context.user_message,
+        deadline=deadline,
+        round_id=round_id,
+    )
     if call_outcome.result is None:
         return FilterItemsResult(
             diagnostics=FilterDiagnostics(
@@ -157,30 +199,36 @@ def _filter_with_single_call(
     )
 
 
-def _filter_with_dual_calls(
-    client: OpenAI,
+async def _filter_with_dual_calls(
+    client: AsyncOpenAI,
     llm_config: ResolvedLLMConfig,
     prompt_context: FilterPromptContext,
+    clients: AsyncClientPool,
+    deadline: float,
+    round_id: str,
     routing_snapshot: RoutingSnapshot | None = None,
 ) -> FilterItemsResult:
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_a = executor.submit(_single_llm_call, client, llm_config, prompt_context.user_message)
-        future_b = executor.submit(_single_llm_call, client, llm_config, prompt_context.user_message)
-
-        outcome_a = future_a.result()
-        outcome_b = future_b.result()
-        call_a = outcome_a.result
-        call_b = outcome_b.result
+    outcome_a, outcome_b = await asyncio.gather(
+        _single_llm_call(
+            client, llm_config, prompt_context.user_message, label="A", deadline=deadline, round_id=round_id
+        ),
+        _single_llm_call(
+            client, llm_config, prompt_context.user_message, label="B", deadline=deadline, round_id=round_id
+        ),
+    )
+    call_a, call_b = outcome_a.result, outcome_b.result
 
     _log_dual_call_result("A", call_a)
     _log_dual_call_result("B", call_b)
-    final_result, arbiter_info = resolve_dual_result(
+    final_result, arbiter_info = await resolve_dual_result(
         call_a,
         call_b,
         prompt_context.items_summary,
         prompt_context.arbiter_items,
         prompt_context.user_message,
         routing_snapshot=routing_snapshot,
+        clients=clients,
+        round_id=round_id,
     )
 
     matched, near_misses, categories_by_article_id, contexts_by_article_id, notification_names = _match_result(
@@ -255,28 +303,39 @@ def _worthy_rate(item: RankingItem) -> float:
     return item.worthy / total
 
 
-def _single_llm_call(
-    client: OpenAI,
+async def _single_llm_call(
+    client: AsyncOpenAI,
     llm_config: ResolvedLLMConfig,
     user_message: str,
+    *,
+    label: str = "single",
+    deadline: float | None = None,
+    round_id: str = "standalone",
 ) -> LLMCallOutcome:
     """执行一次 LLM 调用并解析结果。"""
+    started = monotonic()
     try:
-        response = client.chat.completions.create(
-            **build_chat_completion_kwargs(
-                llm_config,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message},
-                ],
-            )
+        result, content = await stream_result(
+            client,
+            llm_config,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            parse=_parse_response,
+            label=label,
+            round_id=round_id,
+            deadline=deadline if deadline is not None else monotonic() + total_timeout(llm_config),
         )
-
-        content = response.choices[0].message.content or ""
-        logger.debug(f"LLM 原始响应: {content}")
-
-        return LLMCallOutcome(result=LLMCallResult(result=_parse_response(content), raw_content=content))
-
+        return LLMCallOutcome(result=LLMCallResult(result=result, raw_content=content))
+    except DecisionTimeoutError as e:
+        summary = error_summary("总期限耗尽", e)
+        logger.error(f"LLM round={round_id} role={label} 调用失败（{summary}）")
+        return LLMCallOutcome(error_summary=summary)
+    except FilterCooldownError as e:
+        summary = error_summary("限流冷却", e)
+        logger.error(f"LLM 调用失败（{summary}）")
+        return LLMCallOutcome(error_summary=summary)
     except RETRYABLE_OPENAI_ERRORS as e:
         summary = error_summary("可重试/网络类问题", e)
         logger.error(f"LLM 调用失败（{summary}）")
@@ -293,6 +352,9 @@ def _single_llm_call(
         summary = error_summary("非 OpenAI SDK 异常", e)
         logger.error(f"LLM 调用失败（{summary}）")
         return LLMCallOutcome(error_summary=summary)
+
+    finally:
+        logger.info(f"LLM round={round_id} role={label} call_end elapsed={monotonic() - started:.3f}s")
 
 
 def _join_error_summaries(*summaries: str) -> str | None:
@@ -412,16 +474,14 @@ def _sanitize_context_text(value: object, max_length: int) -> str:
 
 
 def _parse_response(content: str) -> FilterResult:
-    """解析 LLM 响应，兼容各种格式。"""
-    data = extract_json_object(content)
-    if data is not None:
-        try:
-            return FilterResult(**data)
-        except (TypeError, ValueError):
-            pass
-
-    logger.warning(f"无法解析 LLM 响应: {(content or '')[:200]}")
-    return FilterResult()
+    """完整 JSON 和必要数组缺一不可；可选上下文字段仍由模型容错。"""
+    data = complete_json_object(content)
+    if not all(isinstance(data.get(key), list) for key in ("recommendations", "near_misses")):
+        raise InvalidResultError("筛选结果必须包含 recommendations 和 near_misses 数组")
+    try:
+        return FilterResult(**data)
+    except (TypeError, ValueError) as error:
+        raise InvalidResultError("筛选结果业务结构无效") from error
 
 
 def _build_prefilter_guidance(config) -> str:

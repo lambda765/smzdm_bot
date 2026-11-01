@@ -4,21 +4,27 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from time import monotonic
 
 from loguru import logger
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-from smzdm_notice.llm.clients import get_client_for_config
 from smzdm_notice.llm.errors import (
     GENERAL_OPENAI_ERRORS,
     NON_RETRYABLE_OPENAI_ERRORS,
     RETRYABLE_OPENAI_ERRORS,
     error_summary,
 )
-from smzdm_notice.llm.json_utils import extract_json_object
 from smzdm_notice.llm.models import ArbiterInfo, FilterResult, LLMCallResult, NearMiss
 from smzdm_notice.llm.prompts import ARBITER_SYSTEM_PROMPT
-from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot, build_chat_completion_kwargs, resolve
+from smzdm_notice.llm.routing import ResolvedLLMConfig, RoutingSnapshot, resolve
+from smzdm_notice.llm.streaming import (
+    AsyncClientPool,
+    InvalidResultError,
+    complete_json_object,
+    stream_result,
+    total_timeout,
+)
 
 _CHANGE_ASSESSMENT_CAUSES = {
     "preference_gap",
@@ -37,17 +43,20 @@ class ArbitrationRequest:
     items_summary: list[dict]
     items_by_id: dict[str, dict]
     user_message: str
-    client: OpenAI
+    client: AsyncOpenAI
     llm_config: ResolvedLLMConfig
 
 
-def resolve_dual_result(
+async def resolve_dual_result(
     call_a: LLMCallResult | None,
     call_b: LLMCallResult | None,
     items_summary: list[dict],
     items_by_id: dict[str, dict],
     user_message: str,
     routing_snapshot: RoutingSnapshot | None = None,
+    *,
+    clients: AsyncClientPool,
+    round_id: str,
 ) -> tuple[FilterResult, ArbiterInfo | None]:
     """根据双次调用结果决定最终推荐。"""
     if call_a is None:
@@ -73,7 +82,7 @@ def resolve_dual_result(
     only_b = ids_b - ids_a
     logger.warning(f"两次判断不一致: A 独有 {only_a}, B 独有 {only_b}")
 
-    arbiter_info = _run_arbiter(
+    arbiter_info = await _run_arbiter(
         result_a,
         result_b,
         call_a,
@@ -82,6 +91,8 @@ def resolve_dual_result(
         items_by_id,
         user_message,
         routing_snapshot,
+        clients=clients,
+        round_id=round_id,
     )
     final_from_arbitration = _result_from_arbitration(result_a, result_b, arbiter_info)
     if final_from_arbitration is not None:
@@ -90,7 +101,7 @@ def resolve_dual_result(
     return _intersect_results(result_a, result_b, ids_a & ids_b), None
 
 
-def _run_arbiter(
+async def _run_arbiter(
     result_a: FilterResult,
     result_b: FilterResult,
     call_a: LLMCallResult,
@@ -99,6 +110,9 @@ def _run_arbiter(
     items_by_id: dict[str, dict],
     user_message: str,
     routing_snapshot: RoutingSnapshot | None = None,
+    *,
+    clients: AsyncClientPool,
+    round_id: str,
 ) -> ArbiterInfo | None:
     from smzdm_notice.core import config
 
@@ -107,7 +121,8 @@ def _run_arbiter(
     llm_config = resolve("arbiter", routing_snapshot)
     logger.info(f"仲裁 LLM 模型: {llm_config.connection}/{llm_config.model_id}")
     logger.debug(f"仲裁 LLM Base URL: {llm_config.base_url}")
-    return arbitrate(
+    deadline = monotonic() + total_timeout(llm_config)
+    return await arbitrate(
         ArbitrationRequest(
             result_a=result_a,
             result_b=result_b,
@@ -116,9 +131,11 @@ def _run_arbiter(
             items_summary=items_summary,
             items_by_id=items_by_id,
             user_message=user_message,
-            client=get_client_for_config(llm_config),
+            client=clients.get(llm_config),
             llm_config=llm_config,
-        )
+        ),
+        deadline=deadline,
+        round_id=round_id,
     )
 
 
@@ -148,19 +165,35 @@ def _intersect_results(result_a: FilterResult, result_b: FilterResult, common_id
     )
 
 
-def arbitrate(request: ArbitrationRequest) -> ArbiterInfo | None:
+async def arbitrate(
+    request: ArbitrationRequest,
+    *,
+    deadline: float | None = None,
+    round_id: str = "standalone",
+) -> ArbiterInfo | None:
     """调用仲裁 agent 决定哪个结果更准确。"""
+    started = monotonic()
+
+    def parse(content: str) -> ArbiterInfo:
+        result = _parse_arbiter_response(content, request)
+        if result is None:
+            raise InvalidResultError("仲裁结果业务结构无效")
+        return result
+
     try:
-        response = request.client.chat.completions.create(
-            **build_chat_completion_kwargs(
-                request.llm_config,
-                messages=[
-                    {"role": "system", "content": ARBITER_SYSTEM_PROMPT},
-                    {"role": "user", "content": _build_arbitration_message(request)},
-                ],
-            )
+        result, _ = await stream_result(
+            request.client,
+            request.llm_config,
+            messages=[
+                {"role": "system", "content": ARBITER_SYSTEM_PROMPT},
+                {"role": "user", "content": _build_arbitration_message(request)},
+            ],
+            parse=parse,
+            label="arbiter",
+            round_id=round_id,
+            deadline=deadline if deadline is not None else monotonic() + total_timeout(request.llm_config),
         )
-        return _parse_arbiter_response(response.choices[0].message.content, request)
+        return result
     except RETRYABLE_OPENAI_ERRORS as e:
         logger.error(f"仲裁调用失败（{error_summary('可重试/网络类问题', e)}）")
         return None
@@ -173,6 +206,9 @@ def arbitrate(request: ArbitrationRequest) -> ArbiterInfo | None:
     except Exception as e:
         logger.error(f"仲裁调用失败（{error_summary('非 OpenAI SDK 异常', e)}）")
         return None
+
+    finally:
+        logger.info(f"LLM round={round_id} role=arbiter call_end elapsed={monotonic() - started:.3f}s")
 
 
 def _build_arbitration_message(request: ArbitrationRequest) -> str:
@@ -188,19 +224,15 @@ def _build_arbitration_message(request: ArbitrationRequest) -> str:
     return (
         f"{request.user_message}\n\n"
         f"## 判断 A 的推荐结果\n{recs_a_text}\n\n"
-        f"## 判断 A 的原始响应（包含可能的 <think> 推理）\n{request.raw_a}\n\n"
+        f"## 判断 A 的完整 JSON 响应\n{request.raw_a}\n\n"
         f"## 判断 B 的推荐结果\n{recs_b_text}\n\n"
-        f"## 判断 B 的原始响应（包含可能的 <think> 推理）\n{request.raw_b}\n\n"
+        f"## 判断 B 的完整 JSON 响应\n{request.raw_b}\n\n"
         f"请根据评判标准，决定哪个判断更准确。"
     )
 
 
 def _parse_arbiter_response(content: str | None, request: ArbitrationRequest) -> ArbiterInfo | None:
-    logger.debug(f"仲裁响应: {content}")
-    data = extract_json_object(content)
-    if data is None:
-        logger.warning(f"仲裁响应无法解析为 JSON: {(content or '')[:500]}")
-        return None
+    data = complete_json_object(content or "")
 
     chosen = str(data.get("chosen", "")).upper()
     if chosen not in {"A", "B"}:
@@ -225,9 +257,7 @@ def _parse_arbiter_response(content: str | None, request: ArbitrationRequest) ->
 
     raw_preference_change = data.get("preference_change")
     preference_change = raw_preference_change if isinstance(raw_preference_change, dict) else None
-    if should_change and (
-        preference_change is None or not str(preference_change.get("rule") or "").strip()
-    ):
+    if should_change and (preference_change is None or not str(preference_change.get("rule") or "").strip()):
         logger.warning("仲裁响应建议修改 preference.md 时必须提供有效的 preference_change.rule")
         return None
     if preference_change is not None and not should_change:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -26,6 +28,7 @@ from smzdm_notice.feishu.card_payload import (
 )
 from smzdm_notice.feishu.commands import find_command_spec, help_markdown
 from smzdm_notice.feishu.model_actions import (
+    ResolvedModelTest,
     apply_model_route_card_action,
     model_card_target,
     resolve_model_test_config,
@@ -76,7 +79,6 @@ from smzdm_notice.llm.errors import (
     GENERAL_OPENAI_ERRORS,
     NON_RETRYABLE_OPENAI_ERRORS,
     RETRYABLE_OPENAI_ERRORS,
-    error_summary,
 )
 from smzdm_notice.llm.routing import (
     AGENTS,
@@ -143,6 +145,16 @@ class CardActionDispatchResult:
     response_card: dict | None = None
 
 
+@dataclass(frozen=True)
+class ModelTestOutcome:
+    """模型测试调用的归一化结果，供消息渲染和安全日志复用。"""
+
+    ok: bool
+    category: str
+    detail: str = ""
+    preview: str = ""
+
+
 @dataclass
 class DraftProgressCard:
     """草案生成期间使用的进度卡；仅流式卡片带刷新线程。"""
@@ -204,6 +216,8 @@ class FeishuInteractiveBot:
         self._deal_reason_form_lock = threading.RLock()
         self._draft_refreshing: set[str] = set()
         self._draft_refresh_lock = threading.RLock()
+        self._model_tests_in_flight: set[tuple[str, str, str]] = set()
+        self._model_tests_in_flight_lock = threading.Lock()
 
     def start_blocking(self) -> None:
         if not (config.FEISHU_APP_ID and config.FEISHU_APP_SECRET):
@@ -880,7 +894,7 @@ class FeishuInteractiveBot:
             self._reply_text(reply_to_message_id, message)
             return CardActionDispatchResult(message)
         if action.startswith("model_"):
-            return self._handle_model_card_action(action, value)
+            return self._handle_model_card_action(action, value, operator, reply_to_message_id)
         message = f"未知操作：{action}"
         self._reply_text(reply_to_message_id, message)
         return CardActionDispatchResult(message)
@@ -1328,17 +1342,19 @@ class FeishuInteractiveBot:
         )
         return False
 
-    def _handle_model_card_action(self, action: str, value: dict) -> CardActionDispatchResult:
+    def _handle_model_card_action(
+        self,
+        action: str,
+        value: dict,
+        operator: str,
+        reply_to_message_id: str,
+    ) -> CardActionDispatchResult:
         """应用模型路由卡片操作，并重绘管理卡片。"""
         try:
             if action == "model_refresh":
                 return CardActionDispatchResult("已刷新 LLM 路由", _build_model_management_card_response())
             if action == "model_test":
-                message = _run_model_test(resolve_model_test_config(value))
-                return CardActionDispatchResult(
-                    message,
-                    _build_model_management_card_response(form_state=_extract_form_state(value)),
-                )
+                return self._submit_model_test(value, operator, reply_to_message_id)
             result = apply_model_route_card_action(action, value)
             logger.info(
                 "LLM 路由卡片操作成功: "
@@ -1358,14 +1374,107 @@ class FeishuInteractiveBot:
         except (LLMRoutingError, ValueError) as e:
             return CardActionDispatchResult(
                 f"WARN: {e}",
-                _build_model_management_card_response(form_state=_extract_form_state(value)),
+                None
+                if action == "model_test"
+                else _build_model_management_card_response(form_state=_extract_form_state(value)),
             )
         except Exception as e:
             logger.error(f"模型卡片操作失败: {e}", exc_info=True)
             return CardActionDispatchResult(
                 INTERNAL_ERROR_MESSAGE,
-                _build_model_management_card_response(form_state=_extract_form_state(value)),
+                None
+                if action == "model_test"
+                else _build_model_management_card_response(form_state=_extract_form_state(value)),
             )
+
+    def _submit_model_test(self, value: dict, operator: str, reply_to_message_id: str) -> CardActionDispatchResult:
+        resolved = resolve_model_test_config(value)
+        test_key = _model_test_key(reply_to_message_id, operator, resolved)
+        with self._model_tests_in_flight_lock:
+            if test_key in self._model_tests_in_flight:
+                return CardActionDispatchResult("相同参数的测试正在进行，请等待结果。")
+            self._model_tests_in_flight.add(test_key)
+
+        test_id = uuid.uuid4().hex[:8]
+        config = resolved.config
+        logger.info(
+            "LLM 模型测试已提交: "
+            f"test_id={test_id}, target={resolved.target}, connection={config.connection}, "
+            f"host={config.base_url_host}, model_id={config.model_id}"
+        )
+        try:
+            self._start_model_test_worker(test_id, resolved, reply_to_message_id, test_key)
+        except Exception:
+            self._release_model_test(test_key)
+            logger.error(f"LLM 模型测试线程启动失败: test_id={test_id}", exc_info=True)
+            raise
+        return CardActionDispatchResult(f"测试已提交（ID: {test_id}），结果将回复到本卡片消息。")
+
+    def _start_model_test_worker(
+        self,
+        test_id: str,
+        resolved: ResolvedModelTest,
+        reply_to_message_id: str,
+        test_key: tuple[str, str, str],
+    ) -> None:
+        thread = threading.Thread(
+            target=self._run_model_test_worker,
+            args=(test_id, resolved, reply_to_message_id, test_key),
+            name=f"feishu-model-test-{test_id}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_model_test_worker(
+        self,
+        test_id: str,
+        resolved: ResolvedModelTest,
+        reply_to_message_id: str,
+        test_key: tuple[str, str, str],
+    ) -> None:
+        config = resolved.config
+        started_at = time.monotonic()
+        logger.info(
+            "LLM 模型测试开始: "
+            f"test_id={test_id}, target={resolved.target}, connection={config.connection}, "
+            f"host={config.base_url_host}, model_id={config.model_id}, temperature={config.temperature}, "
+            f"timeout_seconds={config.timeout_seconds}, max_retries={config.max_retries}, "
+            f"response_format={_safe_json(config.response_format)}, "
+            f"extra_body_keys={sorted(config.extra_body)}"
+        )
+        try:
+            outcome = _run_model_test(config)
+            elapsed = time.monotonic() - started_at
+            if outcome.ok:
+                logger.info(
+                    f"LLM 模型测试成功: test_id={test_id}, elapsed_seconds={elapsed:.3f}, "
+                    f"preview_chars={len(outcome.preview)}"
+                )
+            else:
+                logger.warning(
+                    f"LLM 模型测试失败: test_id={test_id}, category={outcome.category}, "
+                    f"elapsed_seconds={elapsed:.3f}, error={outcome.detail}"
+                )
+            message = _format_model_test_result(test_id, resolved, outcome, elapsed)
+            delivered = self._reply_text(reply_to_message_id, message)
+            log = logger.info if delivered else logger.warning
+            log(
+                f"LLM 模型测试结果投递{'成功' if delivered else '失败'}: "
+                f"test_id={test_id}, status={'success' if outcome.ok else 'failed'}"
+            )
+        except Exception as e:
+            elapsed = time.monotonic() - started_at
+            detail = _redact_model_test_error(e, config)
+            logger.error(
+                f"LLM 模型测试后台处理异常: test_id={test_id}, elapsed_seconds={elapsed:.3f}, error={detail}",
+            )
+            self._reply_text(reply_to_message_id, f"❌ LLM 模型测试异常\n测试 ID: {test_id}\n原因: {detail}")
+        finally:
+            self._release_model_test(test_key)
+
+    def _release_model_test(self, test_key: tuple[str, str, str]) -> None:
+        with self._model_tests_in_flight_lock:
+            self._model_tests_in_flight.discard(test_key)
 
     def _remember_model_card_form_value(self, message_id: str, operator: str, value: dict) -> None:
         """缓存 Feishu 后续 callback 可能不会携带的模型表单局部编辑。"""
@@ -1666,7 +1775,70 @@ def _model_form_state_from_snapshot(snapshot: llm_routing.RoutingSnapshot, targe
     return result
 
 
-def _run_model_test(llm_config: ResolvedLLMConfig) -> str:
+def _model_test_key(
+    message_id: str,
+    operator: str,
+    resolved: ResolvedModelTest,
+) -> tuple[str, str, str]:
+    config = resolved.config
+    fingerprint = _safe_json(
+        {
+            "target": resolved.target,
+            "connection": config.connection,
+            "model_id": config.model_id,
+            "timeout_seconds": config.timeout_seconds,
+            "max_retries": config.max_retries,
+            "temperature": config.temperature,
+            "response_format": config.response_format,
+            "extra_body": config.extra_body,
+        }
+    )
+    return message_id, operator, fingerprint
+
+
+def _safe_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _redact_model_test_error(error: Exception, llm_config: ResolvedLLMConfig) -> str:
+    # 必须先脱敏再截断，避免截断后的密钥片段无法匹配完整密钥。
+    detail = str(error).strip() or error.__class__.__name__
+    if llm_config.api_key:
+        detail = detail.replace(llm_config.api_key, "[REDACTED]")
+    if llm_config.base_url:
+        detail = detail.replace(llm_config.base_url, llm_config.base_url_host)
+    return detail[:500] + "..." if len(detail) > 500 else detail
+
+
+def _format_model_test_result(
+    test_id: str,
+    resolved: ResolvedModelTest,
+    outcome: ModelTestOutcome,
+    elapsed_seconds: float,
+) -> str:
+    config = resolved.config
+    lines = [
+        "✅ LLM 模型测试成功" if outcome.ok else "❌ LLM 模型测试失败",
+        f"测试 ID: {test_id}",
+        f"作用范围: {resolved.target}",
+        f"Connection: {config.connection} ({config.connection_label})",
+        f"API Host: {config.base_url_host}",
+        f"Model ID: {config.model_id}",
+        f"Temperature: {config.temperature if config.temperature is not None else '未设置'}",
+        f"Timeout: {config.timeout_seconds:g} 秒/次",
+        f"Max retries: {config.max_retries}",
+        f"Response format: {_safe_json(config.response_format)}",
+        f"Extra body: {_safe_json(config.extra_body)}",
+        f"总耗时: {elapsed_seconds:.2f} 秒",
+    ]
+    if outcome.ok:
+        lines.extend(["响应预览:", outcome.preview or "（空响应）"])
+    else:
+        lines.extend([f"错误分类: {outcome.category}", f"原因: {outcome.detail}"])
+    return "\n".join(lines)
+
+
+def _run_model_test(llm_config: ResolvedLLMConfig) -> ModelTestOutcome:
     try:
         kwargs = build_chat_completion_kwargs(
             llm_config,
@@ -1675,19 +1847,34 @@ def _run_model_test(llm_config: ResolvedLLMConfig) -> str:
                 {"role": "user", "content": 'Return exactly {"ok": true}.'},
             ],
         )
-        kwargs["timeout"] = min(llm_config.timeout_seconds, 30)
+        kwargs["timeout"] = llm_config.timeout_seconds
         response = get_client_for_config(llm_config).chat.completions.create(**kwargs)
         content = response.choices[0].message.content or ""
-        preview = content[:200]
-        return f"OK: {llm_config.connection}/{llm_config.model_id} 测试成功。\n{preview}"
+        return ModelTestOutcome(ok=True, category="success", preview=content[:200])
     except RETRYABLE_OPENAI_ERRORS as e:
-        return f"WARN: 测试失败（{error_summary('可重试/网络类问题', e)}）"
+        return ModelTestOutcome(
+            ok=False,
+            category="可重试/网络类问题",
+            detail=_redact_model_test_error(e, llm_config),
+        )
     except NON_RETRYABLE_OPENAI_ERRORS as e:
-        return f"WARN: 测试失败（{error_summary('配置或请求不可重试问题', e)}）"
+        return ModelTestOutcome(
+            ok=False,
+            category="配置或请求不可重试问题",
+            detail=_redact_model_test_error(e, llm_config),
+        )
     except GENERAL_OPENAI_ERRORS as e:
-        return f"WARN: 测试失败（{error_summary('OpenAI SDK/API 错误', e)}）"
+        return ModelTestOutcome(
+            ok=False,
+            category="OpenAI SDK/API 错误",
+            detail=_redact_model_test_error(e, llm_config),
+        )
     except Exception as e:
-        return f"WARN: 测试失败（{error_summary('非 OpenAI SDK 异常', e)}）"
+        return ModelTestOutcome(
+            ok=False,
+            category="非 OpenAI SDK 异常",
+            detail=_redact_model_test_error(e, llm_config),
+        )
 
 
 def _model_usage_text() -> str:
